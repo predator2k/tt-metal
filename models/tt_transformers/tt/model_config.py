@@ -2599,6 +2599,17 @@ class ModelArgs:
 
         # RoPE params
         self.rope_theta = text_config.get("rope_theta")
+        # Tenstorrent-p1 patch: Qwen3ForCausalLM nests rope_theta inside rope_parameters
+        if self.rope_theta is None:
+            rope_params = text_config.get("rope_parameters", {}) or {}
+            if rope_params.get("rope_theta"):
+                self.rope_theta = rope_params["rope_theta"]
+        # Tenstorrent-p1 patch: Llama-3.x fallback if config lost rope_theta
+        if self.rope_theta is None and "llama" in (self.model_name or "").lower():
+            print(f"[TT-PATCH-DIAG] rope_theta missing for {self.model_name}; text_config keys: {list(text_config.keys())[:25]}", flush=True)
+            # Fallback for Llama 3.x family if config dict lost the field
+            self.rope_theta = 500000.0
+            print(f"[TT-PATCH-DIAG] forced rope_theta=500000.0 as Llama-3.x fallback", flush=True)
         self.rope_theta_local = text_config.get("rope_local_base_freq", None)
         self.use_sliding_window = text_config.get("use_sliding_window", None)
         if (
@@ -2857,7 +2868,11 @@ class ModelArgs:
         return self.model_config
 
     def get_hf_model_cls(self):
-        from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
+        try:
+            from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
+        except ImportError:
+            from transformers import AutoModelForCausalLM
+            AutoModelForImageTextToText = AutoModelForVision2Seq = None
 
         if not self.is_multimodal:
             return AutoModelForCausalLM
