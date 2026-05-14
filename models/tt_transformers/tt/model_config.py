@@ -656,12 +656,18 @@ class ModelArgs:
             # All Gather Matmul for Dense Out (DO) - computed flag stored as instance attribute
             # NOTE: Fused all gather matmul only supports a core grid of size num_devices x 1
             # TODO: #26657 refactor ACTUAL_DEVICE environment variable usage
+            # P3a.2 (EAGLE): on Blackhole P300_X2, ttnn.cluster.get_cluster_type()
+            # does not surface as P300_X2 → ccl_topology() returns Linear, not Ring.
+            # Fused all_gather_async accepts Linear topology, so widen the gate to
+            # any multi-chip non-None topology. Without this, the non-fused WO path
+            # silently requires n_local_heads*head_dim == dim/num_devices, which is
+            # a coincidence (only true for Qwen3-8B on a 2-chip mesh, not Qwen3-1.7B).
             self._use_fused_all_gather_matmul = (
-                self.num_devices == 8
+                self.num_devices >= 2
                 and os.getenv("ACTUAL_DEVICE", "") != "TG"
                 and (self.dim // ttnn.TILE_SIZE // self.num_devices) % self.num_devices == 0
                 and self.num_devices > 1
-                and self.ccl_topology() == ttnn.Topology.Ring
+                and self.ccl_topology() is not None
             ) or self.prefetcher is not None
 
             # Using dram_shard_grid_width to ensure per_core_N matches DRAM shard width for P100, otherwise matmuls silently give bad PCC
