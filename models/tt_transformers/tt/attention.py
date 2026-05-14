@@ -961,6 +961,19 @@ class Attention(LightweightModule):
         )
 
         norm_config = self.args.get_norm_config("attn", Mode.PREFILL, None)
+        # P3a.2 patch: nlp_create_qkv_heads pads Q/K/V last-dim with GQA-fused
+        # extra space (e.g. Qwen3-1.7B 8Q/4KV per device → padded 192 instead
+        # of 128). RMSNorm validates against padded shape and rejects the
+        # mismatch with gamma sized for head_dim. SDPA also rejects K/V hidden
+        # dim mismatch. Strip all three back to head_dim before downstream ops.
+        def _strip_to_head_dim(t):
+            sh = list(t.shape)
+            if sh[-1] != self.head_dim:
+                return ttnn.slice(t, [0]*len(sh), sh[:-1] + [self.head_dim])
+            return t
+        q_heads_1QSD_pre_rot = _strip_to_head_dim(q_heads_1QSD_pre_rot)
+        k_heads_1KSD_pre_rot = _strip_to_head_dim(k_heads_1KSD_pre_rot)
+        v_heads_1VSD = _strip_to_head_dim(v_heads_1VSD)
         q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
         k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
 
