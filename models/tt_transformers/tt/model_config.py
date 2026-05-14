@@ -1263,6 +1263,11 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
+                # P3a.2 single-chip: dram_matmul_config falls back to regular
+                # matmul (8,8) which only accepts BLOCK_SHARDED or DRAM output;
+                # WIDTH-sharded is rejected at matmul_device_operation.cpp:971.
+                if not self.is_multichip:
+                    return ttnn.DRAM_MEMORY_CONFIG
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             return ttnn.DRAM_MEMORY_CONFIG
@@ -1283,6 +1288,9 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
+                # P3a.2 single-chip: see get_mlp_ff1_3_mem_config comment.
+                if not self.is_multichip:
+                    return ttnn.DRAM_MEMORY_CONFIG
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             return ttnn.DRAM_MEMORY_CONFIG
@@ -1322,6 +1330,11 @@ class ModelArgs:
     def get_mlp_binary_mult_mem_config(self, mode: Mode):
         """Get the memory config for MLP binary mult (w2 input) - replaces SHARDED_MLP2_INPUT_MEMCFG."""
         if mode == Mode.DECODE:
+            # P3a.2 single-chip: w2 program-config falls back to regular
+            # matmul which rejects WIDTH-sharded inputs (same as ff1/ff3
+            # output). Stay in DRAM end-to-end on this path.
+            if not self.is_multichip:
+                return ttnn.DRAM_MEMORY_CONFIG
             return ttnn.create_sharded_memory_config(
                 (
                     32 if self.is_galaxy else self.tile_padded_batch_rows,
@@ -1569,6 +1582,9 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
+                # P3a.2 single-chip: see get_mlp_ff1_3_mem_config comment.
+                if not self.is_multichip:
+                    return ttnn.DRAM_MEMORY_CONFIG
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             return ttnn.DRAM_MEMORY_CONFIG
