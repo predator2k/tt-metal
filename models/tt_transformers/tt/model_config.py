@@ -2125,16 +2125,10 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
         elif mode == Mode.PREFILL:
-            return ttnn.create_sharded_memory_config(
-                (
-                    self.tile_padded_batch_rows,
-                    nearest_32((self.dim // (4 if self.is_galaxy else 1)) // self.lm_head_core_grid.num_cores),
-                ),  # Shard shape: [32, 128] -> 1 shard per core
-                self.lm_head_core_grid,
-                ttnn.ShardStrategy.WIDTH,
-                ttnn.ShardOrientation.ROW_MAJOR,
-                use_height_and_width_as_shard_shape=True,
-            )
+            # P3a.2 patch: paired with the regular MatmulMultiCoreReuseMultiCastProgramConfig
+            # we now return from get_lm_head_program_config; that program config requires
+            # BLOCK_SHARDED / HEIGHT_SHARDED / interleaved input, not WIDTH_SHARDED.
+            return ttnn.DRAM_MEMORY_CONFIG
         else:
             raise ValueError(f"Invalid mode: {mode}")
 
@@ -2153,11 +2147,16 @@ class ModelArgs:
                 untilize_out=True,
             )
         else:
-            return self.dram_matmul_config(
-                self.tile_padded_batch_rows,
-                self.dim,
-                split_size,
-                self.lm_head_core_grid.num_cores,
+            # P3a.2 patch: DRAM-sharded matmul on P300 picks 8x10 cores via
+            # DRAM bank-to-reader assignment, exceeding the 12x8 worker grid
+            # under MUX dispatch. Fall back to a regular MatmulMulti-core matmul
+            # with explicit 8x8 grid (which fits) for the LM head.
+            return self.matmul_config(
+                m=self.tile_padded_batch_rows,
+                k=self.dim,
+                n=split_size,
+                grid_size=(8, 8),
+                fuse_batch=True,
             )
 
     @lru_cache(maxsize=None)
@@ -2177,7 +2176,9 @@ class ModelArgs:
             else:
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
-            return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+            # P3a.2 patch: paired with regular MatmulMultiCoreReuseMultiCastProgramConfig
+            # which requires BLOCK_SHARDED or interleaved output, not WIDTH_SHARDED.
+            return ttnn.DRAM_MEMORY_CONFIG
         else:
             raise ValueError(f"Invalid mode: {mode}")
 
