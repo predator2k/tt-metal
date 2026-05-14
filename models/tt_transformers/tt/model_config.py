@@ -2185,16 +2185,9 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
-                return ttnn.create_sharded_memory_config(
-                    (
-                        self.tile_padded_batch_rows,
-                        nearest_32((self.dim // (4 if self.is_galaxy else 1)) // self.lm_head_core_grid.num_cores),
-                    ),  # Shard shape: [32, 128] -> 1 shard per core
-                    self.lm_head_core_grid,
-                    ttnn.ShardStrategy.WIDTH,
-                    ttnn.ShardOrientation.ROW_MAJOR,
-                    use_height_and_width_as_shard_shape=True,
-                )
+                # P3a.2 patch: regular matmul (our patched LM head) rejects
+                # WIDTH_SHARDED input; use DRAM-interleaved.
+                return ttnn.DRAM_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             # P3a.2 patch: paired with the regular MatmulMultiCoreReuseMultiCastProgramConfig
             # we now return from get_lm_head_program_config; that program config requires
@@ -2245,10 +2238,9 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
-                return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
+                # P3a.2 patch: regular matmul outputs DRAM, not WIDTH_SHARDED.
+                return ttnn.DRAM_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
-            # P3a.2 patch: paired with regular MatmulMultiCoreReuseMultiCastProgramConfig
-            # which requires BLOCK_SHARDED or interleaved output, not WIDTH_SHARDED.
             return ttnn.DRAM_MEMORY_CONFIG
         else:
             raise ValueError(f"Invalid mode: {mode}")

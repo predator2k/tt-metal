@@ -584,10 +584,14 @@ CoreCoord Device::dram_grid_size() const {
 CoreCoord Device::compute_with_storage_grid_size() const {
     const auto& dispatch_core_config = context_->get_dispatch_core_manager().get_dispatch_core_config();
     auto grid = tt::get_compute_grid_size(MetalEnvAccessor(*env_).impl(), id_, num_hw_cqs_, dispatch_core_config);
-    // P3a.2 patch: P300 under MUX exposes 12x9 (row 9 reserved for ETH dispatch).
-    // Some matmul auto-configs request up to 8x10 cores; clamp to 8 rows so
-    // they never overflow.
-    if (grid.y > 8) grid.y = 8;
+    // P3a.2 patch (Layout-A only): Blackhole P300 under MUX dispatch exposes a
+    // 12x9 worker grid (row 9 reserved for ETH dispatch). Some matmul
+    // auto-configs request up to 8x10 cores; clamp to 8 rows under MUX so
+    // they never overflow. For single-chip / no-MUX (Layout-B etc.) the full
+    // 10 rows are natively available — DO NOT clamp.
+    if (dispatch_core_config.get_dispatch_core_type() == tt_metal::DispatchCoreType::ETH && grid.y > 8) {
+        grid.y = 8;
+    }
     return grid;
 }
 
