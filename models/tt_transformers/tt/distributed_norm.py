@@ -105,8 +105,17 @@ class DistributedNorm(LightweightModule):
         else:
             x = ttnn.to_memory_config(x, input_mem_cfg)
 
+        # P3a.2 patch: on single-chip the sharded program_config triggers a
+        # std::bad_optional_access deep in ttnn.rms_norm — some field expected
+        # in multi-device program_configs is empty. Force the unsharded
+        # ttnn.rms_norm path on num_devices==1.
+        _force_unsharded = not self.args.is_multichip
+        _in_sh = (mode == Mode.DECODE) and not _force_unsharded
+        _out_sh = (mode == Mode.DECODE) and not _force_unsharded
+        if _force_unsharded:
+            x = ttnn.to_memory_config(x, ttnn.DRAM_MEMORY_CONFIG)
         x = self.norm(
-            x, mode=mode, in_sharded=(mode == Mode.DECODE), out_sharded=(mode == Mode.DECODE), norm_config=norm_config
+            x, mode=mode, in_sharded=_in_sh, out_sharded=_out_sh, norm_config=norm_config
         )
 
         # Distributed norm requires a gather
