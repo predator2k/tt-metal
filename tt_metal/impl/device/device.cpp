@@ -583,7 +583,12 @@ CoreCoord Device::dram_grid_size() const {
 
 CoreCoord Device::compute_with_storage_grid_size() const {
     const auto& dispatch_core_config = context_->get_dispatch_core_manager().get_dispatch_core_config();
-    return tt::get_compute_grid_size(MetalEnvAccessor(*env_).impl(), id_, num_hw_cqs_, dispatch_core_config);
+    auto grid = tt::get_compute_grid_size(MetalEnvAccessor(*env_).impl(), id_, num_hw_cqs_, dispatch_core_config);
+    // P3a.2 patch: P300 under MUX exposes 12x9 (row 9 reserved for ETH dispatch).
+    // Some matmul auto-configs request up to 8x10 cores; clamp to 8 rows so
+    // they never overflow.
+    if (grid.y > 8) grid.y = 8;
+    return grid;
 }
 
 CoreCoord Device::virtual_noc0_coordinate(uint8_t noc_index, CoreCoord coord) const {
