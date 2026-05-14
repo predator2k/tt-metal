@@ -3249,6 +3249,19 @@ class ModelArgs:
         return 1  # Fallback to 1 if no divisor found
 
     def dram_matmul_config(self, m: int, k: int, n: int, num_cores=None, fused_activation=None):
+        # P3a.2 patch: DRAM-sharded matmul has std::optionals expected on
+        # multi-device fabric that are empty on single-chip → bad optional
+        # access. Fall back to regular MatmulMultiCoreReuseMultiCast when
+        # the device is single-chip (no MUX dispatch, no multi-mesh ring).
+        if not self.is_multichip:
+            return self.matmul_config(
+                m=m,
+                k=k,
+                n=n,
+                grid_size=(8, 8),
+                fuse_batch=True,
+                fused_activation=fused_activation,
+            )
         # in0_block_w must evenly divide k and be no larger than tile_size * num_cores
         if num_cores is None:
             # num_cores = self.dram_shard_core_grid_for_k(k).num_cores

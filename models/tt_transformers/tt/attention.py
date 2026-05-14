@@ -635,7 +635,15 @@ class Attention(LightweightModule):
         else:
             # bfloat16 is required by nlp_create_qkv_heads_decode
             if self.prefetcher is None:
-                xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
+                # P3a.2 patch: our patched QKV matmul outputs DRAM-interleaved
+                # (not sharded), so sharded_to_interleaved fails. Detect and
+                # route to to_memory_config + typecast instead.
+                if xqkv_fused_sharded.is_sharded():
+                    xqkv_fused = ttnn.sharded_to_interleaved(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG, ttnn.bfloat16)
+                else:
+                    xqkv_fused = ttnn.to_memory_config(xqkv_fused_sharded, ttnn.L1_MEMORY_CONFIG)
+                    if xqkv_fused.dtype != ttnn.bfloat16:
+                        xqkv_fused = ttnn.typecast(xqkv_fused, ttnn.bfloat16)
                 ttnn.deallocate(xqkv_fused_sharded)
             else:
                 xqkv_fused = xqkv_fused_sharded
