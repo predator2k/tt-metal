@@ -16,10 +16,92 @@ from models.common.utility_functions import is_blackhole
 from models.tt_transformers.tt.common import Mode
 
 
-# Helper function to check if prefetcher is supported on the current device
-def is_prefetcher_supported(num_devices: int):
-    model_name = os.getenv("HF_MODEL", "")
-    return is_blackhole() and num_devices >= 4 and "Llama" in model_name and "8B" in model_name
+# Model configurations for which DRAM prefetcher is supported
+# TODO #38278: to be removed when model support matrix is unified in tt-transformers
+VERIFIED_MODEL_CONFIGS = {
+    "Llama-3.2-1B": {"dim": 2048, "hidden_dim": 8192, "n_heads": 32, "n_kv_heads": 8},
+    "Llama-3.2-3B": {"dim": 3072, "hidden_dim": 8192, "n_heads": 24, "n_kv_heads": 8},
+    "Llama-3.1-8B": {"dim": 4096, "hidden_dim": 14336, "n_heads": 32, "n_kv_heads": 8},
+    "Llama-3.3-70B": {"dim": 8192, "hidden_dim": 28672, "n_heads": 64, "n_kv_heads": 8},
+    "Qwen3-32B": {"dim": 5120, "hidden_dim": 22016, "n_heads": 40, "n_kv_heads": 8},
+    "Qwen3-VL-7B": {"dim": 4096, "hidden_dim": 11008, "n_heads": 32, "n_kv_heads": 8},
+    "Qwen3-VL-14B": {"dim": 5120, "hidden_dim": 13824, "n_heads": 40, "n_kv_heads": 8},
+    "Qwen3-VL-72B": {"dim": 8192, "hidden_dim": 28672, "n_heads": 64, "n_kv_heads": 8},
+    "Gemma3-4B": {"dim": 2560, "hidden_dim": 14336, "n_heads": 20, "n_kv_heads": 20},
+    "Gemma3-27B": {"dim": 4608, "hidden_dim": 24576, "n_heads": 32, "n_kv_heads": 8},
+    # Tenstorrent-p1: Qwen3 text-only sizes added for the SGLang/tt-sglang
+    # path. Both have strictly smaller dim/hidden_dim than at least one
+    # already-verified Llama in this table (Llama-3.2-1B has hidden_dim=8192
+    # vs Qwen3-1.7B 6144; Llama-3.1-8B has hidden_dim=14336 vs Qwen3-8B
+    # 12288), so the CB-pages / L1-size constraints in
+    # is_prefetcher_supported() pass conservatively.
+    "Qwen3-1.7B": {"dim": 2048, "hidden_dim": 6144, "n_heads": 16, "n_kv_heads": 8},
+    "Qwen3-8B": {"dim": 4096, "hidden_dim": 12288, "n_heads": 32, "n_kv_heads": 8},
+}
+
+
+def generate_sender_receiver_mapping(num_receivers_per_sender: int = 8) -> dict:
+    """
+    Generate custom sender->receiver mapping for Blackhole prefetcher.
+    Args:
+        num_receivers_per_sender (int): Number of receiver cores per sender (8 for 64 total, 10 for 80 total)
+    Returns:
+        dict: {(sender_x, sender_y): [(rx, ry), ...]} mapping
+    """
+    cfg = ARCH_CONFIG["blackhole"]
+    left_y = cfg["bank_ordered_y_coords"]["left"]
+    right_y = cfg["bank_ordered_y_coords"]["right"]
+    left_sender_col = cfg["sender_cols"]["left"]
+    right_sender_col = cfg["sender_cols"]["right"]
+    left_senders = [(left_sender_col, r) for r in left_y]
+    right_senders = [(right_sender_col, r) for r in right_y]
+    mapping = {}
+    for sx, sy in left_senders:
+        mapping[(sx, sy)] = [(x, sy) for x in range(1, num_receivers_per_sender + 1)]
+    for sx, sy in right_senders:
+        # Receivers for right senders: columns 8-10, plus columns 0-6 excluding sender column
+        cols = list(range(8, 11)) + [x for x in range(8) if x != right_sender_col]
+        mapping[(sx, sy)] = [(x, sy) for x in cols[:num_receivers_per_sender]]
+    return mapping
+
+
+def is_prefetcher_supported(model_name: str, num_devices: int, ring_size: int = 16) -> bool:
+    """
+    Check if model can use DRAM prefetcher: CB pages <= 65535, L1 size fits, kv_heads % num_devices == 0.
+    Args:
+        model_name (str): Model name (must contain a key from VERIFIED_MODEL_CONFIGS)
+        num_devices (int): Number of devices for tensor parallelism
+        ring_size (int): Total receiver cores (default 16, custom mapping uses 64/80)
+    Returns:
+        bool: True if supported on Blackhole with given config, False otherwise
+    """
+    verified_model_name = next((m for m in VERIFIED_MODEL_CONFIGS if m in model_name), None)
+    if not is_blackhole() or verified_model_name is None:
+        return False
+    TILE_SIZE, MAX_CB_PAGES = 32, 65535
+    BYTES_PER_TILE_BFP8 = 1088  # bfloat8_b tile size in bytes
+    MAX_L1_PER_BANK = {4: 1000000, 8: 1000000}.get(num_devices, 850000)
+    kv_heads_divisible = VERIFIED_MODEL_CONFIGS[verified_model_name]["n_kv_heads"] % num_devices == 0
+    dim, hidden_dim = (
+        VERIFIED_MODEL_CONFIGS[verified_model_name]["dim"],
+        VERIFIED_MODEL_CONFIGS[verified_model_name]["hidden_dim"],
+    )
+    n_per_device = hidden_dim // num_devices
+    n_per_core = math.ceil(n_per_device / ring_size)
+    n_per_core_padded = ((n_per_core + TILE_SIZE - 1) // TILE_SIZE) * TILE_SIZE
+    n_padded = n_per_core_padded * ring_size
+    h_tiles = math.ceil(dim / TILE_SIZE)
+    w_tiles = n_padded // TILE_SIZE
+    h_tiles_padded = ((h_tiles + ring_size - 1) // ring_size) * ring_size
+    tiles_per_core = (h_tiles_padded * w_tiles) // ring_size
+    # Check memory constraints and kv heads divisible by num_devices
+    pages_ok = tiles_per_core <= MAX_CB_PAGES
+    bytes_per_core = tiles_per_core * BYTES_PER_TILE_BFP8
+    l1_ok = bytes_per_core <= MAX_L1_PER_BANK
+    logger.info(
+        f"DRAM Prefetcher support check: tiles_per_core: {tiles_per_core} <= {MAX_CB_PAGES} is {pages_ok}, bytes_per_core: {bytes_per_core} <= {MAX_L1_PER_BANK} is {l1_ok}, kv_heads_divisible: {kv_heads_divisible}"
+    )
+    return pages_ok and l1_ok and kv_heads_divisible
 
 
 @dataclass

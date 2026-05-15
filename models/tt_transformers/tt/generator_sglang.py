@@ -62,11 +62,28 @@ def initialize_sglang_text_transformer(
     n_layers=None,
     dtype=ttnn.bfloat8_b,
     optimizations=DecodersPrecision.performance,
+    use_prefetcher=False,
 ):
+    # Tenstorrent-p1: optional DRAM prefetcher (hides DRAM-to-SRAM weight
+    # load latency behind compute). Opt-in via use_prefetcher=True; the
+    # caller is expected to have already verified is_prefetcher_supported
+    # for the (model, num_devices) tuple. Default False to keep prior
+    # behavior unchanged.
+    from models.tt_transformers.tt.prefetcher import Prefetcher, is_prefetcher_supported
+
     submesh_devices = create_submeshes(mesh_device, tt_data_parallel)
     # Load model args, weights
     model_args = []
+    prefetchers = []
     for submesh in submesh_devices:
+        # Per-submesh prefetcher (one Prefetcher per ModelArgs); num_layers
+        # is set after ModelArgs construction below.
+        prefetcher = None
+        if use_prefetcher:
+            num_devs = submesh.get_num_devices()
+            if is_prefetcher_supported(hf_config._name_or_path, num_devs):
+                prefetcher = Prefetcher(submesh, num_tensors=5, num_layers=n_layers)
+        prefetchers.append(prefetcher)
         model_args_i = ModelArgs(
             submesh,
             instruct=(
@@ -75,6 +92,7 @@ def initialize_sglang_text_transformer(
             max_batch_size=max_batch_size // tt_data_parallel,
             optimizations=lambda model_args: optimizations(model_args.n_layers, model_args.model_name),
             max_seq_len=max_seq_len,
+            prefetcher=prefetcher,
         )
 
         assert model_args_i.model_name.replace("-", "") in hf_config._name_or_path.replace(
@@ -82,6 +100,8 @@ def initialize_sglang_text_transformer(
         ), f"The model specified in sglang ({hf_config._name_or_path}) does not match the model name ({model_args_i.model_name}) with model weights ({model_args_i.CKPT_DIR})."
         if n_layers is not None:
             model_args_i.n_layers = n_layers
+        if prefetcher is not None:
+            prefetcher.num_layers = model_args_i.n_layers
 
         model_args.append(model_args_i)
 
@@ -96,6 +116,7 @@ def initialize_sglang_text_transformer(
             state_dict=state_dict,
             weight_cache_path=model_args[i].weight_cache_path(dtype),
             use_paged_kv_cache=True,
+            prefetcher=prefetchers[i],
         )
         tt_model.append(tt_model_i)
 
@@ -116,6 +137,7 @@ class LlamaForCausalLM(Generator):
         n_layers=None,
         tt_data_parallel=1,
         optimizations: str = "performance",
+        use_prefetcher: bool = False,
     ):
         hf_model_name = hf_config._name_or_path
         if (
@@ -141,6 +163,7 @@ class LlamaForCausalLM(Generator):
             optimizations=DecodersPrecision.from_string(optimizations)
             if optimizations is not None
             else DecodersPrecision.performance,
+            use_prefetcher=use_prefetcher,
         )
         return cls(tt_model, model_args, mesh_device)
 
@@ -172,6 +195,7 @@ class QwenForCausalLM(Generator):
         n_layers=None,
         tt_data_parallel=1,
         optimizations: str = "performance",
+        use_prefetcher: bool = False,
     ):
         tt_model, model_args = initialize_sglang_text_transformer(
             hf_config,
@@ -184,6 +208,7 @@ class QwenForCausalLM(Generator):
             optimizations=DecodersPrecision.from_string(optimizations)
             if optimizations is not None
             else DecodersPrecision.performance,
+            use_prefetcher=use_prefetcher,
         )
         return cls(tt_model, model_args, mesh_device)
 
@@ -215,6 +240,7 @@ class MistralForCausalLM(Generator):
         n_layers=None,
         tt_data_parallel=1,
         optimizations: str = "performance",
+        use_prefetcher: bool = False,
     ):
         tt_model, model_args = initialize_sglang_text_transformer(
             hf_config,
@@ -227,6 +253,7 @@ class MistralForCausalLM(Generator):
             optimizations=DecodersPrecision.from_string(optimizations)
             if optimizations is not None
             else DecodersPrecision.performance,
+            use_prefetcher=use_prefetcher,
         )
         return cls(tt_model, model_args, mesh_device)
 
@@ -260,6 +287,7 @@ class GptOssForCausalLM(Generator):
         n_layers=None,
         tt_data_parallel=1,
         optimizations: str = "performance",
+        use_prefetcher: bool = False,
     ):
         from models.demos.gpt_oss.tt.common import create_tt_model
 
