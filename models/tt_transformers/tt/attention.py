@@ -622,13 +622,29 @@ class Attention(LightweightModule):
         # This is because the SDPA op in decode mode has different number of reductions depending on batch size
         # Which leads to slightly different outputs from attention (due to accumulated errors)
         sdpa_decode_prog_cfg = self.args.get_attn_sdpa_decode_program_config(self.prefetcher)
-        if page_table:
+        # P3a.2 T2.2.Z+4: optional skip-self-attention mode (tree-mask
+        # emulation for EAGLE verify chain). When self._skip_self_attention
+        # is True, attention reads kv at [0, current_pos - 1) (excluding
+        # the just-written K at current_pos), so the input token doesn't
+        # leak into output logits via self-attention.
+        if getattr(self, "_skip_self_attention", False):
+            _one_t = ttnn.full(
+                current_pos.shape,
+                1,
+                dtype=current_pos.dtype,
+                device=current_pos.device(),
+                memory_config=current_pos.memory_config(),
+            )
+            _attn_pos = ttnn.subtract(current_pos, _one_t)
+        else:
+            _attn_pos = current_pos
+        if page_table is not None:
             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                 q_heads_1BQD,
                 keys,
                 values,
                 page_table_tensor=page_table,
-                cur_pos_tensor=current_pos,
+                cur_pos_tensor=_attn_pos,
                 scale=self.scale,
                 sliding_window_size=self.sliding_window,
                 program_config=sdpa_decode_prog_cfg,
@@ -640,7 +656,7 @@ class Attention(LightweightModule):
                 q_heads_1BQD,
                 keys,
                 values,
-                cur_pos_tensor=current_pos,
+                cur_pos_tensor=_attn_pos,
                 scale=self.scale,
                 sliding_window_size=self.sliding_window,
                 program_config=sdpa_decode_prog_cfg,
