@@ -1372,6 +1372,11 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
+                # P3a.2 single-chip: dram_matmul_config falls back to regular
+                # matmul (8,8) which only accepts BLOCK_SHARDED or DRAM output;
+                # WIDTH-sharded is rejected at matmul_device_operation.cpp:971.
+                if not self.is_multichip or is_blackhole():  # P3a.2 P300 MUX
+                    return ttnn.DRAM_MEMORY_CONFIG
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             return ttnn.DRAM_MEMORY_CONFIG
@@ -1392,6 +1397,9 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
+                # P3a.2 single-chip: see get_mlp_ff1_3_mem_config comment.
+                if not self.is_multichip or is_blackhole():  # P3a.2 P300 MUX
+                    return ttnn.DRAM_MEMORY_CONFIG
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             return ttnn.DRAM_MEMORY_CONFIG
@@ -1431,6 +1439,11 @@ class ModelArgs:
     def get_mlp_binary_mult_mem_config(self, mode: Mode):
         """Get the memory config for MLP binary mult (w2 input) - replaces SHARDED_MLP2_INPUT_MEMCFG."""
         if mode == Mode.DECODE:
+            # P3a.2 single-chip: w2 program-config falls back to regular
+            # matmul which rejects WIDTH-sharded inputs (same as ff1/ff3
+            # output). Stay in DRAM end-to-end on this path.
+            if not self.is_multichip or is_blackhole():  # P3a.2 P300 MUX
+                return ttnn.DRAM_MEMORY_CONFIG
             return ttnn.create_sharded_memory_config(
                 (
                     32 if self.is_galaxy else self.tile_padded_batch_rows,
@@ -1593,6 +1606,13 @@ class ModelArgs:
                     orientation=ttnn.ShardOrientation.ROW_MAJOR,
                     use_height_and_width_as_shard_shape=True,
                 )
+            elif is_blackhole():
+                # P3a.2 patch (Blackhole P300_X2 MUX): dram_matmul_config falls back
+                # to (8,8) regular matmul which rejects WIDTH_SHARDED inputs
+                # (matmul_device_operation.cpp:821 expects BLOCK_SHARDED or
+                # HEIGHT_SHARDED). Use DRAM input mem cfg so the fallback
+                # matmul accepts the QKV input on Blackhole multichip.
+                return ttnn.DRAM_MEMORY_CONFIG
             else:
                 return ttnn.create_sharded_memory_config(
                     (
@@ -1678,6 +1698,13 @@ class ModelArgs:
                     use_height_and_width_as_shard_shape=True,
                 )
             else:
+                # P3a.2 single-chip: see get_mlp_ff1_3_mem_config comment.
+                # P3a.2 Blackhole multichip: (8,8) matmul fallback rejects
+                # WIDTH_SHARDED output (matmul_device_operation.cpp:971).
+                # Use DRAM output instead — downstream all-reduce reshapes as
+                # needed.
+                if not self.is_multichip or is_blackhole():
+                    return ttnn.DRAM_MEMORY_CONFIG
                 return ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG
         elif mode == Mode.PREFILL:
             return ttnn.DRAM_MEMORY_CONFIG
@@ -3245,6 +3272,27 @@ class ModelArgs:
         return 1  # Fallback to 1 if no divisor found
 
     def dram_matmul_config(self, m: int, k: int, n: int, num_cores=None, fused_activation=None):
+        # P3a.2 patch: DRAM-sharded matmul has std::optionals expected on
+        # multi-device fabric that are empty on single-chip → bad optional
+        # access. Fall back to regular MatmulMultiCoreReuseMultiCast when
+        # the device is single-chip (no MUX dispatch, no multi-mesh ring).
+        # P3a.2 patch (Blackhole P300_X2 MUX): DRAM-sharded matmul's
+        # `get_optimal_dram_bank_to_reader_assignment` allocates an 8x10
+        # core range based on DRAM bank topology, even after `compute_with_
+        # storage_grid_size` is clamped to 12x8. The 10th row exceeds the
+        # MUX-clamped grid -> TT_FATAL in program.cpp CB validation. Route
+        # Blackhole multichip through the regular 8x8 matmul instead. Cost
+        # is some perf headroom we'd otherwise get from DRAM-sharding, but
+        # the kernel boots and produces correct output.
+        if not self.is_multichip or is_blackhole():
+            return self.matmul_config(
+                m=m,
+                k=k,
+                n=n,
+                grid_size=(8, 8),
+                fuse_batch=True,
+                fused_activation=fused_activation,
+            )
         # in0_block_w must evenly divide k and be no larger than tile_size * num_cores
         if num_cores is None:
             # num_cores = self.dram_shard_core_grid_for_k(k).num_cores

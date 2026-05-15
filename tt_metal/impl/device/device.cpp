@@ -501,7 +501,20 @@ CoreCoord Device::dram_grid_size() const {
 
 CoreCoord Device::compute_with_storage_grid_size() const {
     const auto& dispatch_core_config = MetalContext::instance().get_dispatch_core_manager().get_dispatch_core_config();
-    return tt::get_compute_grid_size(id_, num_hw_cqs_, dispatch_core_config);
+    auto grid = tt::get_compute_grid_size(id_, num_hw_cqs_, dispatch_core_config);
+    // P3a.2 patch (Layout-A only): Blackhole P300 under MUX dispatch exposes a
+    // 12x9 worker grid (row 9 reserved for ETH dispatch). Some matmul
+    // auto-configs request up to 8x10 cores; clamp to 8 rows when fabric data-
+    // mover (MUX/DM) is enabled so they never overflow. For single-chip /
+    // no-MUX (Layout-B etc.) the full 10 rows are natively available — DO
+    // NOT clamp. Checking FabricTensixConfig (not DispatchCoreType) because
+    // P300 launches use {dispatch_core_type=WORKER (default), fabric_tensix=MUX};
+    // the prior `type==ETH` check would never match.
+    const auto fabric_tensix = MetalContext::instance().get_fabric_tensix_config();
+    if (fabric_tensix != tt_fabric::FabricTensixConfig::DISABLED && grid.y > 8) {
+        grid.y = 8;
+    }
+    return grid;
 }
 
 CoreCoord Device::virtual_noc0_coordinate(uint8_t noc_index, CoreCoord coord) const {
