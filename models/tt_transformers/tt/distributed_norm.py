@@ -109,7 +109,12 @@ class DistributedNorm(LightweightModule):
         # std::bad_optional_access deep in ttnn.rms_norm — some field expected
         # in multi-device program_configs is empty. Force the unsharded
         # ttnn.rms_norm path on num_devices==1.
-        _force_unsharded = not self.args.is_multichip
+        # P3a.2 patch (Blackhole P300_X2 MUX): we route attn_input through DRAM
+        # (see get_attn_input_mem_config), so the input is no longer sharded.
+        # The sharded norm path then dereferences an empty std::optional
+        # (memory_config/shard_spec) on DRAM input → crash. Force unsharded.
+        from models.common.utility_functions import is_blackhole as _is_bh_p3a2
+        _force_unsharded = not self.args.is_multichip or _is_bh_p3a2()
         _in_sh = (mode == Mode.DECODE) and not _force_unsharded
         _out_sh = (mode == Mode.DECODE) and not _force_unsharded
         if _force_unsharded:
