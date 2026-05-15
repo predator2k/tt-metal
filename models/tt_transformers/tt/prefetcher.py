@@ -59,6 +59,56 @@ def generate_sender_receiver_mapping(num_receivers_per_sender: int = 8) -> dict:
     return mapping
 
 
+def generate_mux_safe_sender_receiver_mapping(
+    num_receivers_per_sender: int = 8,
+    max_row: int = 7,
+) -> dict:
+    """
+    Generate sender->receiver mapping safe for MUX-clamped Blackhole grids.
+
+    On P300_X2 with MUX dispatch, the worker grid is clamped to rows [0, max_row]
+    (typically 12x8 = cols 0-11, rows 0-7). The default YAML config places left
+    senders at row 9 which is outside this grid.
+
+    This function remaps out-of-bounds sender Y coords to unused rows within the
+    valid range, and excludes core (0,0) from receiver placement to avoid L1
+    circular-buffer clash with norm ops.
+    """
+    cfg = ARCH_CONFIG["blackhole"]
+    left_y = cfg["bank_ordered_y_coords"]["left"]
+    right_y = cfg["bank_ordered_y_coords"]["right"]
+    left_sender_col = cfg["sender_cols"]["left"]
+    right_sender_col = cfg["sender_cols"]["right"]
+
+    valid_left_y = [y for y in left_y if y <= max_row]
+    valid_right_y = [y for y in right_y if y <= max_row]
+    used_y = set(valid_left_y) | set(valid_right_y)
+    available_y = sorted(set(range(max_row + 1)) - used_y)
+
+    remapped_left_y = []
+    for y in left_y:
+        if y <= max_row:
+            remapped_left_y.append(y)
+        elif available_y:
+            replacement = available_y.pop(0)
+            logger.info(f"DRAM Prefetcher MUX: remapping left sender row {y} → {replacement} (grid max row {max_row})")
+            remapped_left_y.append(replacement)
+        else:
+            logger.warning(f"DRAM Prefetcher MUX: dropping left sender at row {y} (no rows available within grid)")
+
+    left_senders = [(left_sender_col, r) for r in remapped_left_y]
+    right_senders = [(right_sender_col, r) for r in valid_right_y]
+
+    mapping = {}
+    for sx, sy in left_senders:
+        mapping[(sx, sy)] = [(x, sy) for x in range(1, num_receivers_per_sender + 1)]
+    for sx, sy in right_senders:
+        cols = list(range(8, 11)) + [x for x in range(8) if x != right_sender_col]
+        receivers = [(x, sy) for x in cols if not (x == 0 and sy == 0)]
+        mapping[(sx, sy)] = receivers[:num_receivers_per_sender]
+    return mapping
+
+
 def is_prefetcher_supported(model_name: str, num_devices: int, ring_size: int = 16) -> bool:
     """
     Check if model can use DRAM prefetcher: CB pages <= 65535, L1 size fits, kv_heads % num_devices == 0.
@@ -283,52 +333,64 @@ class Prefetcher(LightweightModule):
         """
         ### Device, Global CB, Parameters
         assert (
-            is_blackhole()
-        ), "DRAM Prefetcher is currently only supported on Tenstorrent Blackhole devices on BH QB 2 (4 devices) and BH LB (8 devices). Model support is available for Llama-3.1-8B under the TT-transformers framework. Support for wormhole devices and other models is WIP."
-        self.global_cb = None
-        self.mesh_device = mesh_device
-        self.num_tensors = num_tensors
-        self.num_layers = num_layers
-        self.enable_performance_mode = True
-        self.worker_sub_device_id = None
-        self.global_cb_size = 0
-        self.num_receiver_cores = (
-            self.get_optimal_receiver_cores() if num_receiver_cores is None else num_receiver_cores
-        )
-        assert (
-            self.num_receiver_cores > 0 and self.num_receiver_cores <= 2
-        ), "Number of receiver cores must be greater than 0 and less than or equal to 2. Only a max of 2 receiver cores have been tested to be functional on BH/WH"
+            num_receiver_cores is None or num_receiver_cores in self.legal_receiver_cores
+        ), "num_receiver_cores must be in legal_receiver_cores"
 
-        # Max tensor block size is the largest block size of a tensor in bytes (1 block = tensor volume / (tile size * tile size) // (num_receiver_cores * num_reader_cores))
-        self.max_tensor_block_size = 0
-        self.ring_size = self.num_receiver_cores * self.mesh_device.dram_grid_size().x
-        self.width_cores = self.mesh_device.compute_with_storage_grid_size().x
-        self.height_cores = self.mesh_device.compute_with_storage_grid_size().y
+        grid = self.mesh_device.compute_with_storage_grid_size()
+        self._mux_clamped = grid.y < 10
+        if self._mux_clamped:
+            logger.info(
+                f"DRAM Prefetcher: MUX-clamped grid detected ({grid.x}x{grid.y}), "
+                f"using MUX-safe sender/receiver mapping"
+            )
+
+        def _make_mapping(n_recv):
+            if self._mux_clamped:
+                return generate_mux_safe_sender_receiver_mapping(n_recv, max_row=grid.y - 1)
+            return generate_sender_receiver_mapping(n_recv) if n_recv > 3 else None
+
+        if num_receiver_cores is not None:
+            assert is_prefetcher_supported(
+                self.model_name, self.mesh_device.get_num_devices(), num_receiver_cores * self.num_senders
+            ), "num_receiver_cores is not supported"
+            self.num_receiver_cores = num_receiver_cores
+            self.receiver_mapping_override = _make_mapping(num_receiver_cores)
+        else:
+            for num_receivers in self.legal_receiver_cores:
+                if is_prefetcher_supported(
+                    self.model_name, self.mesh_device.get_num_devices(), num_receivers * self.num_senders
+                ):
+                    self.num_receiver_cores = num_receivers
+                    self.receiver_mapping_override = _make_mapping(num_receivers)
+                    break
 
         ### Core Config
         self.core_config = PrefetcherCoreConfig(
             num_receiver_cores=self.num_receiver_cores, mesh_device=self.mesh_device
         )
 
-        ### Prefetcher Hardcoded Core Ranges
-        self.all_core_range_set = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(self.width_cores - 1, self.height_cores - 1))]
-        )
         self.dram_banks = self.core_config.dram_banks
 
-        # Dynamic worker core grid (for easily grabbing a sub core grid that is of mulitples of 8 cores)
-        self.dynamic_worker_core_grid = lambda num_cores: ttnn.CoreRangeSet(
-            # requested number of cores MUST be multiples of 8
-            [ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(num_cores // 8, 7))]
+        ### Worker core ranges for the worker sub device
+        full_grid = ttnn.CoreRangeSet(
+            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
         )
-
-        # Remaining worker core ranges for the worker sub device
-        left_range = self.core_config._receiver_cols["left"]
-        right_range = self.core_config._receiver_cols["right"]
-        self.all_worker_cores_range_set = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(left_range[0], 0), ttnn.CoreCoord(left_range[1] - 1, 9))]
-            + [ttnn.CoreRange(ttnn.CoreCoord(right_range[0], 0), ttnn.CoreCoord(right_range[1] - 1, 9))]
-        )
+        self.all_core_range_set = full_grid
+        if self.receiver_mapping_override:
+            sender_cores = [
+                ttnn.CoreRange(ttnn.CoreCoord(s.x, s.y), ttnn.CoreCoord(s.x, s.y))
+                for s in self.core_config.sender_cores(active=True)
+            ]
+            sender_set = ttnn.CoreRangeSet(sender_cores)
+            self.all_worker_cores_range_set = full_grid.subtract(sender_set)
+        else:
+            left_range = self.core_config._receiver_cols["left"]
+            right_range = self.core_config._receiver_cols["right"]
+            max_y = grid.y - 1
+            self.all_worker_cores_range_set = ttnn.CoreRangeSet(
+                [ttnn.CoreRange(ttnn.CoreCoord(left_range[0], 0), ttnn.CoreCoord(left_range[1] - 1, max_y))]
+                + [ttnn.CoreRange(ttnn.CoreCoord(right_range[0], 0), ttnn.CoreCoord(right_range[1] - 1, max_y))]
+            )
 
         ### Prefetched Tensors
         self.callbacks = []
