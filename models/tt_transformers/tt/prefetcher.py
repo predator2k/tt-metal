@@ -35,6 +35,14 @@ VERIFIED_MODEL_CONFIGS = {
     "Qwen3-VL-72B": {"dim": 8192, "hidden_dim": 28672, "n_heads": 64, "n_kv_heads": 8},
     "Gemma3-4B": {"dim": 2560, "hidden_dim": 14336, "n_heads": 20, "n_kv_heads": 20},
     "Gemma3-27B": {"dim": 4608, "hidden_dim": 24576, "n_heads": 32, "n_kv_heads": 8},
+    # Tenstorrent-p1: Qwen3 text-only sizes added for the SGLang/tt-sglang
+    # path. Both have strictly smaller dim/hidden_dim than at least one
+    # already-verified Llama in this table (Llama-3.2-1B has hidden_dim=8192
+    # vs Qwen3-1.7B 6144; Llama-3.1-8B has hidden_dim=14336 vs Qwen3-8B
+    # 12288), so the CB-pages / L1-size constraints in
+    # is_prefetcher_supported() pass conservatively.
+    "Qwen3-1.7B": {"dim": 2048, "hidden_dim": 6144, "n_heads": 16, "n_kv_heads": 8},
+    "Qwen3-8B": {"dim": 4096, "hidden_dim": 12288, "n_heads": 32, "n_kv_heads": 8},
 }
 
 
