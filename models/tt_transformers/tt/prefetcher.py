@@ -464,12 +464,11 @@ class Prefetcher(LightweightModule):
                 # L1 allocations (RMSNorm etc.) on compute cores.
                 if self.receiver_mapping_override:
                     all_receivers = set()
-                    for s in self.sender_cores(active=True):
-                        for r_set in self.receiver_cores(sender_active=None, receiver_active=True):
-                            for cr in r_set.ranges():
-                                for x in range(cr.start_coord.x, cr.end_coord.x + 1):
-                                    for y in range(cr.start_coord.y, cr.end_coord.y + 1):
-                                        all_receivers.add((x, y))
+                    for r_set in self.receiver_cores(sender_active=None, receiver_active=True):
+                        for cr in r_set.ranges():
+                            for x in range(cr.start.x, cr.end.x + 1):
+                                for y in range(cr.start.y, cr.end.y + 1):
+                                    all_receivers.add((x, y))
                     receiver_ranges = [
                         ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y))
                         for x, y in sorted(all_receivers)
