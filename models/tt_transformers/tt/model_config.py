@@ -285,11 +285,26 @@ class ModelOptimizations:
                         OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI2,
                     },
                 })
-            else:
-                logger.info(f"Model {model_name}: BFP4 MLP + HIFI2 fidelity (balanced)")
+            elif _qwen3_mode == "balanced_old":
+                # Previous default: HIFI2_FP16 MLP fidelity (26.9 tok/s)
+                logger.info(f"Model {model_name}: BFP4 MLP + HIFI2_FP16 fidelity (old balanced)")
                 inst = cls({
                     "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
                     "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.HIFI2_FP16},
+                })
+            else:
+                # New default (v129): BFP4 LOFI MLP + HIFI2 SDPA
+                # Validated: 28.1 tok/s, correct output at 256+ tokens including
+                # chat/thinking mode. LOFI for MLP (fast), HIFI2 for SDPA (prevents
+                # attention precision degradation in long-form generation).
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI + HIFI2 SDPA (balanced, 28.1 tok/s)")
+                inst = cls({
+                    "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI2,
+                    },
                 })
         else:
             settings = {
