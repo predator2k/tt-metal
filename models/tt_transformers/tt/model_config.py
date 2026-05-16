@@ -202,6 +202,89 @@ class ModelOptimizations:
                         OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
                     },
                 })
+            elif _qwen3_mode == "lofi":
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI (max speed, may degrade)")
+                inst = cls({
+                    "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                    "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
+                })
+            elif _qwen3_mode == "lofi_bf16kv":
+                # Hypothesis: KV cache precision causes thinking chain degradation
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI + BF16 KV cache")
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+                        TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
+                })
+            elif _qwen3_mode == "lofi_hifi2_sdpa":
+                # Hypothesis: attention SDPA fidelity causes thinking chain degradation
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI MLP + HIFI2 SDPA")
+                inst = cls({
+                    "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI2,
+                    },
+                })
+            elif _qwen3_mode == "lofi_hifi2_attn":
+                # Hypothesis: all attention ops need higher fidelity
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI MLP + HIFI2 all-attn")
+                inst = cls({
+                    "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI,
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI2,
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI2,
+                    },
+                })
+            elif _qwen3_mode == "bfp8_lofi":
+                # Hypothesis: BFP8 (no BFP4) + LOFI is faster than HIFI but correct
+                logger.info(f"Model {model_name}: BFP8 MLP (default) + LOFI fidelity")
+                inst = cls({
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI,
+                        OpGroup.LI_FF2: MathFidelitySetting.LOFI,
+                    },
+                })
+            elif _qwen3_mode == "lofi_bf16kv_hifi2_sdpa":
+                # Combined: BF16 KV + HIFI2 SDPA — surgical precision boost
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI + BF16 KV + HIFI2 SDPA")
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+                        TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI2,
+                    },
+                })
+            elif _qwen3_mode == "lofi_bf16kv_hifi2_attn":
+                # Combined: BF16 KV + HIFI2 all-attn — more precision boost
+                logger.info(f"Model {model_name}: BFP4 MLP + LOFI + BF16 KV + HIFI2 all-attn")
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.FF1_FF3: PrecisionSetting.BFP4,
+                        TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI,
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI2,
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI2,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI2,
+                    },
+                })
             else:
                 logger.info(f"Model {model_name}: BFP4 MLP + HIFI2 fidelity (balanced)")
                 inst = cls({
