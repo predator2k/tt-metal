@@ -361,7 +361,9 @@ class Prefetcher(LightweightModule):
             self.num_receiver_cores = num_receiver_cores
             self.receiver_mapping_override = _make_mapping(num_receiver_cores)
         else:
-            for num_receivers in self.legal_receiver_cores:
+            # Prefer larger ring sizes: more receivers per sender = less L1 per
+            # receiver core = less likely to clash with model op L1 allocations.
+            for num_receivers in reversed(self.legal_receiver_cores):
                 if is_prefetcher_supported(
                     self.model_name, self.mesh_device.get_num_devices(), num_receivers * self.num_senders
                 ):
