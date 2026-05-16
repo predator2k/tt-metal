@@ -161,7 +161,7 @@ class ModelOptimizations:
         All models use bfp4 in FF1 and FF3 MLPs in this configuration
         """
         base_model_name = get_base_model_name(model_name)
-        if base_model_name in ["Qwen2.5-7B", "Qwen2.5-VL-7B", "Qwen3-8B"]:
+        if base_model_name in ["Qwen2.5-7B", "Qwen2.5-VL-7B"]:
             logger.info(
                 f"Model {model_name} is degraded under standard high-performance settings, using BF16 attention and BFP8 MLP"
             )
@@ -182,6 +182,32 @@ class ModelOptimizations:
                     },
                 }
             )
+        elif base_model_name in ["Qwen3-8B"]:
+            import os as _os
+            _qwen3_mode = _os.environ.get("SGLANG_TT_QWEN3_PRECISION", "balanced")
+            if _qwen3_mode == "hifi":
+                logger.info(f"Model {model_name}: forced full HIFI mode via env")
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.WQKV: PrecisionSetting.BF16,
+                        TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                        TensorGroup.WO: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                    },
+                })
+            else:
+                logger.info(f"Model {model_name}: BFP4 MLP + HIFI2 fidelity (balanced)")
+                inst = cls({
+                    "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                    "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.HIFI2_FP16},
+                })
         else:
             settings = {
                 "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
