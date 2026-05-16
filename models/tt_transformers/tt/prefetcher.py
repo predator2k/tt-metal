@@ -337,16 +337,21 @@ class Prefetcher(LightweightModule):
         ), "num_receiver_cores must be in legal_receiver_cores"
 
         grid = self.mesh_device.compute_with_storage_grid_size()
-        self._mux_clamped = grid.y < 10
+        # compute_with_storage_grid_size() reports hardware capability (13×10
+        # on Blackhole) not the MUX-restricted runtime grid (12×8). Detect
+        # MUX from architecture: multi-device Blackhole always uses MUX
+        # dispatch which clamps the worker grid to rows 0-7.
+        self._mux_clamped = is_blackhole()
+        _mux_max_row = 7 if self._mux_clamped else grid.y - 1
         if self._mux_clamped:
             logger.info(
-                f"DRAM Prefetcher: MUX-clamped grid detected ({grid.x}x{grid.y}), "
-                f"using MUX-safe sender/receiver mapping"
+                f"DRAM Prefetcher: Blackhole detected — using MUX-safe mapping "
+                f"(max_row={_mux_max_row}, hw grid {grid.x}x{grid.y})"
             )
 
         def _make_mapping(n_recv):
             if self._mux_clamped:
-                return generate_mux_safe_sender_receiver_mapping(n_recv, max_row=grid.y - 1)
+                return generate_mux_safe_sender_receiver_mapping(n_recv, max_row=_mux_max_row)
             return generate_sender_receiver_mapping(n_recv) if n_recv > 3 else None
 
         if num_receiver_cores is not None:
@@ -372,8 +377,12 @@ class Prefetcher(LightweightModule):
         self.dram_banks = self.core_config.dram_banks
 
         ### Worker core ranges for the worker sub device
+        # Use _mux_max_row for the actual runtime grid limit (MUX clamps
+        # rows to 0-7 even though compute_with_storage_grid reports 10)
+        _grid_max_x = grid.x - 1
+        _grid_max_y = _mux_max_row
         full_grid = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid.x - 1, grid.y - 1))]
+            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(_grid_max_x, _grid_max_y))]
         )
         self.all_core_range_set = full_grid
         if self.receiver_mapping_override:
@@ -386,10 +395,9 @@ class Prefetcher(LightweightModule):
         else:
             left_range = self.core_config._receiver_cols["left"]
             right_range = self.core_config._receiver_cols["right"]
-            max_y = grid.y - 1
             self.all_worker_cores_range_set = ttnn.CoreRangeSet(
-                [ttnn.CoreRange(ttnn.CoreCoord(left_range[0], 0), ttnn.CoreCoord(left_range[1] - 1, max_y))]
-                + [ttnn.CoreRange(ttnn.CoreCoord(right_range[0], 0), ttnn.CoreCoord(right_range[1] - 1, max_y))]
+                [ttnn.CoreRange(ttnn.CoreCoord(left_range[0], 0), ttnn.CoreCoord(left_range[1] - 1, _grid_max_y))]
+                + [ttnn.CoreRange(ttnn.CoreCoord(right_range[0], 0), ttnn.CoreCoord(right_range[1] - 1, _grid_max_y))]
             )
 
         ### Prefetched Tensors
