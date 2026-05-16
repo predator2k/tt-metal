@@ -342,9 +342,10 @@ class Prefetcher(LightweightModule):
             self.num_receiver_cores = num_receiver_cores
             self.receiver_mapping_override = _make_mapping(num_receiver_cores)
         else:
-            # Prefer larger ring sizes: more receivers per sender = less L1 per
-            # receiver core = less likely to clash with model op L1 allocations.
-            for num_receivers in reversed(self.legal_receiver_cores):
+            # Prefer smallest valid ring: fewer receiver cores = more cores
+            # available for compute in the 3-sub-device layout (receivers are
+            # isolated from the worker grid to prevent L1 CB clashes).
+            for num_receivers in self.legal_receiver_cores:
                 if is_prefetcher_supported(
                     self.model_name, self.mesh_device.get_num_devices(), num_receivers * self.num_senders
                 ):
@@ -456,8 +457,37 @@ class Prefetcher(LightweightModule):
         match mode:
             case Mode.DECODE:
                 self.prefetcher_sub_device = PrefetcherSubDevice(self.mesh_device)
-                self.prefetcher_sub_device.add_sub_device(self.to_core_range_set(self.sender_cores(active=True)))
-                self.prefetcher_sub_device.add_sub_device(self.all_worker_cores_range_set)
+                sender_set = self.to_core_range_set(self.sender_cores(active=True))
+                self.prefetcher_sub_device.add_sub_device(sender_set)
+                # 3-sub-device layout: separate receivers from workers so the
+                # prefetcher CB on receiver cores doesn't clash with model op
+                # L1 allocations (RMSNorm etc.) on compute cores.
+                if self.receiver_mapping_override:
+                    all_receivers = set()
+                    for s in self.sender_cores(active=True):
+                        for r_set in self.receiver_cores(sender_active=None, receiver_active=True):
+                            for cr in r_set.ranges():
+                                for x in range(cr.start_coord.x, cr.end_coord.x + 1):
+                                    for y in range(cr.start_coord.y, cr.end_coord.y + 1):
+                                        all_receivers.add((x, y))
+                    receiver_ranges = [
+                        ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y))
+                        for x, y in sorted(all_receivers)
+                    ]
+                    if receiver_ranges:
+                        receiver_set = ttnn.CoreRangeSet(receiver_ranges)
+                        compute_only = self.all_worker_cores_range_set.subtract(receiver_set)
+                        self.prefetcher_sub_device.add_sub_device(receiver_set)
+                        self.prefetcher_sub_device.add_sub_device(compute_only)
+                        self.all_worker_cores_range_set = compute_only
+                        logger.info(
+                            f"[Prefetcher] 3-sub-device layout: "
+                            f"{len(all_receivers)} receiver cores isolated from worker grid"
+                        )
+                    else:
+                        self.prefetcher_sub_device.add_sub_device(self.all_worker_cores_range_set)
+                else:
+                    self.prefetcher_sub_device.add_sub_device(self.all_worker_cores_range_set)
                 self.prefetcher_sub_device.init_sub_device_manager()
             case Mode.PREFILL:
                 self.prefetcher_sub_device = PrefetcherSubDevice(self.mesh_device)
