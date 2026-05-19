@@ -411,6 +411,14 @@ class Prefetcher(LightweightModule):
         self.init_prefill_done = False
         self.prefetch_done = False
 
+    @property
+    def worker_start_core(self):
+        """First valid start_core inside the (possibly carved-by-receivers) worker grid."""
+        ranges = self.all_worker_cores_range_set.ranges()
+        if not ranges:
+            return ttnn.CoreCoord(1, 0)
+        return ranges[0].start
+
     # NOTE: DRAM prefetched weights are prefetched in the order of the construction of the module
     def register_callback(self, callback: Callable[[], None]):
         self.callbacks.append(callback)

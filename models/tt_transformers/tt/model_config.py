@@ -1538,7 +1538,7 @@ class ModelArgs:
         """Get the SDPA program config for decode mode."""
         if prefetcher is not None:
             sdpa_grid_size = (8, 8)
-            start_core = ttnn.CoreCoord(1, 0)
+            start_core = prefetcher.worker_start_core
             num_sdpa_cores = sdpa_grid_size[0] * sdpa_grid_size[1]
             return ttnn.SDPAProgramConfig(
                 compute_with_storage_grid_size=sdpa_grid_size,
@@ -1786,7 +1786,7 @@ class ModelArgs:
         """Get the memory config for SDPA output in attention."""
         if mode == Mode.DECODE:
             if prefetcher is not None:
-                start_core = ttnn.CoreCoord(1, 0)
+                start_core = prefetcher.worker_start_core
                 return ttnn.create_sharded_memory_config(
                     shape=(math.ceil(self.n_local_heads / ttnn.TILE_SIZE) * ttnn.TILE_SIZE, self.head_dim),
                     core_grid=ttnn.num_cores_to_corerangeset_in_subcoregrids(

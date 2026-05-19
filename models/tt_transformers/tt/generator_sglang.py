@@ -81,7 +81,14 @@ def initialize_sglang_text_transformer(
         prefetcher = None
         if use_prefetcher:
             num_devs = submesh.get_num_devices()
-            if is_prefetcher_supported(hf_config._name_or_path, num_devs):
+            # Tenstorrent-p1: gate uses default ring_size=16 which fails for
+            # Qwen3-8B/num_devs=2 (1.67MB > 850KB cap). Iterate the constructor's
+            # legal_receiver_cores [1,2,3,8,10] (ring_sizes [8,16,24,64,80]) and
+            # accept if ANY passes.
+            if any(
+                is_prefetcher_supported(hf_config._name_or_path, num_devs, ring_size=rs)
+                for rs in (8, 16, 24, 64, 80)
+            ):
                 prefetcher = Prefetcher(submesh, num_tensors=5, num_layers=n_layers)
         prefetchers.append(prefetcher)
         model_args_i = ModelArgs(

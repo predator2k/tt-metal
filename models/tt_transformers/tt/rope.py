@@ -957,8 +957,10 @@ class RotarySetup(LightweightModule):
         embedding_layout = ttnn.TILE_LAYOUT
 
         if self.prefetcher is not None:
+            # Read worker_start_core LAZILY here. self.start_core captured at __init__
+            # time is stale once prefetcher.init(Mode.DECODE) carves receivers out.
             trans_mat_core_grids = ttnn.num_cores_to_corerangeset_in_subcoregrids(
-                self.start_core,
+                self.prefetcher.worker_start_core,
                 self.batch_size_per_device_group,
                 self.prefetcher.all_worker_cores_range_set,
                 row_wise=True,
