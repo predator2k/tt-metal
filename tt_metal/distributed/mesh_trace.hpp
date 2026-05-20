@@ -36,6 +36,13 @@ public:
     // Trace data per logical Device in a Mesh.
     std::vector<MeshTraceData> ordered_trace_data;
     uint32_t total_trace_size = 0;
+
+    // [Layer-16.5d] Sub-device IDs under which this trace was originally captured.
+    // Non-empty only when register_default_trace_on_active_manager() has remapped
+    // sub_device_ids to a different manager's stall group.  Used by enqueue_trace()
+    // to determine which stream indices the baked trace binary will actually ack on
+    // (the captured stream, not the current stall-group stream).
+    std::vector<SubDeviceId> captured_sub_device_ids;
 };
 
 // Ties a MeshTraceDescriptor (host side state) to a MeshBuffer (device side state)

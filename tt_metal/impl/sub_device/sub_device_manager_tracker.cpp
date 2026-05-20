@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "distributed/mesh_trace.hpp"
 
 #include <tt_stl/assert.hpp>
 #include "core_coord.hpp"
@@ -125,6 +126,90 @@ void SubDeviceManagerTracker::remove_sub_device_manager(SubDeviceManagerId sub_d
 }
 
 SubDeviceManager* SubDeviceManagerTracker::get_active_sub_device_manager() const { return active_sub_device_manager_; }
+
+void SubDeviceManagerTracker::register_default_trace_on_active_manager(const distributed::MeshTraceId& trace_id) {
+    // When DEFAULT is active there is nothing to do: execute_trace will already find the trace
+    // in DEFAULT's pool.  This is a harmless no-op, not an error.
+    if (active_sub_device_manager_ == default_sub_device_manager_) {
+        return;
+    }
+    auto src_buf = default_sub_device_manager_->get_trace(trace_id);
+    TT_FATAL(
+        src_buf != nullptr,
+        "register_default_trace_on_active_manager: trace {} not found on the default sub-device manager",
+        *trace_id);
+
+    // The active (DECODE) manager may have a different sub-device layout than the DEFAULT manager
+    // under which this trace was captured.  For example:
+    //   DEFAULT: sub_device 0 = all compute workers
+    //   DECODE:  sub_device 0 = sender (persistent),
+    //            sub_device 1 = receiver (persistent),
+    //            sub_device 2 = worker (compute)
+    //
+    // issue_trace_commands() sends the go signal to whichever sub_device_ids are baked into the
+    // MeshTraceDescriptor.  If we share the descriptor unchanged, the go signal would target the
+    // sender (sub_device 0 under DECODE) rather than the compute workers, causing a hang.
+    //
+    // Fix: build a new MeshTraceDescriptor that remaps DEFAULT's sub_device_ids to the active
+    // manager's stall group (which is always the set of compute-worker sub-devices).  The
+    // underlying MeshBuffer (device DRAM trace data) is identical and can be shared.
+    const auto& stall_group = active_sub_device_manager_->get_sub_device_stall_group();
+    const auto& src_desc = src_buf->desc;
+    TT_FATAL(
+        src_desc != nullptr,
+        "register_default_trace_on_active_manager: trace {} has a null descriptor",
+        *trace_id);
+
+    bool needs_remap = false;
+    for (const auto& id : src_desc->sub_device_ids) {
+        bool found = false;
+        for (const auto& sg_id : stall_group) {
+            if (id == sg_id) { found = true; break; }
+        }
+        if (!found) { needs_remap = true; break; }
+    }
+
+    if (!needs_remap) {
+        // sub_device_ids already match the active manager's stall group — share as-is.
+        active_sub_device_manager_->register_trace(trace_id, src_buf);
+        return;
+    }
+
+    // Build a 1-to-1 remap: DEFAULT sub_device_ids[i] → stall_group[i].
+    // We require a 1-to-1 correspondence in size.
+    TT_FATAL(
+        src_desc->sub_device_ids.size() == stall_group.size(),
+        "register_default_trace_on_active_manager: trace {} has {} sub-device(s) but the active "
+        "manager's stall group has {} sub-device(s); cannot remap",
+        *trace_id,
+        src_desc->sub_device_ids.size(),
+        stall_group.size());
+
+    auto new_desc = std::make_shared<distributed::MeshTraceDescriptor>();
+    new_desc->ordered_trace_data = src_desc->ordered_trace_data;  // shared data copy
+    new_desc->total_trace_size   = src_desc->total_trace_size;
+
+    for (size_t i = 0; i < src_desc->sub_device_ids.size(); ++i) {
+        SubDeviceId old_id = src_desc->sub_device_ids[i];
+        SubDeviceId new_id = stall_group[i];
+        new_desc->sub_device_ids.push_back(new_id);
+        auto it = src_desc->descriptors.find(old_id);
+        TT_FATAL(
+            it != src_desc->descriptors.end(),
+            "register_default_trace_on_active_manager: sub_device_id {} missing from descriptor map for trace {}",
+            *old_id, *trace_id);
+        new_desc->descriptors[new_id] = it->second;
+    }
+
+    // Record the original (captured) sub_device_ids so that enqueue_trace() can
+    // identify which stream slot the baked trace binary will ack on.
+    new_desc->captured_sub_device_ids = src_desc->sub_device_ids;
+
+    auto remapped_buf           = std::make_shared<distributed::MeshTraceBuffer>();
+    remapped_buf->desc          = std::move(new_desc);
+    remapped_buf->mesh_buffer   = src_buf->mesh_buffer;  // share device DRAM buffer
+    active_sub_device_manager_->register_trace(trace_id, std::move(remapped_buf));
+}
 
 SubDeviceManager* SubDeviceManagerTracker::get_default_sub_device_manager() const {
     return default_sub_device_manager_;

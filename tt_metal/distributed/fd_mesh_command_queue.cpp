@@ -946,6 +946,7 @@ void FDMeshCommandQueue::reset_worker_state(
     cq_shared_state_->sub_device_cq_owner.clear();
     cq_shared_state_->sub_device_cq_owner.resize(num_sub_devices);
     in_use_ = true;
+
     for (auto* device : mesh_device_->get_devices()) {
         program_dispatch::reset_worker_dispatch_state_on_device(
             mesh_device_,
@@ -1049,14 +1050,73 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
     // programs
     this->reset_prefetcher_cache_manager();
 
+    // [Layer-16.5d] Cross-manager trace replay: fix stream-0 / stream-N mismatch.
+    //
+    // When register_default_trace_on_active_manager() has remapped a DEFAULT-captured
+    // trace onto a different sub-device manager (e.g. DECODE), the descriptor's
+    // sub_device_ids have been changed (e.g. SubDeviceId(0) → SubDeviceId(2)) but
+    // the baked DRAM trace binary still sends worker-completion acks to the ORIGINAL
+    // stream (stream 0).  update_worker_state_post_trace_execution() updates
+    // expected_num_workers_completed_[remapped_id] — which is never incremented by
+    // the device — and finish_nolock() then waits for the remapped stream, hanging.
+    //
+    // Fix: if captured_sub_device_ids is non-empty, the trace was remapped.
+    //   1. Before the update, save the pre-execution counts for BOTH the captured and
+    //      the remapped slots so we can correctly restore them afterwards.
+    //   2. After the update, move the new count from the remapped slot to the captured
+    //      (original) slot — that is the slot the device firmware actually acks on —
+    //      and restore the remapped slot to its pre-execution value.
+    //   3. Call finish_nolock with the original (captured) sub_device_ids so the event-
+    //      record command waits for the correct stream.
+    //
+    // Invariant: captured_sub_device_ids.size() == sub_device_ids.size() (ensured by
+    // register_default_trace_on_active_manager's 1-to-1 remap check).
+    const auto& captured_ids = descriptor->captured_sub_device_ids;
+    const bool is_remapped_trace = !captured_ids.empty();
+
+    // Snapshot the pre-execution counts for the REMAPPED slots.
+    // After update_worker_state_post_trace_execution writes the post-trace count to the
+    // remapped slot, we restore the remapped slot to its pre-trace value (because the
+    // device never actually touched that stream).
+    std::vector<uint32_t> pre_exec_remapped_counts;
+    if (is_remapped_trace) {
+        const auto& remapped_ids = descriptor->sub_device_ids;
+        pre_exec_remapped_counts.reserve(remapped_ids.size());
+        for (const auto& rem_id : remapped_ids) {
+            pre_exec_remapped_counts.push_back(expected_num_workers_completed_[*rem_id]);
+        }
+    }
+
     trace_dispatch::update_worker_state_post_trace_execution(
         trace_inst->desc->descriptors,
         cq_shared_state_->worker_launch_message_buffer_state,
         config_buffer_mgr_,
         expected_num_workers_completed_);
 
+    if (is_remapped_trace) {
+        // Move post-trace counts from remapped slots → original (captured) slots.
+        // The captured slots are the streams the baked trace binary actually acks on.
+        // Restore remapped slots to their pre-trace values (device never touched them).
+        const auto& remapped_ids = descriptor->sub_device_ids;
+        for (size_t i = 0; i < captured_ids.size(); ++i) {
+            uint32_t cap_idx      = *captured_ids[i];
+            uint32_t remapped_idx = *remapped_ids[i];
+            // Post-trace count was written to remapped_idx by update_worker_state.
+            // The device acked on cap_idx (stream 0); propagate the count there.
+            expected_num_workers_completed_[cap_idx]      = expected_num_workers_completed_[remapped_idx];
+            // Restore remapped slot: device never wrote to this stream for this trace.
+            expected_num_workers_completed_[remapped_idx] = pre_exec_remapped_counts[i];
+        }
+    }
+
     if (blocking) {
-        this->finish_nolock();
+        if (is_remapped_trace) {
+            // finish_nolock with captured sub_device_ids → waits for the stream that
+            // the baked trace binary actually sent completion acks to (stream 0).
+            this->finish_nolock(tt::stl::Span<const SubDeviceId>(captured_ids.data(), captured_ids.size()));
+        } else {
+            this->finish_nolock();
+        }
     }
 }
 
