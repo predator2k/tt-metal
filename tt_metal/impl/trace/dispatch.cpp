@@ -82,7 +82,18 @@ void issue_trace_commands(
     const TraceDispatchMetadata& dispatch_md,
     uint8_t cq_id,
     const DispatchArray<uint32_t>& expected_num_workers_completed,
-    CoreCoord dispatch_core) {
+    CoreCoord dispatch_core,
+    const std::vector<SubDeviceId>* wait_sub_device_ids) {
+    // Build remapped→captured stream-index lookup for WAIT_STREAM, if provided.
+    // go-signal always uses the remapped IDs (dispatch_md.sub_device_ids / trace_worker_descriptors keys).
+    std::unordered_map<uint32_t, uint32_t> wait_stream_index_override;
+    if (wait_sub_device_ids && wait_sub_device_ids->size() == dispatch_md.sub_device_ids.size()) {
+        for (size_t i = 0; i < dispatch_md.sub_device_ids.size(); ++i) {
+            uint32_t remapped_idx = *dispatch_md.sub_device_ids[i];
+            uint32_t captured_idx = *(*wait_sub_device_ids)[i];
+            wait_stream_index_override[remapped_idx] = captured_idx;
+        }
+    }
     void* cmd_region = sysmem_manager.issue_queue_reserve(dispatch_md.cmd_sequence_sizeB, cq_id);
 
     HugepageDeviceCommand command_sequence(cmd_region, dispatch_md.cmd_sequence_sizeB);
@@ -127,26 +138,56 @@ void issue_trace_commands(
     // go_signal. Clear the dispatch <--> worker semaphore, since trace starts at 0.
     for (const auto& [id, desc] : dispatch_md.trace_worker_descriptors) {
         auto index = *id;
-        uint32_t expected_num_workers = expected_num_workers_completed[index];
-        if (desc.num_traced_programs_needing_go_signal_multicast) {
-            expected_num_workers += device->num_worker_cores(HalProgrammableCoreType::TENSIX, id);
-        }
-        if (desc.num_traced_programs_needing_go_signal_unicast) {
-            expected_num_workers += device->num_virtual_eth_cores(id);
+        // For remapped traces: WAIT_STREAM must use the captured (original) stream index,
+        // because the baked trace binary sends worker-completion acks to the captured stream,
+        // not the remapped one.  go-signal (above) keeps the remapped index unchanged.
+        auto wait_it = wait_stream_index_override.find(index);
+        uint32_t wait_index = (wait_it != wait_stream_index_override.end()) ? wait_it->second : index;
+        const bool is_remapped = (wait_index != index);
+
+        // [Layer-18.5] For remapped traces, the go-signal acks from workers are directed to
+        // stream `index` (remapped) via the go-signal message's dispatch_message_update_offset.
+        // They do NOT arrive on stream `wait_index` (captured = stream 0).  Only the baked
+        // trace-program completion acks land on stream 0.
+        //
+        // Therefore the WAIT target for stream 0 must be:
+        //   captured_base = expected_num_workers_completed[wait_index]
+        //   (no N_tensix / N_eth added; those acks go to stream `index`, not stream 0)
+        //
+        // This equals the value record_event will wait for AFTER the trace programs finish
+        // (pre_exec_cap stays in the host tracker, and the trace will ADD M_delta acks to
+        // stream 0 from 0 → M_delta after CLEAR; the updated cap slot = pre_exec_cap+M_delta
+        // is what finish_nolock / record_event uses — see fd_mesh_command_queue.cpp layer-16.5e).
+        //
+        // For non-remapped traces, use the original logic: base is the remapped (== captured)
+        // slot plus the go-signal ack count (N_tensix / N_eth).
+        uint32_t expected_num_workers;
+        if (is_remapped) {
+            // Captured-stream WAIT: fires at pre_exec_cap (already accumulated), then CLEAR;
+            // trace programs then deliver M_delta fresh acks that record_event waits for.
+            expected_num_workers = expected_num_workers_completed[wait_index];
+        } else {
+            expected_num_workers = expected_num_workers_completed[index];
+            if (desc.num_traced_programs_needing_go_signal_multicast) {
+                expected_num_workers += device->num_worker_cores(HalProgrammableCoreType::TENSIX, id);
+            }
+            if (desc.num_traced_programs_needing_go_signal_unicast) {
+                expected_num_workers += device->num_virtual_eth_cores(id);
+            }
         }
 
         if (MetalContext::instance().get_dispatch_query_manager().distributed_dispatcher()) {
             command_sequence.add_dispatch_wait(
                 CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM,
                 0,
-                MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(index),
+                MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(wait_index),
                 expected_num_workers,
                 1);
         }
         command_sequence.add_dispatch_wait(
             CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM | CQ_DISPATCH_CMD_WAIT_FLAG_CLEAR_STREAM,
             0,
-            MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(index),
+            MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(wait_index),
             expected_num_workers);
     }
 

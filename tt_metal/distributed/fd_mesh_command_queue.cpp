@@ -1041,9 +1041,16 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
         buffer->num_pages(),
         buffer->address());
 
+    // For remapped traces, pass captured_sub_device_ids so WAIT_STREAM uses the original
+    // stream index (stream 0) — the stream the baked trace binary actually acks workers on.
+    const auto& captured_ids_for_issue = descriptor->captured_sub_device_ids;
+    const std::vector<SubDeviceId>* wait_ids_ptr =
+        captured_ids_for_issue.empty() ? nullptr : &captured_ids_for_issue;
+
     for (auto* device : mesh_device_->get_devices()) {
         trace_dispatch::issue_trace_commands(
-            mesh_device_, device->sysmem_manager(), dispatch_md, id_, expected_num_workers_completed_, dispatch_core_);
+            mesh_device_, device->sysmem_manager(), dispatch_md, id_, expected_num_workers_completed_, dispatch_core_,
+            wait_ids_ptr);
     }
 
     // Reset the prefetcher cache manager, since trace capture modifies the state on host for subsequent non-trace
@@ -1074,10 +1081,18 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
     const auto& captured_ids = descriptor->captured_sub_device_ids;
     const bool is_remapped_trace = !captured_ids.empty();
 
-    // Snapshot the pre-execution counts for the REMAPPED slots.
-    // After update_worker_state_post_trace_execution writes the post-trace count to the
-    // remapped slot, we restore the remapped slot to its pre-trace value (because the
-    // device never actually touched that stream).
+    // Snapshot the pre-execution counts for the remapped slots only.
+    //
+    // Remapped slot snapshot: after update_worker_state_post_trace_execution writes the
+    // post-trace count to the remapped slot, we restore it to its pre-trace value (because
+    // the device never actually touched that stream for a cross-manager trace).
+    //
+    // Captured slot: issue_trace_commands loop 2 (layer-18) emits a WAIT_STREAM+CLEAR on
+    // the captured stream (stream 0) before the trace runs.  That CLEAR zeroes the hardware
+    // counter before trace execution, so the counter always ends at exactly M_delta after
+    // each replay — there is no accumulation across runs.  The correct finish_nolock target
+    // is therefore M_delta, not pre_exec_cap + M_delta (layer-18.5 fix — no snapshot needed
+    // for the captured slot).
     std::vector<uint32_t> pre_exec_remapped_counts;
     if (is_remapped_trace) {
         const auto& remapped_ids = descriptor->sub_device_ids;
@@ -1097,13 +1112,27 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
         // Move post-trace counts from remapped slots → original (captured) slots.
         // The captured slots are the streams the baked trace binary actually acks on.
         // Restore remapped slots to their pre-trace values (device never touched them).
+        //
+        // [Layer-18.5] Correct target is exactly M_delta (not pre_exec_cap + M_delta).
+        //
+        // The layer-18 fix makes issue_trace_commands loop 2 issue a WAIT_STREAM+CLEAR on
+        // stream cap_idx (stream 0) before the trace executes.  That CLEAR resets the hardware
+        // stream counter to 0 on every replay.  The baked trace then adds exactly M_delta acks.
+        // So after each replay the hardware counter is at M_delta regardless of how many times
+        // the trace has run — there is no accumulation.  The correct finish_nolock target is
+        // therefore always M_delta, not pre_exec_captured_counts[i] + M_delta.
+        //
+        // The earlier layer-16.5e comment ("using just M_delta would cause stream_wrap_ge to
+        // see a diff > 2^15 on run2+") was wrong: it assumed the counter accumulates without
+        // CLEAR, but the layer-18 loop 2 CLEAR prevents accumulation.
         const auto& remapped_ids = descriptor->sub_device_ids;
         for (size_t i = 0; i < captured_ids.size(); ++i) {
             uint32_t cap_idx      = *captured_ids[i];
             uint32_t remapped_idx = *remapped_ids[i];
-            // Post-trace count was written to remapped_idx by update_worker_state.
-            // The device acked on cap_idx (stream 0); propagate the count there.
-            expected_num_workers_completed_[cap_idx]      = expected_num_workers_completed_[remapped_idx];
+            // M_delta = update_worker_state wrote this to remapped_idx (baked capture count).
+            uint32_t M_delta = expected_num_workers_completed_[remapped_idx];
+            // Hardware counter always ends at exactly M_delta after CLEAR+trace (no accumulation).
+            expected_num_workers_completed_[cap_idx]      = M_delta;
             // Restore remapped slot: device never wrote to this stream for this trace.
             expected_num_workers_completed_[remapped_idx] = pre_exec_remapped_counts[i];
         }
@@ -1111,6 +1140,24 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
 
     if (blocking) {
         if (is_remapped_trace) {
+            // [LAYER18-DIAG] Print expected_num_workers_completed for captured vs remapped slots
+            // so we can confirm hypothesis γ (dispatch_d WAIT_STREAM on wrong stream).
+            {
+                const auto& remapped_ids_diag = descriptor->sub_device_ids;
+                for (size_t i = 0; i < captured_ids.size(); ++i) {
+                    uint32_t cap_idx_diag = *captured_ids[i];
+                    uint32_t rem_idx_diag = *remapped_ids_diag[i];
+                    log_warning(
+                        LogMetal,
+                        "[LAYER18-DIAG] enqueue_trace finish_nolock: trace_id={} cap_idx={} rem_idx={} "
+                        "expected[cap]={} expected[rem]={}",
+                        *trace_id,
+                        cap_idx_diag,
+                        rem_idx_diag,
+                        expected_num_workers_completed_[cap_idx_diag],
+                        expected_num_workers_completed_[rem_idx_diag]);
+                }
+            }
             // finish_nolock with captured sub_device_ids → waits for the stream that
             // the baked trace binary actually sent completion acks to (stream 0).
             this->finish_nolock(tt::stl::Span<const SubDeviceId>(captured_ids.data(), captured_ids.size()));
