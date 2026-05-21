@@ -8,6 +8,7 @@
 
 #include "ttnn/operations/core/compute_kernel/compute_kernel_config.hpp"
 #include "ttnn/types.hpp"
+#include <tt-metalium/core_coord.hpp>
 
 namespace ttnn {
 
@@ -21,6 +22,7 @@ Tensor rms_norm(
     const std::optional<const Tensor>& residual_input_tensor = std::nullopt,
     const std::optional<MemoryConfig>& memory_config = std::nullopt,
     const std::optional<const prim::LayerNormProgramConfig>& program_config = std::nullopt,
-    std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt);
+    std::optional<const DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
+    const std::optional<CoreRangeSet>& core_range_set = std::nullopt);
 
 }  // namespace ttnn

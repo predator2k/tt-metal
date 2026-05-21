@@ -191,7 +191,13 @@ tt::tt_metal::ProgramDescriptor LayerNormMultiCoreProgramFactory::create_descrip
 
     uint32_t num_tile_rows = NC * Ht;
 
-    CoreRangeSet requested_cores = core_range_set.has_value() ? core_range_set.value() : default_core_range(device);
+    // Prefer: (1) operation_attributes.core_range_set (threaded via LayerNormParams from prim::layer_norm),
+    //          (2) the 4th-param core_range_set (direct Python bypass path),
+    //          (3) full device grid.
+    CoreRangeSet requested_cores =
+        operation_attributes.core_range_set.has_value()
+            ? operation_attributes.core_range_set.value()
+            : (core_range_set.has_value() ? core_range_set.value() : default_core_range(device));
 
     // Use split_work_to_cores to properly distribute tile rows across available cores
     auto

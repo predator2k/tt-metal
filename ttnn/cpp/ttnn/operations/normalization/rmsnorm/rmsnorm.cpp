@@ -27,7 +27,8 @@ Tensor rms_norm(
     const std::optional<const Tensor>& residual_input_tensor,
     const std::optional<MemoryConfig>& memory_config,
     const std::optional<const prim::LayerNormProgramConfig>& program_config,
-    const std::optional<const DeviceComputeKernelConfig> compute_kernel_config) {
+    const std::optional<const DeviceComputeKernelConfig> compute_kernel_config,
+    const std::optional<CoreRangeSet>& core_range_set) {
     auto output_memory_config = memory_config.value_or(input_tensor.memory_config());
     auto rank = input_tensor.logical_shape().size();
 
@@ -73,7 +74,12 @@ Tensor rms_norm(
             input_tensor.tensor_spec().tile().get_width())),
         kernel_config_val,
         std::nullopt,  // dtype
-        prim::LayerNormType::RMSNORM);
+        prim::LayerNormType::RMSNORM,
+        prim::DistributedLayerNormStage::NOT_DISTRIBUTED,
+        std::nullopt,  // stats
+        std::nullopt,  // recip_tensor
+        std::nullopt,  // fused_activation
+        core_range_set);
 }
 
 }  // namespace ttnn
