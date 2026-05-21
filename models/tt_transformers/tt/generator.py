@@ -82,6 +82,24 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         self.trace_output_decode = defaultdict(lambda: None)
         self.prefill_traces_warmup = False
         self.already_warmed_up_prefill = False
+        # Tenstorrent-p1 (Vector 2): tracks whether switch_mode(Mode.DECODE) has been called.
+        # When True, any new prefill trace capture runs under the DECODE sub-device manager,
+        # so register_default_trace_on_active_manager() must NOT be called (the trace is already
+        # in the DECODE manager's pool; calling remap would TT_FATAL on "trace not in DEFAULT").
+        self._prefill_decode_mode_entered = False
+        # Set of trace_keys (f"{prefill_seq_len}_{model_id}_{batch_size}") captured under the
+        # DEFAULT manager — these need V2.5 suspend/resume on replay.
+        self._prefill_trace_captured_under_default: set = set()
+        # V2.5 (SubDevices.md §1.2): saved prefetcher state for suspend/resume around prefill.
+        # Populated by _v25_suspend_prefetcher(); consumed (and cleared) by the restore block
+        # in _decode_forward_trace_text at the start of the FIRST decode step after prefill.
+        self._v25_saved_worker_sub_device_id: dict = {}   # model_id → value
+        self._v25_saved_receiver_sub_device_id: dict = {}  # model_id → value
+        self._v25_saved_prefetcher_mode: dict = {}         # model_id → Mode
+        self._v25_decode_restore_pending: bool = False     # True = decode restore needed (legacy safety net)
+        # V2.5 split-logits: set to model_id when DEFAULT manager is active after trace replay
+        # and needs a mid-logits restore (slice under DEFAULT, then restore, then norm+lm_head).
+        self._v25_split_logits_model_id: int = -1         # -1 = not active
         # By default, enable split sampling (break the decode trace into two parts: upto logits, then sampling step)
         self.enable_split_sampling = True
         self.mode = None
@@ -125,6 +143,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         if self.already_warmed_up_prefill:
             return
         self.already_warmed_up_prefill = True
+
+        # Tenstorrent-p1: Warmup runs before switch_mode(DECODE), so the prefill trace is
+        # captured under DEFAULT manager.  Warmup must capture the trace AND run
+        # process_logits_after_prefill_trace so that post-prefill ops (ttnn.slice, lm_head)
+        # are compiled under DEFAULT manager.  These DEFAULT-compiled entries are then reused
+        # when post-prefill ops run under DECODE manager on subsequent requests.
+        # RESULT: warmup trace capture is kept (enable_trace unchanged).
 
         sequence_lengths_to_warmup = self.model_args[0].get_warmup_prefill_supported_seq_lens()
         warmup_batch_sizes = (1,)
@@ -394,6 +419,17 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         global_user_id = kwargs.get("global_user_id", None)
         trace_key = f"{prefill_seq_len}_{model_id}_{batch_size}"
         if self.trace_id_prefill[trace_key] is None:
+            # Tenstorrent-p1 (V2.5): Prefill trace capture.
+            # Warmup traces are captured under DEFAULT manager (before DECODE mode is set).
+            # After DECODE mode is entered (DECODE manager active + prefetcher running),
+            # we suspend the prefetcher (V2.5) and capture under DEFAULT manager as well,
+            # so ALL prefill traces live in the DEFAULT pool (no GlobalCB L1 clash).
+            # V2.5 replay switches to DEFAULT manager → no cross-manager remap needed.
+            if self._prefill_decode_mode_entered:
+                # DECODE manager is active; suspend to DEFAULT before capture.
+                # (Restore happens in _prefill_forward_trace after execute_trace.)
+                self._v25_suspend_prefetcher(model_id)
+
             trace_id, tt_out_trace, *device_inputs = self._capture_trace_prefill(
                 prefill_ids,
                 page_table=page_table,
@@ -406,6 +442,12 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             self.trace_id_prefill[trace_key] = trace_id
             self.trace_inputs_prefill[trace_key] = device_inputs
             self.trace_output_prefill[trace_key] = tt_out_trace
+            # ALL prefill traces are captured under DEFAULT manager (pre or post DECODE mode).
+            self._prefill_trace_captured_under_default.add(trace_key)
+            if not self._prefill_decode_mode_entered:
+                logger.info(f"[V2.5] Prefill trace key={trace_key} captured under DEFAULT manager (warmup, pre-decode)")
+            else:
+                logger.info(f"[V2.5] Prefill trace key={trace_key} captured under DEFAULT manager (post-decode-mode, V2.5 suspended)")
 
         tt_out_trace = self._prefill_forward_trace(
             self.trace_id_prefill[trace_key],
@@ -417,6 +459,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             global_user_id=global_user_id,
             batch_size=batch_size,
             user_id=user_id,
+            trace_key=trace_key,
         )
 
         return tt_out_trace
@@ -432,6 +475,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         model_id=-1,
         global_user_id=None,
         batch_size=1,
+        trace_key=None,
     ):
         # Use actual batch_size since tokens are now in batch dimension
         prefill_kwargs = {"page_table": page_table, "batch_size": batch_size, "user_id": user_id}
@@ -444,9 +488,135 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             host_inputs, device_tensors=device_inputs, mesh_device=self.model_args[model_id].mesh_device
         )
 
-        ttnn.execute_trace(self.model_args[model_id].mesh_device, trace_id, cq_id=0, blocking=False)
+        # Tenstorrent-p1 (V2.5): prefill trace replay.
+        #
+        # V2.5 (SubDevices.md §1.2): for prefill traces captured under DEFAULT manager
+        # (warmup or post-DECODE-mode), suspend the prefetcher (switch to DEFAULT manager)
+        # before execute_trace, then defer restore to the next decode step.
+        #
+        # This avoids BOTH problems that killed Options A and B:
+        #   - Stream-0 per-device counter mismatch (cross-manager remap hangs on multi-chip)
+        #   - GlobalCB L1 clash (no GlobalCB exists under DEFAULT manager)
+        #
+        # For pre-DECODE warmup replays, _v25_decode_restore_pending stays False (no restore
+        # needed since DEFAULT manager is already active and prefetcher not yet running).
+        mesh_device = self.model_args[model_id].mesh_device
+        _is_captured_under_default = trace_key in self._prefill_trace_captured_under_default if trace_key is not None else False
+        if _is_captured_under_default and self._prefill_decode_mode_entered:
+            # Post-DECODE prefill replay: DECODE manager is active, prefetcher running.
+            #
+            # V2.5 strategy (full-DEFAULT path, Layer 20 v2):
+            #   1. Suspend prefetcher (switch to DEFAULT manager) — avoids sub-device
+            #      intersection errors during trace replay (trace was captured under DEFAULT).
+            #   2. Execute prefill trace non-blocking under DEFAULT manager.
+            #   3. Set _v25_split_logits_model_id so prefill_forward_text runs all
+            #      post-trace logit processing under DEFAULT:
+            #        a. ttnn.slice under DEFAULT (full device grid required for slice kernels)
+            #        b. _apply_norm_and_lm_head under DEFAULT (no GlobalCB clash because
+            #           Layer 20 v2 removes global-allocator check from
+            #           lowest_occupied_compute_l1_address — receiver cores and compute
+            #           cores have independent L1 address spaces, so no real clash exists)
+            #        c. _v25_restore_prefetcher restores DECODE manager AFTER lm_head
+            #
+            # Why blocking=False?
+            #   Under DEFAULT manager, blocking=True calls finish_nolock() with stall-group
+            #   = all-cores, which includes persistent sender/receiver kernels → hang.
+            #   Non-blocking returns immediately; the subsequent ttnn.slice and lm_head
+            #   ops will naturally wait for the trace output tensor to be ready.
+            logger.info(f"[V2.5] Prefill trace (key={trace_key}): suspending prefetcher for replay under DEFAULT manager")
+            self._v25_suspend_prefetcher(model_id)
+            ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
+            # Do NOT restore DECODE manager here.  Both ttnn.slice and lm_head will run
+            # under DEFAULT manager in prefill_forward_text (split-logits path), and DECODE
+            # manager is restored only after lm_head completes.
+            self._v25_split_logits_model_id = model_id
+            logger.info(f"[V2.5] Prefill trace (key={trace_key}) replayed under DEFAULT; full-DEFAULT split pending (model_id={model_id})")
+        else:
+            # Pre-DECODE warmup replay (DEFAULT manager already active) or post-DECODE native capture.
+            logger.info(f"[V2.5] Prefill trace (key={trace_key}): replaying directly (pre-decode or native capture)")
+            ttnn.execute_trace(mesh_device, trace_id, cq_id=0, blocking=False)
 
         return tt_out_trace
+
+    def _v25_suspend_prefetcher(self, model_id: int):
+        """V2.5: suspend prefetcher state and switch to DEFAULT manager for prefill replay.
+
+        Saves worker_sub_device_id, receiver_sub_device_id, and prefetcher.mode, then
+        zeros them out (so model.py skips prefetcher-specific paths) and calls
+        prefetcher.load_default_manager() to clear the DECODE sub-device manager.
+
+        No-op if model has no prefetcher or prefetcher is already suspended.
+        """
+        prefetcher = getattr(self.model[model_id], "prefetcher", None)
+        if prefetcher is None:
+            return
+        # Only save once (idempotent)
+        if model_id in self._v25_saved_prefetcher_mode:
+            logger.info(f"[V2.5] suspend: model_id={model_id} already suspended, skipping")
+            return
+        self._v25_saved_worker_sub_device_id[model_id] = getattr(prefetcher, "worker_sub_device_id", None)
+        self._v25_saved_receiver_sub_device_id[model_id] = getattr(prefetcher, "receiver_sub_device_id", None)
+        self._v25_saved_prefetcher_mode[model_id] = getattr(prefetcher, "mode", None)
+        # Zero out so model.py skip prefetcher paths during prefill replay
+        prefetcher.worker_sub_device_id = None
+        prefetcher.receiver_sub_device_id = None
+        prefetcher.mode = Mode.PREFILL
+        # V2.5 [Layer 21]: Drain ALL sub-devices (sender=0, receiver=1, worker=2) BEFORE
+        # switching to DEFAULT manager.
+        #
+        # Root cause of v12 hang: after the decode trace finishes with
+        # finish_nolock([stall_group={sub_device_2}]), the WORKER completion acks
+        # (stream 2) have arrived at M_delta, but the SENDER (stream 0) and RECEIVER
+        # (stream 1) kernel acks may still be in flight.  When
+        # reset_worker_dispatch_state_on_device is called inside
+        # clear_loaded_sub_device_manager(), it sends:
+        #   add_dispatch_go_signal_mcast(expected[0], RESET_READ_PTR, stream_0, ...)
+        # The dispatch firmware waits for stream 0 == expected[0] before multicasting.
+        # If stream 0 < expected[0] (sender still running), it hangs forever.
+        #
+        # Fix: synchronize ALL 3 sub-devices here, so streams 0, 1, 2 all reach
+        # their expected counts before we switch to DEFAULT.  The synchronization
+        # enqueues WAIT_STREAM for each of the 3 streams and blocks until all fire.
+        all_sub_device_ids = prefetcher.prefetcher_sub_device.sub_devices_id
+        mesh_device = self.model_args[model_id].mesh_device
+        logger.info(
+            f"[V2.5] suspend: draining all DECODE sub-devices {all_sub_device_ids} "
+            f"before DEFAULT switch (model_id={model_id})"
+        )
+        import ttnn as _ttnn_v25
+        _ttnn_v25.synchronize_device(mesh_device, sub_device_ids=all_sub_device_ids)
+        logger.info(f"[V2.5] suspend: all DECODE sub-devices drained, switching to DEFAULT manager")
+        # Switch to DEFAULT manager (clears DECODE sub-device manager + GlobalCB not active)
+        prefetcher.load_default_manager()
+        logger.info(
+            f"[V2.5] suspend: model_id={model_id} saved worker={self._v25_saved_worker_sub_device_id[model_id]} "
+            f"receiver={self._v25_saved_receiver_sub_device_id[model_id]} mode={self._v25_saved_prefetcher_mode[model_id]}"
+        )
+
+    def _v25_restore_prefetcher(self, model_id: int):
+        """V2.5: restore prefetcher state and switch back to DECODE manager.
+
+        Called at the start of the first decode step after a V2.5-suspended prefill.
+        Restores worker_sub_device_id, receiver_sub_device_id, prefetcher.mode, and
+        calls prefetcher.load_decode_manager() to re-activate the DECODE sub-device manager.
+
+        No-op if model has no prefetcher or nothing was saved.
+        """
+        prefetcher = getattr(self.model[model_id], "prefetcher", None)
+        if prefetcher is None:
+            return
+        if model_id not in self._v25_saved_prefetcher_mode:
+            logger.info(f"[V2.5] restore: model_id={model_id} nothing saved, skipping")
+            return
+        prefetcher.worker_sub_device_id = self._v25_saved_worker_sub_device_id.pop(model_id)
+        prefetcher.receiver_sub_device_id = self._v25_saved_receiver_sub_device_id.pop(model_id)
+        prefetcher.mode = self._v25_saved_prefetcher_mode.pop(model_id)
+        # Restore DECODE sub-device manager (re-restricts stall group to worker-only)
+        prefetcher.load_decode_manager()
+        logger.info(
+            f"[V2.5] restore: model_id={model_id} restored worker={prefetcher.worker_sub_device_id} "
+            f"receiver={prefetcher.receiver_sub_device_id} mode={prefetcher.mode}"
+        )
 
     # Note: This function is called by vLLM
     def prefill_forward_text(
@@ -465,6 +635,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         **kwargs,
     ):
         self.mode = Mode.PREFILL
+        # SGLANG_TT_DISABLE_PREFILL_TRACE=1: skip prefill trace capture/replay entirely.
+        # Prefill runs untraced (3× slower TTFT) but avoids cross-manager trace replay
+        # that hangs run2 when the prefetcher is active.  Decode traces still work,
+        # so TPOT (the user-facing metric) retains the prefetcher speedup.
+        if os.environ.get("SGLANG_TT_DISABLE_PREFILL_TRACE", "0") != "0":
+            enable_trace = False
+            logger.info("[PREFILL-TRACE] SGLANG_TT_DISABLE_PREFILL_TRACE=1: prefill trace disabled, using untraced forward")
         if page_table is not None:
             assert isinstance(page_table, torch.Tensor), "page_table mush be torch.Tensor"
         else:
@@ -639,6 +816,10 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 prefill_seq_len, num_cached_tokens if not use_batched_prefill else 0
             )
 
+            # Tenstorrent-p1 (Layer 20): always use prefill trace when available.
+            # Trace replay doesn't compile new programs → no static-CB clash with GlobalCB.
+            # Warmup-captured traces (DEFAULT manager) are remapped via
+            # register_default_trace_on_active_manager() at replay time when DECODE manager is active.
             logger.info(
                 f"Prefill seq len: {prefill_seq_len}, max_prefill_chunk_size: {self.model_args[0].max_prefill_chunk_size}, trace: {enable_trace_current_prompt}"
             )
@@ -713,6 +894,30 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                     **local_kwargs,
                 )
             else:
+                # Untraced prefill path. When the prefetcher is running under the
+                # DECODE sub-device manager, untraced program compilation/execution
+                # AND the subsequent ttnn.untilize both fail because the DECODE
+                # manager restricts which cores are visible
+                # ("Kernel group cores do not match sub device cores").
+                #
+                # Strategy: suspend the prefetcher (switch to DEFAULT manager) before
+                # the untraced forward AND leave DEFAULT active through ttnn.untilize
+                # and logits.cpu(). Use the V2.5 deferred-restore mechanism
+                # (_v25_split_logits_model_id) so that DECODE is restored at line 1131
+                # (after untilize + blocking cpu), exactly as in the traced path.
+                _needs_manager_switch = self._prefill_decode_mode_entered and getattr(
+                    self.model[model_id], "prefetcher", None
+                ) is not None
+                if _needs_manager_switch:
+                    logger.info(
+                        f"[PREFILL-TRACE-UNTRACED] DECODE manager active — suspending prefetcher "
+                        f"for untraced prefill (model_id={model_id}); DECODE restore deferred to post-untilize"
+                    )
+                    self._v25_suspend_prefetcher(model_id)
+                    # Mark for deferred restore (same slot as traced path uses).
+                    # The restore at line ~1131 will call _v25_restore_prefetcher
+                    # after untilize+cpu complete under DEFAULT manager.
+                    self._v25_split_logits_model_id = model_id
                 logits = self.prefill_forward_single_user_text(
                     prefill_ids,
                     page_table=page_table_user,
@@ -819,9 +1024,19 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                     else:
                         for local_idx, slot in enumerate(empty_slots):
                             user_logits = logits[slot : slot + 1, :, :, :]
-                            _logits = self.model[model_id].process_logits_after_prefill_trace(
-                                user_logits, last_token_idx[slot]
-                            )
+                            if self._v25_split_logits_model_id == model_id:
+                                # V2.5 full-DEFAULT path: slice+lm_head under DEFAULT.
+                                # DO NOT restore DECODE here — the caller's untilize and
+                                # subsequent ops also run under DEFAULT until next decode.
+                                # DECODE restored at start of _decode_forward_trace_text.
+                                logger.info(f"[V2.5] split-logits batched: slot={slot}, slice+lm_head under DEFAULT; restore deferred to decode")
+                                _logits = self.model[model_id].slice_logits_for_prefill_trace(user_logits, last_token_idx[slot])
+                                _logits = self.model[model_id]._apply_norm_and_lm_head(_logits)
+                                # _v25_split_logits_model_id stays set; first slot done
+                            else:
+                                _logits = self.model[model_id].process_logits_after_prefill_trace(
+                                    user_logits, last_token_idx[slot]
+                                )
                             _logits = ttnn.to_layout(
                                 _logits, ttnn.ROW_MAJOR_LAYOUT, memory_config=ttnn.DRAM_MEMORY_CONFIG
                             )
@@ -846,7 +1061,23 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                     )
                     continue
                 else:
-                    logits = self.model[model_id].process_logits_after_prefill_trace(logits, last_token_idx)
+                    if self._v25_split_logits_model_id == model_id:
+                        # V2.5 full-DEFAULT path (Layer 20 v3):
+                        #   Run ttnn.slice AND norm+lm_head under DEFAULT manager.
+                        #   Layer 20 v3 skips all L1-CB clash validation under DEFAULT,
+                        #   so lm_head and untilize don't spuriously clash with GlobalCB.
+                        #   DO NOT restore DECODE here — ttnn.untilize (below) also needs
+                        #   DEFAULT manager. After untilize, logits.cpu(blocking=True) is used
+                        #   (blocking=True, not blocking=False) to flush all device work while
+                        #   still under DEFAULT manager (no stall-group restrictions). DECODE
+                        #   is restored AFTER the blocking cpu() completes, before the sync loop.
+                        logger.info(f"[V2.5] split-logits: slice+norm+lm_head under DEFAULT; untilize+blocking-cpu also under DEFAULT; restore after cpu (model_id={model_id})")
+                        logits = self.model[model_id].slice_logits_for_prefill_trace(logits, last_token_idx)
+                        logits = self.model[model_id]._apply_norm_and_lm_head(logits)
+                        # Note: _v25_split_logits_model_id stays set; DECODE restored before sync loop
+                        logger.info(f"[V2.5] split-logits: norm+lm_head done under DEFAULT; pending DECODE restore before sync loop")
+                    else:
+                        logits = self.model[model_id].process_logits_after_prefill_trace(logits, last_token_idx)
             else:
                 if return_hidden_states:
                     raise NotImplementedError("return_hidden_states=True requires enable_trace=True")
@@ -870,15 +1101,34 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 )
             else:
                 logits = ttnn.untilize(logits, use_multicore=True)
+                # V2.5 path: use blocking=True cpu() so that the DMA completes while still
+                # under DEFAULT manager (no stall-group restrictions from the decode sub-device
+                # manager). Restore DECODE AFTER this blocking transfer, BEFORE the sync loop.
+                # Under DEFAULT the stall group is the full device; persistent sender/receiver
+                # kernels have already exited (prefetcher.stop() ran at the end of the prior
+                # decode step inside the trace), so the blocking cpu() completes quickly.
+                _v25_active = (self._v25_split_logits_model_id == model_id)
                 prefill_results.append(
                     {
                         "idx": idx,
                         "model_id": model_id,
                         "last_token_idx": last_token_idx,
-                        "logits": logits.cpu(blocking=False),
+                        "logits": logits.cpu(blocking=_v25_active),
                         "sampling": sampling_enabled,
+                        "v25_blocking": _v25_active,
                     }
                 )
+
+        # V2.5: Restore DECODE manager BEFORE the sync loop.
+        # All slice + lm_head + untilize ran under DEFAULT (no GlobalCB clash, no assertion).
+        # The logits.cpu(blocking=True) above already completed the DMA, so synchronize_device
+        # in the results loop is NOT needed for V2.5 results — just restore DECODE here.
+        if self._v25_split_logits_model_id != -1:
+            logger.info(
+                f"[V2.5] restoring DECODE manager (blocking cpu done, model_id={self._v25_split_logits_model_id})"
+            )
+            self._v25_restore_prefetcher(self._v25_split_logits_model_id)
+            self._v25_split_logits_model_id = -1
 
         if len(prefill_results) > 0:
             for elem_idx, res in enumerate(prefill_results):
@@ -887,7 +1137,10 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 model_id = res["model_id"]
                 num_cached_tokens = int(start_pos[idx]) if start_pos is not None else 0
                 last_token_idx_relative = last_token_idx - num_cached_tokens
-                ttnn.synchronize_device(self.model[model_id].mesh_device)
+                if not res.get("v25_blocking"):
+                    # V2.5 path: cpu(blocking=True) already flushed the DMA; skip synchronize.
+                    # Non-V2.5 path: cpu(blocking=False) was used; must synchronize here.
+                    ttnn.synchronize_device(self.model[model_id].mesh_device)
 
                 if "hidden_states" in res:
                     output_tensor[idx] = self.model[model_id].process_output_prefill_hidden_states(
@@ -1080,6 +1333,22 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         # Switch to decode mode for prefetcher to reintialize sub devices
         for i in range(len(self.model)):
             self.model[i].switch_mode(Mode.DECODE)
+        # Tenstorrent-p1 (V2.5): after switch_mode(Mode.DECODE) the DECODE sub-device
+        # manager is active.  Mark that DECODE mode has been entered so _easy_trace_prefill
+        # knows to suspend the prefetcher (V2.5) before any subsequent prefill trace capture.
+        # Unlike Option-B, we do NOT release DEFAULT-captured traces here — V2.5 replays
+        # them under DEFAULT manager (after suspending the prefetcher), avoiding both the
+        # GlobalCB L1 clash and the per-device stream-0 counter mismatch.
+        if not self._prefill_decode_mode_entered:
+            _any_prefetcher_v2 = any(getattr(m, "prefetcher", None) is not None for m in self.model)
+            if _any_prefetcher_v2:
+                self._prefill_decode_mode_entered = True
+                logger.info(
+                    "[V2.5] DECODE manager activated — subsequent prefill trace captures "
+                    "will suspend prefetcher (DEFAULT manager) via V2.5 before capture."
+                )
+
+
 
         sampling_on_device = sampling_params is not None
         split_sampling_enabled = bool(self.enable_split_sampling and sampling_on_device)
@@ -1206,6 +1475,10 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 page_table=tt_page_table[i],
                 kv_cache=user_kv_cache,
                 sampling_on_device=sampling_on_device,
+                # Tenstorrent-p1 (Layer 15): compile run skips all_gather_async entirely
+                # to avoid the multi-chip fabric deadlock (see model.py ttnn_decode_forward).
+                # The compile-run logits are discarded; correctness only matters in trace replay.
+                use_barrier_semaphore=False,
             )
             tt_output.append((tt_logits_i, tt_log_probs_i))
 
@@ -1231,6 +1504,22 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             kv_cache=kv_cache,
             sampling_on_device=sampling_on_device,
         )
+        # Tenstorrent-p1 (Layer 15): synchronize before trace capture.
+        # With the DRAM prefetcher active (3-sub-device DECODE manager), the compile
+        # run dispatches sender (sub_device_0) + compute workers (sub_device_2) programs
+        # asynchronously (use_barrier_semaphore=False returns raw TILE logits without
+        # waiting).  Without synchronization, the compile-run GlobalCB sender may still
+        # be streaming data into the trace-capture run's GlobalCB, causing a deadlock:
+        #   - Two concurrent senders fight for the same GlobalCB circular buffer
+        #   - end_mesh_trace finish() issues dispatch_wait(45264) which blocks dispatch_d
+        #   - dispatch_d can't process trace-capture sender programs → workers starve → hang
+        # Fix: synchronize the DECODE sub-device manager (stall group = [sub_device_2])
+        # after compile run to drain compute workers.  The stall group waits for
+        # sub_device_2 worker count = 45264, which implies sub_device_0 sender also
+        # completed (GlobalCB protocol: sender only finishes after all layers acked).
+        # This is safe with warm kernel cache (~37 ms per decode step, not 10+ min).
+        for i in range(self.data_parallel):
+            ttnn.synchronize_device(self.model_args[i].mesh_device)
         logger.info("Done Compiling Model")
 
         # Get inputs ready for trace run
@@ -1257,12 +1546,25 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             trace_id = ttnn.begin_trace_capture(self.model_args[i].mesh_device, cq_id=0)
             trace_ids[i] = trace_id
             user_kv_cache = kv_cache[i] if kv_cache is not None else None
+            prefetcher_active = getattr(self.model[i], "prefetcher", None) is not None
             tt_out_trace.append(
                 self.model[i].ttnn_decode_forward(
                     *device_inputs[i],
                     kv_cache=user_kv_cache,
                     sampling_on_device=sampling_on_device,
                     capture_sampling_trace=split_enabled,
+                    # Tenstorrent-p1 (Layer 15): gather-outside-trace strategy.
+                    # With the DRAM prefetcher active, all three paths for the logit
+                    # all-gather are illegal inside trace capture:
+                    #   (a) all_gather_async: host-side CCL semaphore writes → TT_FATAL
+                    #   (b) ttnn.all_gather: calls finish() → 3-sub-device deadlock in
+                    #       compile run (workers wait for GlobalCB → sender waits for ACKs)
+                    #   (c) ttnn.all_gather during trace capture: also triggers host-side
+                    #       write_shard_to_device internally → TT_FATAL confirmed in testing
+                    # Pass use_barrier_semaphore=False so model.py skips gather+untilize
+                    # and returns raw TILE logits as the trace output.
+                    # _decode_forward_trace_text applies gather+untilize after execute_trace.
+                    use_barrier_semaphore=not prefetcher_active,
                 )
             )
             ttnn.end_trace_capture(self.model_args[i].mesh_device, trace_id, cq_id=0)
@@ -1279,6 +1581,24 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         """
         Run decode forward text with tracing
         """
+        # Tenstorrent-p1 (V2.5): restore prefetcher state after a prefill-interrupted decode.
+        # _v25_decode_restore_pending is set True by _easy_trace_prefill when the prefetcher
+        # was suspended (switched to DEFAULT manager) for prefill trace capture/replay.
+        # Restore here — BEFORE trace capture or inputs reset — so that
+        # _capture_decode_trace_text runs under the DECODE manager (GlobalCB active).
+        if self._v25_decode_restore_pending:
+            logger.info("[V2.5] Decode restore (safety net): restoring prefetcher state after prefill suspend")
+            for model_id in range(self.data_parallel):
+                self._v25_restore_prefetcher(model_id)
+            self._v25_decode_restore_pending = False
+            logger.info("[V2.5] Decode restore: complete — DECODE manager re-activated")
+        # Safety net: if split-logits restore was never consumed (unexpected code path),
+        # restore DECODE manager now before decode starts.
+        if self._v25_split_logits_model_id != -1:
+            logger.info(f"[V2.5] decode start: restoring DECODE manager (deferred from prefill split-logits, model_id={self._v25_split_logits_model_id})")
+            self._v25_restore_prefetcher(self._v25_split_logits_model_id)
+            self._v25_split_logits_model_id = -1
+
         # The trace is different depending on whether we are doing device sampling or not
         if not self.trace_ids_decode[sampling_on_device]:
             trace_ids, tt_out_trace, *device_inputs = self._capture_decode_trace_text(
@@ -1311,9 +1631,72 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                     host_tensors=host_inputs_i,
                     device_tensors=self.trace_inputs_decode[sampling_on_device][i],
                 )
+        import time as _time_l15
+        _t_exec0 = _time_l15.perf_counter()
         for i, trace_id in self.trace_ids_decode[sampling_on_device].items():
             ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=0, blocking=False)
+        _t_exec1 = _time_l15.perf_counter()
         outputs = self.trace_output_decode[sampling_on_device]
+
+        # Tenstorrent-p1 (Layer 15): gather-outside-trace strategy.
+        # When the DRAM prefetcher is active, trace capture skips all_gather + untilize
+        # (use_barrier_semaphore=False path in model.py) to avoid:
+        #   (a) host-side I/O from all_gather_async during trace capture, and
+        #   (b) finish() deadlock from ttnn.all_gather during the compile run, and
+        #   (c) host-side writes from ttnn.all_gather during trace capture (TT_FATAL).
+        # The trace output is raw TILE logits (shape [1, 1, 1, vocab_size/num_devices]).
+        # Apply all_gather + untilize here, OUTSIDE the trace, after execute_trace.
+        _t_ag0 = _t_ag1 = _t_ut0 = _t_ut1 = _t_exec1
+        _pref_active = False
+        # Tenstorrent-p1 (Vector 3 debug): log first-ever check of the condition.
+        _v3dbg_logged = getattr(self, "_v3dbg_pref_cond_logged", False)
+        if not sampling_on_device:
+            new_outputs = []
+            for i in range(self.data_parallel):
+                prefetcher = getattr(self.model[i], "prefetcher", None)
+                _v3dbg_cond = prefetcher is not None and self.model_args[i].num_devices > 1
+                if not _v3dbg_logged:
+                    logger.info(
+                        f"[V3-DBG] prefetcher={prefetcher is not None} num_devices={self.model_args[i].num_devices} "
+                        f"_pref_active_cond={_v3dbg_cond} sampling_on_device={sampling_on_device}"
+                    )
+                    self._v3dbg_pref_cond_logged = True
+                    _v3dbg_logged = True
+                if _v3dbg_cond:
+                    _pref_active = True
+                    tt_logits, tt_log_probs = outputs[i]
+                    num_links = 2 if self.model_args[i].is_galaxy else 1
+                    _t_ag0 = _time_l15.perf_counter()
+                    tt_logits = ttnn.all_gather(
+                        tt_logits,
+                        dim=3,
+                        num_links=num_links,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        topology=self.model_args[i].ccl_topology(),
+                    )
+                    _t_ag1 = _time_l15.perf_counter()
+                    _t_ut0 = _t_ag1
+                    tt_logits = ttnn.untilize(
+                        tt_logits,
+                        use_multicore=True,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        sub_core_grids=prefetcher.all_worker_cores_range_set,
+                    )
+                    _t_ut1 = _time_l15.perf_counter()
+                    new_outputs.append((tt_logits, tt_log_probs))
+                else:
+                    new_outputs.append(outputs[i])
+            outputs = new_outputs
+
+        if _pref_active and os.environ.get("SGLANG_TT_PREFETCH_TIMING", "0") == "1":
+            print(
+                f"[L15-timing] exec_dispatch={1000*(_t_exec1-_t_exec0):.3f}ms "
+                f"ag_dispatch={1000*(_t_ag1-_t_ag0):.3f}ms "
+                f"ut_dispatch={1000*(_t_ut1-_t_ut0):.3f}ms "
+                f"total_host_dispatch={1000*(_t_ut1-_t_exec0):.3f}ms",
+                flush=True,
+            )
+
         if sampling_on_device:
             new_outputs = []
             for i in range(self.data_parallel):
