@@ -562,6 +562,16 @@ class ModelArgs:
         self.rms_norm_add_unit_offset = False
         self.embed_scale = None
         self.use_hf_rope = use_hf_rope
+        # WS-A.6: Qwen3.5 must use HF-style RoPE because the Meta
+        # ``rotary_embedding_llama`` kernel does not support partial_rotary_
+        # factor. Flip the flag NOW (before the cache path is computed at
+        # lines 582-583) so the ``hf_rope`` cache subdir is used. The
+        # canonical post-config flip in ``_set_model_specific_params`` stays
+        # as a safety net but becomes redundant for this case.
+        _hf_model_env = os.getenv("HF_MODEL", "") or ""
+        if ("qwen3.5" in _hf_model_env.lower() or "qwen3_5" in _hf_model_env.lower()) and \
+                os.getenv("SGLANG_TT_DISABLE_HF_ROPE_FORCE") != "1":
+            self.use_hf_rope = True
 
         assert not os.getenv(
             "FAKE_DEVICE"
@@ -2711,6 +2721,16 @@ class ModelArgs:
         # Mistral, GptOss, Phi all keep ``rms_norm_add_unit_offset = False``.
         if self.base_model_name.startswith("Qwen3.5"):
             self.rms_norm_add_unit_offset = True
+            # WS-A.6: Qwen3.5 requires HF-style RoPE because its full-attention
+            # layers use MRoPE + partial_rotary_factor=0.25, neither of which
+            # the Meta-style ``rotary_embedding_llama`` kernel supports. The
+            # primary flip happens earlier (right after ``use_hf_rope`` init)
+            # so the cache subdir picks ``hf_rope`` correctly. This safety net
+            # re-asserts the flag and forces ``use_qk_fused=False`` (the gated
+            # QK fusion kernel isn't compatible with HF rope).
+            if os.getenv("SGLANG_TT_DISABLE_HF_ROPE_FORCE") != "1":
+                self.use_hf_rope = True
+                self.use_qk_fused = False
         return
 
     def _set_params_from_dict(self, config):
@@ -2838,10 +2858,17 @@ class ModelArgs:
         # RoPE params
         self.rope_theta = text_config.get("rope_theta")
         # Tenstorrent-p1 patch: Qwen3ForCausalLM nests rope_theta inside rope_parameters
+        rope_params = text_config.get("rope_parameters", {}) or {}
         if self.rope_theta is None:
-            rope_params = text_config.get("rope_parameters", {}) or {}
             if rope_params.get("rope_theta"):
                 self.rope_theta = rope_params["rope_theta"]
+        # WS-A.6: Qwen3.5 MRoPE + partial_rotary_factor. Both live under
+        # ``rope_parameters`` in the HF config. Defaults preserve every other
+        # model's behavior (partial_rotary_factor=1.0 ⇒ full rotation;
+        # mrope_section=None ⇒ standard 1D RoPE path).
+        self.partial_rotary_factor = float(rope_params.get("partial_rotary_factor", 1.0))
+        mrope_section = rope_params.get("mrope_section", None)
+        self.mrope_section = list(mrope_section) if mrope_section is not None else None
         # Tenstorrent-p1 patch: Llama-3.x fallback if config lost rope_theta
         if self.rope_theta is None and "llama" in (self.model_name or "").lower():
             print(f"[TT-PATCH-DIAG] rope_theta missing for {self.model_name}; text_config keys: {list(text_config.keys())[:25]}", flush=True)

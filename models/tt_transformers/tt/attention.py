@@ -13,6 +13,7 @@ from models.common.utility_functions import nearest_32
 from models.tt_transformers.tt.ccl import tt_all_gather, tt_all_reduce
 from models.tt_transformers.tt.common import Mode
 from models.tt_transformers.tt.model_config import OpGroup, TensorGroup, num_to_corerange
+from models.tt_transformers.tt.rope import qwen35_partial_rotary_head_perm
 
 
 class Attention(LightweightModule):
@@ -247,6 +248,39 @@ class Attention(LightweightModule):
         # We deinterleave here, ONCE, at weight-load time.
         self.attn_output_gate = getattr(configuration, "attn_output_gate", False)
 
+        # WS-A.6: partial_rotary_factor < 1 path (Qwen3.5). The TT
+        # ``rotary_embedding_hf`` kernel hardcodes ``rotate_half`` at the
+        # head_dim/2 boundary, but HF Qwen3.5 partial RoPE rotates only the
+        # first ``rotary_dim`` dims and pairs (i, i + rotary_dim/2) inside that
+        # slice. We permute the per-head rows of Q and K projection weights so
+        # the rotated upper-half lands at TT index ``i + head_dim/2``, making
+        # the kernel's bound rotate_half match HF's pair indices. cos/sin are
+        # zero-padded (cos=1, sin=0) on the pass-through slots so those
+        # positions become identity through the rope kernel. q_norm / k_norm
+        # weights are permuted with the same scheme. V is untouched (no RoPE).
+        # When ``partial_rotary_factor == 1.0`` (every other model) this branch
+        # is a no-op and the wq/wk path is byte-equivalent.
+        self.partial_rotary_factor = float(getattr(configuration, "partial_rotary_factor", 1.0))
+        if self.partial_rotary_factor < 1.0:
+            rotary_dim = int(self.head_dim * self.partial_rotary_factor)
+            self._qk_rope_perm = qwen35_partial_rotary_head_perm(self.head_dim, rotary_dim)
+        else:
+            self._qk_rope_perm = None
+
+        def _permute_qk_rows_per_head(weight: torch.Tensor, n_heads_per_block: int) -> torch.Tensor:
+            """Apply self._qk_rope_perm to the per-head row blocks of a
+            ``[n_heads_per_block * head_dim, hidden]`` weight tensor. No-op if
+            partial_rotary is disabled. Returns a fresh tensor (does not mutate
+            ``state_dict``).
+            """
+            if self._qk_rope_perm is None:
+                return weight
+            hidden = weight.shape[-1]
+            # Reshape per-head, permute along head_dim row dim, then flatten.
+            w = weight.view(n_heads_per_block, self.head_dim, hidden)
+            w = w[:, self._qk_rope_perm, :]
+            return w.reshape(n_heads_per_block * self.head_dim, hidden).contiguous()
+
         # wqkv DRAM-sharded width per device:
         #   - non-gated:   (n_heads + 2*n_kv_heads) * head_dim / num_devices
         #   - gated (Qwen3.5): (2*n_heads + 2*n_kv_heads) * head_dim / num_devices
@@ -276,7 +310,16 @@ class Attention(LightweightModule):
                 # split q and gate, concat along head-row dim with all-q first
                 wq_q = wq_selected[:, 0, :, :].reshape(self.n_local_heads * self.head_dim, hidden)
                 wq_g = wq_selected[:, 1, :, :].reshape(self.n_local_heads * self.head_dim, hidden)
+                # WS-A.6: permute Q rows (not gate — gate is multiplied
+                # element-wise after attention and is not rotated).
+                wq_q = _permute_qk_rows_per_head(wq_q, self.n_local_heads)
                 wq_selected = torch.cat([wq_q, wq_g], dim=0)
+            else:
+                # WS-A.6: permute Q rows for non-gated path (unused by Qwen3.5
+                # in P1; future-proof for other partial-rotary models).
+                wq_selected = _permute_qk_rows_per_head(wq_selected, self.n_local_heads)
+            # WS-A.6: permute K rows.
+            wk_selected = _permute_qk_rows_per_head(wk_selected, self.n_local_kv_heads)
 
             # Transpose the selected chunks
             wq = torch.transpose(wq_selected, -2, -1)
@@ -309,6 +352,24 @@ class Attention(LightweightModule):
             if mode == Mode.DECODE:
                 x = ttnn.to_memory_config(x, mem_cfg, dtype=x.dtype)
             return x
+
+        # WS-A.6: when partial_rotary_factor < 1.0, permute q_norm/k_norm
+        # weights with the same per-head row permutation applied to wq/wk.
+        # q_norm runs on the Q tensor BEFORE rope and outputs in the same
+        # layout, so its scale weights must match the permuted Q layout. Done
+        # once per layer construction; idempotent because we overwrite the same
+        # state_dict key in place. cache files will reflect the permuted
+        # values (cache path was already invalidated by the use_hf_rope
+        # subdir suffix; see model_config.py:583).
+        if self._qk_rope_perm is not None:
+            if f"{q_norm_str}.weight" in state_dict:
+                state_dict[f"{q_norm_str}.weight"] = state_dict[f"{q_norm_str}.weight"][
+                    self._qk_rope_perm
+                ].contiguous()
+            if f"{k_norm_str}.weight" in state_dict:
+                state_dict[f"{k_norm_str}.weight"] = state_dict[f"{k_norm_str}.weight"][
+                    self._qk_rope_perm
+                ].contiguous()
 
         if f"{q_norm_str}.weight" in state_dict:
             fn_q_norm = RMSNorm(

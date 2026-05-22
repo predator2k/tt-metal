@@ -65,7 +65,13 @@ class Transformer(LightweightModule):
 
         DefaultRopeSetup = HfRotarySetup if self.args.use_hf_rope else RotarySetup
         ActualRopeSetupClass = rope_setup_class if rope_setup_class is not None else DefaultRopeSetup
-        self.rope_setup = ActualRopeSetupClass(
+        # WS-A.6: Qwen3.5 sets ``args.mrope_section`` and
+        # ``args.partial_rotary_factor`` (both optional, with safe defaults).
+        # Only forward to HfRotarySetup which knows the MRoPE kwargs; the
+        # Meta-style RotarySetup does not accept them. For non-MRoPE models the
+        # args defaults make HfRotarySetup byte-equivalent to the pre-WS-A.6
+        # behavior.
+        rope_kwargs = dict(
             device=mesh_device,
             batch_size=args.max_batch_size,
             head_dim=args.head_dim,
@@ -75,6 +81,10 @@ class Transformer(LightweightModule):
             use_qk_fused=args.use_qk_fused,
             prefetcher=prefetcher,
         )
+        if ActualRopeSetupClass is HfRotarySetup:
+            rope_kwargs["mrope_section"] = getattr(args, "mrope_section", None)
+            rope_kwargs["partial_rotary_factor"] = getattr(args, "partial_rotary_factor", 1.0)
+        self.rope_setup = ActualRopeSetupClass(**rope_kwargs)
 
         if args.rope_theta_local:
             self.rope_local_setup = DefaultRopeSetup(

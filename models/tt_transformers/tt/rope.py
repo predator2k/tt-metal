@@ -439,6 +439,173 @@ def get_rot_mats_hf(
     return [cos_matrix, sin_matrix]
 
 
+def qwen35_partial_rotary_head_perm(head_dim: int, rotary_dim: int) -> torch.Tensor:
+    """Per-head row permutation that maps Qwen3.5 HF partial-RoPE layout to a
+    layout compatible with TT's ``rotary_embedding_hf`` kernel.
+
+    Background:
+
+      * HF Qwen3.5 partial RoPE rotates the **first ``rotary_dim`` dims** of
+        each head. ``rotate_half`` on that slice pairs index ``i`` with index
+        ``i + rotary_dim/2`` (split inside the rotated 64 dims).
+      * TT's ``rotary_embedding_hf`` kernel hardcodes ``half_Wt = head_dim/2``
+        (see ``rotary_embedding_hf_sharded.cpp``), pairing index ``i`` with
+        index ``i + head_dim/2``.
+
+    To run HF partial RoPE on the unmodified TT kernel, we permute the per-head
+    rows of ``q_proj`` / ``k_proj`` (and ``q_norm`` / ``k_norm``) at load time
+    so that HF index ``i + rotary_dim/2`` lands at TT index ``i + head_dim/2``
+    for the rotated half, and the rest fill the gaps.
+
+    Permutation (for head_dim=256, rotary_dim=64, half=32):
+      HF [0:32]   → TT [0:32]          (rot lower half)
+      HF [32:64]  → TT [128:160]       (rot upper half — placed at i + 128)
+      HF [64:160] → TT [32:128]        (pass-through, 96 dims)
+      HF [160:256]→ TT [160:256]       (pass-through, 96 dims)
+
+    Returns ``perm`` such that ``tt_data[i, :] = hf_data[perm[i], :]`` for a
+    [head_dim, ...] tensor (row permutation). Symmetric and inverse-equivalent
+    for the canonical Qwen3.5 numbers.
+
+    With this permutation in place, the cos/sin tables only need real values at
+    TT indices ``[0:rotary_dim/2]`` and ``[head_dim/2 : head_dim/2 +
+    rotary_dim/2]``; the rest stay at cos=1 / sin=0 so the kernel's bound
+    rotate_half ops on the pass-through tail evaluate to identity.
+
+    Equivariance check: V is **not** permuted (no RoPE on V) and o_proj rows
+    are unchanged, so the final attention output stays in HF semantic space.
+    The KV cache stores K in TT-permuted layout, but every SDPA Q*K^T reads Q
+    in the same permutation, so the dot-product is preserved.
+    """
+    assert rotary_dim > 0 and rotary_dim <= head_dim, (rotary_dim, head_dim)
+    assert rotary_dim % 2 == 0, f"rotary_dim={rotary_dim} must be even"
+    half = head_dim // 2
+    rot_half = rotary_dim // 2
+    assert half + rot_half <= head_dim
+    pass_per_block = half - rot_half  # 96 for Qwen3.5-0.8B
+    perm = torch.empty(head_dim, dtype=torch.long)
+    # TT [0 : rot_half) ← HF [0 : rot_half)
+    perm[0:rot_half] = torch.arange(0, rot_half)
+    # TT [rot_half : half) ← HF [rotary_dim : rotary_dim + pass_per_block)
+    perm[rot_half:half] = torch.arange(rotary_dim, rotary_dim + pass_per_block)
+    # TT [half : half + rot_half) ← HF [rot_half : rotary_dim)
+    perm[half:half + rot_half] = torch.arange(rot_half, rotary_dim)
+    # TT [half + rot_half : head_dim) ← HF [rotary_dim + pass_per_block : head_dim)
+    perm[half + rot_half:head_dim] = torch.arange(rotary_dim + pass_per_block, head_dim)
+    return perm
+
+
+def get_rot_mats_hf_mrope(
+    head_dim: int,
+    device: Any,
+    seq_len: int,
+    theta: float,
+    mrope_section: Optional[List[int]],
+    partial_rotary_factor: float = 1.0,
+    datatype: Any = ttnn.bfloat16,
+    layout: ttnn.Layout = ttnn.TILE_LAYOUT,
+) -> List[ttnn.Tensor]:
+    """Generate HF-format cos/sin matrices for Qwen3.5-style RoPE with
+    ``partial_rotary_factor`` zero-padding (TEXT-only path).
+
+    NUMERICAL EQUIVALENCE NOTE (verified against HF
+    ``Qwen3_5TextRotaryEmbedding`` for the Qwen3.5-0.8B config):
+
+      * HF expands a 2D ``position_ids`` (``[bs, seq_len]``) to ``[3, bs,
+        seq_len]`` by *replicating* the same positions to the T, H, W axes —
+        see ``Qwen3_5TextRotaryEmbedding.forward`` (transformers ≥ 4.57).
+      * With identical positions on all three axes, ``freqs[0]``, ``freqs[1]``,
+        and ``freqs[2]`` are bit-identical, so ``apply_interleaved_mrope``
+        becomes a no-op: every ``freqs_t[..., idx] = freqs[dim, ..., idx]``
+        assignment writes the same value that's already there.
+      * Therefore TEXT-only Qwen3.5 RoPE collapses to standard 1D HF RoPE on
+        the first ``rotary_dim = int(head_dim * partial_rotary_factor)`` dims,
+        with the remaining dims passing through unchanged.
+
+      Implication: ``mrope_section`` only affects vision (3D position_ids with
+      distinct T/H/W). For text-only inference this function ignores
+      ``mrope_section`` and simply zero-pads cos/sin to ``head_dim`` with
+      cos=1.0 and sin=0.0 on the pass-through tail. The existing
+      ``ttnn.experimental.rotary_embedding_hf`` kernel then implements partial
+      rotation as a special case: ``q_pass * 1 + rotate_half(q_pass) * 0 =
+      q_pass``. bf16 representations of 1.0 and 0.0 are exact, so this is
+      bit-equivalent to HF's explicit q_rot/q_pass split.
+
+    Returns ``[cos, sin]`` shaped ``[1, 1, seq_len, head_dim]`` matching
+    :func:`get_rot_mats_hf`.
+
+    Args:
+        head_dim: Per-head dimension (full Q/K width, e.g. 256 for Qwen3.5-0.8B).
+        device: TTNN mesh device.
+        seq_len: Max sequence length to pre-compute cos/sin for.
+        theta: RoPE base (e.g. 10_000_000 for Qwen3.5).
+        mrope_section: Kept for forward-compat with vision MRoPE. Currently
+            unused in TEXT-only path; documented in the note above.
+        partial_rotary_factor: Fraction of ``head_dim`` to rotate. ``1.0`` is
+            byte-equivalent to :func:`get_rot_mats_hf`.
+        datatype: Device dtype (``ttnn.bfloat16`` recommended; the bf16
+            representations of 1.0 and 0.0 are exact).
+        layout: Device tensor layout (``TILE`` for prefill, ``ROW_MAJOR`` for
+            decode cache, mirroring :func:`get_rot_mats_hf`).
+    """
+    del mrope_section  # see docstring; TEXT-only path ignores
+    assert 0.0 < partial_rotary_factor <= 1.0, partial_rotary_factor
+
+    rotary_dim = int(head_dim * partial_rotary_factor)
+    # rotary_dim must be even because RoPE pairs adjacent freqs.
+    assert rotary_dim % 2 == 0, f"rotary_dim={rotary_dim} must be even"
+    rot_half = rotary_dim // 2
+    head_half = head_dim // 2
+
+    # Standard 1D RoPE inverse frequencies on the rotated dims.
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )  # [rot_half]
+    t = torch.arange(seq_len, dtype=torch.float32)
+    freqs = torch.outer(t, inv_freq)  # [seq_len, rot_half]
+
+    # WS-A.6: when partial_rotary_factor < 1, the per-head Q/K rows are
+    # permuted (see :func:`qwen35_partial_rotary_head_perm`) so the rotated
+    # half lives at TT indices ``[0 : rot_half) ∪ [head_half : head_half +
+    # rot_half)`` and the pass-through tail lives in the gaps. Build cos/sin
+    # to match: real freqs at the rotated positions; cos=1/sin=0 elsewhere
+    # (kernel's bound rotate_half on the pass-through slots evaluates to
+    # identity, matching HF's no-op for q_pass).
+    cos_full = torch.ones(seq_len, head_dim, dtype=torch.float32)
+    sin_full = torch.zeros(seq_len, head_dim, dtype=torch.float32)
+    if rotary_dim < head_dim:
+        cos_full[:, 0:rot_half] = torch.cos(freqs)
+        cos_full[:, head_half:head_half + rot_half] = torch.cos(freqs)
+        sin_full[:, 0:rot_half] = torch.sin(freqs)
+        sin_full[:, head_half:head_half + rot_half] = torch.sin(freqs)
+    else:
+        # Full RoPE (partial_rotary_factor == 1.0): byte-equivalent to
+        # standard HF format. Use the standard [cos, cos] / [sin, sin] tiling.
+        cos_full = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+        sin_full = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
+
+    # [1, 1, seq_len, head_dim]
+    cos_full = cos_full.unsqueeze(0).unsqueeze(0)
+    sin_full = sin_full.unsqueeze(0).unsqueeze(0)
+
+    cos_matrix = ttnn.from_torch(
+        cos_full,
+        device=device,
+        layout=layout,
+        dtype=datatype,
+        mesh_mapper=replicate_tensor_to_mesh_mapper(device),
+    )
+    sin_matrix = ttnn.from_torch(
+        sin_full,
+        device=device,
+        layout=layout,
+        dtype=datatype,
+        mesh_mapper=replicate_tensor_to_mesh_mapper(device),
+    )
+
+    return [cos_matrix, sin_matrix]
+
+
 class HfRotarySetupOld(LightweightModule):
     """Legacy HF rope setup: HF-format cos/sin caches for ``ttnn.experimental.rotary_embedding``.
 
@@ -578,6 +745,14 @@ class HfRotarySetup(LightweightModule):
     Decode cos/sin caches use ``ROW_MAJOR`` layout for ``ttnn.embedding`` row gather; prefill
     uses ``TILE`` layout via :func:`get_rot_mats_hf`. See :class:`HfRotarySetupOld` for the legacy
     ``rotary_embedding`` path.
+
+    Qwen3.5 MRoPE: when ``mrope_section`` is provided or ``partial_rotary_factor``
+    is < 1.0, the cos/sin caches are built via :func:`get_rot_mats_hf_mrope`,
+    which embeds the TEXT-only interleaved MRoPE schedule and zero-pads the
+    non-rotated dims (cos=1.0, sin=0.0) so the existing rotary_embedding_hf
+    kernel handles partial rotation as a special case. Pre-MRoPE consumers
+    (Llama, Qwen2/3-8B, Mistral, etc.) leave these kwargs at their defaults
+    and remain byte-equivalent.
     """
 
     def __init__(
@@ -592,6 +767,8 @@ class HfRotarySetup(LightweightModule):
         datatype: ttnn.DataType = ttnn.bfloat16,
         shard_batch_to_mesh_dim: Optional[int] = 1,  # Kept for API compatibility
         prefetcher: Optional[Prefetcher] = None,
+        mrope_section: Optional[List[int]] = None,
+        partial_rotary_factor: float = 1.0,
     ) -> None:
         super().__init__()
         if use_qk_fused:
@@ -614,25 +791,59 @@ class HfRotarySetup(LightweightModule):
             device.compute_with_storage_grid_size() if ttnn.get_arch_name() == "blackhole" else ttnn.CoreCoord(8, 8)
         )
 
-        # Decode: ROW_MAJOR cache for embedding lookup (same numerics as prefill via get_rot_mats_hf).
-        self.cos_matrix, self.sin_matrix = get_rot_mats_hf(
-            head_dim=head_dim,
-            device=device,
-            seq_len=max_seq_len,
-            theta=rope_theta,
-            rope_scaling=rope_scaling,
-            datatype=datatype,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-        )
+        # WS-A.6: Qwen3.5 MRoPE + partial_rotary_factor gate. When either is
+        # active, swap in get_rot_mats_hf_mrope (cos/sin tables embed the
+        # interleaved MRoPE TEXT-only schedule, zero-pad non-rotated dims).
+        # rope_scaling is not supported alongside MRoPE in this initial port —
+        # Qwen3.5 sets rope_type=default with no scaling, so this is a strict
+        # check rather than a fallback.
+        self.use_mrope = mrope_section is not None or partial_rotary_factor != 1.0
+        if self.use_mrope:
+            assert rope_scaling is None, (
+                "MRoPE + rope_scaling not yet supported; Qwen3.5 ships rope_type=default"
+            )
+            assert mrope_section is not None, (
+                "partial_rotary_factor < 1.0 requires mrope_section (Qwen3.5 path)"
+            )
+            self.cos_matrix, self.sin_matrix = get_rot_mats_hf_mrope(
+                head_dim=head_dim,
+                device=device,
+                seq_len=max_seq_len,
+                theta=rope_theta,
+                mrope_section=mrope_section,
+                partial_rotary_factor=partial_rotary_factor,
+                datatype=datatype,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+            self.cos_matrix_prefill, self.sin_matrix_prefill = get_rot_mats_hf_mrope(
+                head_dim=head_dim,
+                device=device,
+                seq_len=max_seq_len,
+                theta=rope_theta,
+                mrope_section=mrope_section,
+                partial_rotary_factor=partial_rotary_factor,
+                datatype=datatype,
+            )
+        else:
+            # Decode: ROW_MAJOR cache for embedding lookup (same numerics as prefill via get_rot_mats_hf).
+            self.cos_matrix, self.sin_matrix = get_rot_mats_hf(
+                head_dim=head_dim,
+                device=device,
+                seq_len=max_seq_len,
+                theta=rope_theta,
+                rope_scaling=rope_scaling,
+                datatype=datatype,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
 
-        self.cos_matrix_prefill, self.sin_matrix_prefill = get_rot_mats_hf(
-            head_dim=head_dim,
-            device=device,
-            seq_len=max_seq_len,
-            theta=rope_theta,
-            rope_scaling=rope_scaling,
-            datatype=datatype,
-        )
+            self.cos_matrix_prefill, self.sin_matrix_prefill = get_rot_mats_hf(
+                head_dim=head_dim,
+                device=device,
+                seq_len=max_seq_len,
+                theta=rope_theta,
+                rope_scaling=rope_scaling,
+                datatype=datatype,
+            )
 
         self.transformation_mat = None
         self.transformation_mat_prefill = None
