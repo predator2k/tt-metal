@@ -1102,6 +1102,8 @@ class Attention(LightweightModule):
                         memory_config=self.args.get_attn_all_gather_output_mem_config(Mode.DECODE, self.prefetcher),
                         topology=self.ccl_topology,
                     )
+                if _ws_dump:
+                    _ws_a7_dump_save("11d_all_gather_output", all_gather_output)
                 dense_out_sharded = ttnn.linear(
                     all_gather_output,
                     self.wo_sharded_ring if self.prefetcher is not None else self.wo,
@@ -1120,6 +1122,12 @@ class Attention(LightweightModule):
                 self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
             )
             if _ws_dump:
+                # WS-A.11 layer-compounding probe: capture WO weight + dense_out
+                # to attribute the post_gate_mul -> post_o_proj PCC drop.
+                try:
+                    _ws_a7_dump_save("11c_wo_weight", self.wo)
+                except Exception as _exc:
+                    print(f"[ws-a11] WO weight dump WARN: {_exc}", flush=True)
                 _ws_a7_dump_save("12_post_o_proj", dense_out_sharded)
             return dense_out_sharded
 
