@@ -13,6 +13,7 @@ from models.common.sampling.generator import SamplingGenerator
 from models.tt_transformers.tt.ccl import TT_CCL
 from models.tt_transformers.tt.common import Mode, copy_host_to_device
 from models.tt_transformers.tt.decoder import TransformerBlock
+from models.tt_transformers.tt.linear_attention import LinearAttentionBlock
 from models.tt_transformers.tt.distributed_norm import DistributedNorm
 from models.tt_transformers.tt.embedding import Embedding, ScaledEmbedding
 from models.tt_transformers.tt.lm_head import LMHead
@@ -88,8 +89,35 @@ class Transformer(LightweightModule):
 
         self.trans_mats_dict = self.rope_setup.get_both_trans_mats()
 
-        self.layers = [
-            TransformerBlock(
+        # Per-layer dispatch: Qwen3.5 (and similar hybrid attention models)
+        # interleave ``linear_attention`` and ``full_attention`` layers.
+        # ``args.layer_types`` is the parsed ``text_config['layer_types']``
+        # list (one entry per layer). When None, every layer uses the
+        # default TT-native ``TransformerBlock`` — preserves all
+        # pre-hybrid model paths (Llama, Qwen2/3, Mistral, …) byte-exact.
+        layer_types = getattr(args, "layer_types", None)
+
+        def _build_layer(i):
+            lt = layer_types[i] if layer_types is not None else None
+            if lt == "linear_attention":
+                # Host-fallback GatedDeltaNet block — see linear_attention.py.
+                # Constructor signature mirrors TransformerBlock (extra kwargs
+                # are accepted-and-ignored) so this dispatch is the only fork.
+                return LinearAttentionBlock(
+                    args=args,
+                    mesh_device=mesh_device,
+                    tt_ccl=self.tt_ccl,
+                    dtype=dtype,
+                    state_dict=state_dict,
+                    weight_cache_path=weight_cache_path,
+                    layer_num=i,
+                    transformation_mats=self.trans_mats_dict,
+                    paged_attention_config=paged_attention_config,
+                    use_paged_kv_cache=use_paged_kv_cache,
+                    attention_class=attention_class,
+                    prefetcher=prefetcher,
+                )
+            return TransformerBlock(
                 args=args,
                 mesh_device=mesh_device,
                 tt_ccl=self.tt_ccl,
@@ -103,8 +131,8 @@ class Transformer(LightweightModule):
                 attention_class=attention_class,
                 prefetcher=prefetcher,
             )
-            for i in tqdm(range(self.n_layers))
-        ]
+
+        self.layers = [_build_layer(i) for i in tqdm(range(self.n_layers))]
         self.norm = DistributedNorm(
             RMSNorm(
                 device=mesh_device,

@@ -2661,6 +2661,11 @@ class ModelArgs:
 
         # Try to get text_config, if it doesn't exist everything is text config
         text_config = config.get("text_config", config)
+        # Stash the raw text_config dict so model-specific blocks (e.g. Qwen3.5
+        # LinearAttentionBlock) can read DeltaNet-specific keys that the
+        # standard ModelArgs surface doesn't carry as named attributes.
+        # This is *read-only*; nothing mutates it after stashing.
+        self._text_config = text_config
         self.eos_token_id = None if isinstance(eos_token_id, int) else eos_token_id
         layer_types = text_config["layer_types"] if "layer_types" in text_config else None
 

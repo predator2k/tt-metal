@@ -16,13 +16,34 @@ from models.tt_transformers.tt.model_config import DecodersPrecision, ModelArgs,
 
 
 def allocate_sglang_kv_cache(kv_cache_shape, dtype, num_layers, dp_model: List[Transformer], tt_cache_path):
+    """Allocate a per-layer paged KV cache list.
+
+    For models with hybrid attention (Qwen3.5: ``layer_types`` interleaves
+    ``linear_attention`` and ``full_attention``), this function honors
+    ``model.args.layer_types`` and emits ``None`` for linear-attention layers
+    — those layers don't have a KV cache (they keep their own recurrent
+    state inside ``LinearAttentionBlock``). The per-layer list length is
+    still ``num_layers`` so ``model.forward()`` can index by layer position.
+
+    For pre-hybrid models (Llama, Qwen3, etc.), ``layer_types`` is None so
+    every entry is a real paged KV pair — byte-exact with the prior
+    behavior.
+    """
     logger.warning("[TT-METAL-SGLANG-LOG] allocate_sglang_kv_cache called in generator")
     submesh_devices = [model.mesh_device for model in dp_model]
     kv_cache = []
     for mesh_idx, submesh in enumerate(submesh_devices):
         cache_kv = torch.zeros(kv_cache_shape, dtype=dtype)
+        # Hybrid-attention models stash per-layer types on model.args;
+        # absent attribute means "every layer is full attention" (default).
+        layer_types = getattr(dp_model[mesh_idx].args, "layer_types", None)
         kv_tt = []
         for layer_num in tqdm(range(num_layers), desc=f"Allocating TT kv caches for each layer (submesh {mesh_idx+1})"):
+            # Skip KV allocation for linear-attention layers (they use a
+            # host-side recurrent state managed by LinearAttentionBlock).
+            if layer_types is not None and layer_types[layer_num] == "linear_attention":
+                kv_tt.append(None)
+                continue
             # Get the dtype for the kv cache based on the configured optimizations in the model
             if dp_model[mesh_idx].args.optimizations is not None:
                 kv_cache_dtype = dp_model[mesh_idx].args.optimizations.get_tensor_dtype(
