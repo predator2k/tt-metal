@@ -44,6 +44,78 @@ def _ws_a8_kv_replicate_enabled() -> bool:
     return _os.environ.get("SGLANG_TT_QWEN35_KV_REPLICATE_RUNTIME", "") == "1"
 
 
+# ---------------------------------------------------------------------------
+# WS-A.14 SDPA precision probes (env-gated; default-off, no behavior change).
+#
+# All four knobs read at decode-time:
+#   SGLANG_TT_QWEN35_WSA14_SDPA_HIFI4=1        -> override SDPA compute kernel
+#                                                 cfg to MathFidelity.HiFi4 +
+#                                                 fp32_dest_acc_en=True.
+#   SGLANG_TT_QWEN35_WSA14_SDPA_FP32ACC=1      -> override SDPA compute kernel
+#                                                 cfg to current fidelity + fp32
+#                                                 dest accumulator only (no
+#                                                 fidelity change). Stacking with
+#                                                 HIFI4 is redundant.
+#   SGLANG_TT_QWEN35_WSA14_PRINT_MEMCFG=1      -> in forward_decode, print
+#                                                 memory_config of attn_output_cat
+#                                                 and gate just before the
+#                                                 elementwise multiply (H4).
+#   SGLANG_TT_QWEN35_WSA14_HEAD_PROBE=1        -> dump attn_output_cat with
+#                                                 separate per-head replica
+#                                                 stats (H5).
+# ---------------------------------------------------------------------------
+def _ws_a14_sdpa_override_kernel_cfg(default_cfg):
+    """Return either default_cfg unchanged, or an HiFi4/fp32 override.
+
+    Builds the override config lazily so we don't pay any cost when the env
+    var is unset. ``default_cfg`` is the WormholeComputeKernelConfig already
+    selected by ``decoders_optimizations.get_math_fidelity`` for this layer.
+    """
+    import os as _os
+    if _os.environ.get("SGLANG_TT_QWEN35_WSA14_SDPA_HIFI4", "") == "1":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=False,
+        )
+    if _os.environ.get("SGLANG_TT_QWEN35_WSA14_SDPA_FP32ACC", "") == "1":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=default_cfg.math_fidelity,
+            math_approx_mode=default_cfg.math_approx_mode,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=default_cfg.packer_l1_acc,
+        )
+    return default_cfg
+
+
+def _ws_a14_print_memcfg_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("SGLANG_TT_QWEN35_WSA14_PRINT_MEMCFG", "") == "1"
+
+
+def _ws_a14_head_probe_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("SGLANG_TT_QWEN35_WSA14_HEAD_PROBE", "") == "1"
+
+
+def _ws_a14_wo_kernel_cfg(default_cfg):
+    """Optional override for the Wo decode matmul compute kernel cfg.
+
+    SGLANG_TT_QWEN35_WSA14_WO_HIFI4=1 lifts the Wo matmul to HiFi4 +
+    fp32_dest_acc_en. Default unset = no behavior change.
+    """
+    import os as _os
+    if _os.environ.get("SGLANG_TT_QWEN35_WSA14_WO_HIFI4", "") == "1":
+        return ttnn.WormholeComputeKernelConfig(
+            math_fidelity=ttnn.MathFidelity.HiFi4,
+            math_approx_mode=False,
+            fp32_dest_acc_en=True,
+            packer_l1_acc=True,
+        )
+    return default_cfg
+
+
 def _ws_a7_dump_save(name: str, tensor):
     """Best-effort save: ttnn -> torch -> append to dict on disk."""
     import os as _os
@@ -986,6 +1058,9 @@ class Attention(LightweightModule):
             _attn_pos = ttnn.subtract(current_pos, _one_t)
         else:
             _attn_pos = current_pos
+        # WS-A.14 H1/H2: optionally override SDPA decode compute kernel cfg
+        # via env var (HIFI4 +/- fp32 dest acc). No-op when env vars are unset.
+        _sdpa_cfg = _ws_a14_sdpa_override_kernel_cfg(self.sdpa_decode_compute_kernel_cfg)
         if page_table is not None:
             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                 q_heads_1BQD,
@@ -996,7 +1071,7 @@ class Attention(LightweightModule):
                 scale=self.scale,
                 sliding_window_size=self.sliding_window,
                 program_config=sdpa_decode_prog_cfg,
-                compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
+                compute_kernel_config=_sdpa_cfg,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         else:
@@ -1008,7 +1083,7 @@ class Attention(LightweightModule):
                 scale=self.scale,
                 sliding_window_size=self.sliding_window,
                 program_config=sdpa_decode_prog_cfg,
-                compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
+                compute_kernel_config=_sdpa_cfg,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,  # FIXME: why not L1 height sharded e.g. SCORES_BATCHED_MM_OUTPUT_MEMCFG?
             )
 
@@ -1029,6 +1104,17 @@ class Attention(LightweightModule):
         ttnn.deallocate(attn_output_1G4D)
         if _ws_dump:
             _ws_a7_dump_save("10_post_sdpa", attn_output_cat)
+        # WS-A.14 H5: dump SDPA output reshaped to expose per-head replicas so
+        # the layer3 probe can diff head 0 vs head 1 (which should be bit
+        # identical when KV is replicated). Off by default.
+        if _ws_a14_head_probe_enabled() and self.layer_num == 3:
+            try:
+                _flat = ttnn.to_torch(ttnn.get_device_tensors(attn_output_cat)[0]).float().cpu()
+                # [1, 1, 32, n_local_heads * head_dim] — reshape last dim.
+                _flat = _flat.reshape(_flat.shape[0], _flat.shape[1], _flat.shape[2], self.n_local_heads, self.head_dim)
+                _ws_a7_dump_save("10_post_sdpa_per_head", _flat)
+            except Exception as _exc:
+                print(f"[ws-a14-head-probe] WARN: {type(_exc).__name__}: {_exc}", flush=True)
 
         # WS-A.3: apply attn_output_gate = sigmoid(gate) * attn_output before
         # o_proj. After nlp_concat_heads_decode, attn_output_cat has shape
@@ -1043,6 +1129,17 @@ class Attention(LightweightModule):
             gate_flat = ttnn.sigmoid(gate_flat)
             if _ws_dump:
                 _ws_a7_dump_save("11_sigmoid_gate", gate_flat)
+            # WS-A.14 H4: print memcfg pair just before to_memory_config + multiply.
+            if _ws_a14_print_memcfg_enabled() and self.layer_num == 3:
+                try:
+                    print(f"[ws-a14-h4] layer={self.layer_num} attn_out memcfg: "
+                          f"{attn_output_cat.memory_config()}", flush=True)
+                    print(f"[ws-a14-h4] layer={self.layer_num} gate_flat memcfg: "
+                          f"{gate_flat.memory_config()}", flush=True)
+                    print(f"[ws-a14-h4] layer={self.layer_num} attn_out shape={tuple(attn_output_cat.shape)} "
+                          f"gate_flat shape={tuple(gate_flat.shape)}", flush=True)
+                except Exception as _exc:
+                    print(f"[ws-a14-h4] WARN: {type(_exc).__name__}: {_exc}", flush=True)
             gate_flat = ttnn.to_memory_config(gate_flat, attn_output_cat.memory_config())
             attn_output_cat = ttnn.multiply(attn_output_cat, gate_flat)
             if _ws_dump:
@@ -1104,12 +1201,14 @@ class Attention(LightweightModule):
                     )
                 if _ws_dump:
                     _ws_a7_dump_save("11d_all_gather_output", all_gather_output)
+                # WS-A.14 H3: optional Wo matmul precision lift (env-gated).
+                _wo_kernel_cfg = _ws_a14_wo_kernel_cfg(self.li_o_decode_compute_kernel_cfg)
                 dense_out_sharded = ttnn.linear(
                     all_gather_output,
                     self.wo_sharded_ring if self.prefetcher is not None else self.wo,
                     memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
                     program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
-                    compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
+                    compute_kernel_config=_wo_kernel_cfg,
                     global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
                     # dense_out ring-gather matmul: all_gather_output is sharded on receiver cores,
                     # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
@@ -1172,6 +1271,26 @@ class Attention(LightweightModule):
 
             ttnn.deallocate(attn_output_cat)
 
+            # WS-A.14 H3a probe: dump pre-all_reduce dense matmul output to
+            # attribute post_o_proj PCC drop between matmul and CCL reduce.
+            if _ws_dump:
+                try:
+                    _ws_a7_dump_save("12pre_wo_matmul_out", dense_out_sharded)
+                except Exception as _exc:
+                    print(f"[ws-a14-12pre] WARN: {_exc}", flush=True)
+
+            # WS-A.14 H3a: optionally lift CCL all_reduce precision from BFP8
+            # to BF16. Default = self.ccl_dtype (BFP8). Env-gated; no-op when
+            # unset.
+            import os as _os
+            _ccl_override = _os.environ.get("SGLANG_TT_QWEN35_WSA14_CCL_DTYPE", "").lower()
+            if _ccl_override == "bf16":
+                _ccl_dt = ttnn.bfloat16
+            elif _ccl_override == "bfp8":
+                _ccl_dt = ttnn.bfloat8_b
+            else:
+                _ccl_dt = self.ccl_dtype
+
             # All reduce
             dense_out_reduced = tt_all_reduce(
                 dense_out_sharded,
@@ -1184,7 +1303,7 @@ class Attention(LightweightModule):
                     Mode.DECODE, self.hidden_size, list(self.mesh_device.shape)[0], self.prefetcher
                 ),
                 sharded=True,
-                dtype=self.ccl_dtype,
+                dtype=_ccl_dt,
                 use_composite=True if self.hidden_size == 8192 else False,
                 subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
             )
