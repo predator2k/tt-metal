@@ -58,8 +58,6 @@ EmbeddingsRMProgramFactory::cached_program_t EmbeddingsRMProgramFactory::create(
 
     uint32_t problem_size = num_blocks;
 
-    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
-
     uint32_t num_blocks_per_core_group_1, num_blocks_per_core_group_2;
     CoreRangeSet all_cores, core_group_1, core_group_2;
     bool row_major = false;
@@ -71,6 +69,13 @@ EmbeddingsRMProgramFactory::cached_program_t EmbeddingsRMProgramFactory::create(
         num_blocks_per_core_group_2 = 0;
         row_major = shard_spec.orientation == ShardOrientation::ROW_MAJOR;
     } else {
+        // Use the stall-group (primary compute) sub-device's worker cores.
+        // See embeddings_fused_program_factory.cpp for a detailed explanation.
+        const auto& stall_group = device->get_sub_device_stall_group();
+        SubDeviceId compute_sub_device =
+            stall_group.empty() ? SubDeviceId{0} : stall_group.back();
+        CoreRangeSet compute_cores =
+            device->worker_cores(HalProgrammableCoreType::TENSIX, compute_sub_device);
         std::tie(
             std::ignore,
             all_cores,
@@ -78,7 +83,7 @@ EmbeddingsRMProgramFactory::cached_program_t EmbeddingsRMProgramFactory::create(
             core_group_2,
             num_blocks_per_core_group_1,
             num_blocks_per_core_group_2) =
-            tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, problem_size);
+            tt::tt_metal::split_work_to_cores(compute_cores, problem_size);
     }
     uint32_t g1_numcores = core_group_1.num_cores();
 

@@ -170,21 +170,40 @@ def tt_all_reduce(
             input_tensor = ttnn.sharded_to_interleaved(input_tensor_sharded, ttnn.L1_MEMORY_CONFIG)
             input_tensor_sharded.deallocate(True)
 
-        reduced = ttnn.experimental.reduce_scatter_minimal_async(
-            input_tensor,
-            persistent_output_buffers=None,
-            dim=dim,
-            multi_device_global_semaphore=tt_ccl.get_and_cycle_rs_semaphore_handles(),
-            barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-            num_links=num_reduce_scatter_links,
-            memory_config=memory_config,
-            intermediate_memory_config=rs_memory_config,
-            topology=topology,
-            chunks_per_sync=chunks_per_sync,
-            num_workers_per_link=num_workers_per_link,
-            num_buffers_per_channel=2,
-            subdevice_id=subdevice_id,
-        )
+        # Standalone no-prefetcher path: drain in-flight CCL, then reset the next
+        # RS semaphore slot before use to prevent stale completion values.
+        # subdevice_id is None iff prefetcher is None (callers pass
+        # prefetcher.worker_sub_device_id or None), so we use that as the proxy.
+        if subdevice_id is not None:
+            # Prefetcher / trace-replay path: use async reduce_scatter.
+            reduced = ttnn.experimental.reduce_scatter_minimal_async(
+                input_tensor,
+                persistent_output_buffers=None,
+                dim=dim,
+                multi_device_global_semaphore=tt_ccl.get_and_cycle_rs_semaphore_handles(),
+                barrier_semaphore=tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+                num_links=num_reduce_scatter_links,
+                memory_config=memory_config,
+                intermediate_memory_config=rs_memory_config,
+                topology=topology,
+                chunks_per_sync=chunks_per_sync,
+                num_workers_per_link=num_workers_per_link,
+                num_buffers_per_channel=2,
+                subdevice_id=subdevice_id,
+            )
+        else:
+            # Standalone no-prefetcher path: use synchronous reduce_scatter to avoid
+            # CCL semaphore slot reuse issue (see distributed_norm.py).
+            reduced = ttnn.reduce_scatter(
+                input_tensor,
+                dim=dim,
+                num_links=num_reduce_scatter_links,
+                memory_config=memory_config,
+                topology=topology,
+                chunks_per_sync=chunks_per_sync,
+                num_workers_per_link=num_workers_per_link,
+                num_buffers_per_channel=2,
+            )
         input_tensor.deallocate(True)
         return reduced
 

@@ -162,7 +162,7 @@ class LMHead(LightweightModule):
                 program_config=pc,
                 memory_config=self.lm_head_output_memory_config,
                 dtype=self.args.lm_head_dtype if hasattr(self.args, "lm_head_dtype") else ttnn.bfloat8_b,
-                sub_device_id=self.prefetcher.worker_sub_device_id if use_prefetcher else None,
+                sub_device_id=self.prefetcher.receiver_sub_device_id if use_prefetcher else None,
             )
             output = ttnn.to_memory_config(
                 output,

@@ -268,6 +268,10 @@ public:
     void replay_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id, bool blocking);
     void release_mesh_trace(const MeshTraceId& trace_id);
     std::shared_ptr<MeshTraceBuffer> get_mesh_trace(const MeshTraceId& trace_id);
+    // Register a trace captured under the default sub-device manager onto the
+    // currently-active custom manager so that replay_mesh_trace succeeds without
+    // switching managers.  No-op if active == default.
+    void register_default_trace_on_active_manager(const MeshTraceId& trace_id);
     uint32_t get_trace_buffers_size() const override;
     void set_trace_buffers_size(uint32_t size) override;
 

@@ -70,9 +70,12 @@ class RMSNorm(LightweightModule):
             else:
                 weight_name = f"layers.{layer_num}.{weight_key}.weight"
 
-        torch_weight = (
-            state_dict[weight_name].unsqueeze(0).view(1, 1, dim).reshape([1, 1, dim // SHARD_HEIGHT, SHARD_HEIGHT])
-        )
+        # Fix B reshape: with TILE_LAYOUT (changed from ROW_MAJOR_LAYOUT to re-enable
+        # the large_tensor_needed L1 guard in layernorm_op_multi_core.cpp), the TTNN
+        # validator requires gamma.logical_shape()[-1] == input.logical_shape()[-1].
+        # The legacy [1, 1, dim//TILE, TILE] reshape gave logical[-1] = TILE (32), which
+        # passed the ROW_MAJOR validator but fails the TILE one. Keep logical[-1] = dim.
+        torch_weight = state_dict[weight_name].unsqueeze(0).view(1, 1, dim)
 
         # Add offset before caching
         if add_unit_offset:
@@ -85,7 +88,7 @@ class RMSNorm(LightweightModule):
             torch_weight,
             device=device,
             dtype=weight_dtype,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
+            layout=ttnn.TILE_LAYOUT,
             memory_config=weight_memory_config,
             cache_file_name=None if weight_cache_path is None else weight_cache_path / weight_name,
             mesh_mapper=ttnn.ReplicateTensorToMesh(device) if is_mesh_device else None,
@@ -96,7 +99,7 @@ class RMSNorm(LightweightModule):
                 torch_weight,
                 device=device,
                 dtype=weight_dtype,
-                layout=ttnn.ROW_MAJOR_LAYOUT,
+                layout=ttnn.TILE_LAYOUT,
                 memory_config=weight_memory_config,
                 cache_file_name=(
                     None if weight_cache_path is None else weight_cache_path / (weight_name + "_distributed")
@@ -126,6 +129,7 @@ class RMSNorm(LightweightModule):
         in_sharded=False,
         out_sharded=False,
         norm_config=None,
+        core_range_set=None,
     ) -> ttnn.Tensor:
         if isinstance(mode, str):
             try:
@@ -151,14 +155,16 @@ class RMSNorm(LightweightModule):
         else:
             assert not out_sharded, "Non-sharded version of RMSNorm cannot output a sharded tensor"
 
-        x = norm(
-            x,
+        norm_kwargs = dict(
             epsilon=self.eps,
             weight=weight,
             program_config=program_config,
             memory_config=memory_config,
             compute_kernel_config=self.compute_kernel_config_hifi2,
         )
+        if core_range_set is not None and norm is ttnn.rms_norm:
+            norm_kwargs["core_range_set"] = core_range_set
+        x = norm(x, **norm_kwargs)
 
         if in_sharded and not out_sharded:
             return ttnn.sharded_to_interleaved(x)

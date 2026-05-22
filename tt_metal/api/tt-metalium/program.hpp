@@ -59,6 +59,12 @@ public:
     detail::ProgramImpl& impl() { return *internal_; }
     const detail::ProgramImpl& impl() const { return *internal_; }
 
+    // When true, skip the sub-device core-membership validation.
+    // Use for programs whose kernels may include cores that belong to no sub-device
+    // (e.g. MUX-clamped inactive rows on Blackhole).
+    void set_global_program(bool v);
+    bool is_global_program() const;
+
 private:
     // The internal ProgramImpl may outlive the Program object if it's in-use by a command queue.
     std::shared_ptr<detail::ProgramImpl> internal_;

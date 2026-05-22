@@ -1221,6 +1221,16 @@ std::shared_ptr<MeshTraceBuffer> MeshDeviceImpl::get_mesh_trace(const MeshTraceI
     return sub_device_manager_tracker_->get_active_sub_device_manager()->get_trace(trace_id);
 }
 
+void MeshDeviceImpl::register_default_trace_on_active_manager(const MeshTraceId& trace_id) {
+    validate_sub_device_manager_tracker();
+    auto active_id = sub_device_manager_tracker_->get_active_sub_device_manager_id();
+    auto default_id = sub_device_manager_tracker_->get_default_sub_device_manager_id();
+    if (active_id == default_id) {
+        return;  // No-op: already on the default manager
+    }
+    sub_device_manager_tracker_->register_default_trace_on_active_manager(trace_id);
+}
+
 MeshTraceId MeshDeviceImpl::begin_mesh_trace(uint8_t cq_id) {
     auto trace_id = MeshTrace::next_id();
     this->begin_mesh_trace(cq_id, trace_id);
@@ -1270,6 +1280,23 @@ void MeshDeviceImpl::end_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id) 
         this->mesh_id_,
         active_sub_device_manager->id());
     this->mesh_command_queues_[cq_id]->record_end();
+    fprintf(stderr, "[TT-P1-DBG] end_mesh_trace: record_end() done\n"); fflush(stderr);
+
+    // Tenstorrent-p1 (Layer 15, v6): NO explicit finish() here.
+    // With the gather-outside-trace strategy (use_barrier_semaphore=False in model.py),
+    // the trace capture no longer includes all_gather_async or barrier semaphores.
+    // The compile-run programs are drained by synchronize_device in generator.py
+    // _capture_decode_trace_text BEFORE begin_trace_capture, so:
+    //   (a) compile-run programs are already complete when we get here
+    //   (b) trace-capture bypass programs are queued but haven't started yet
+    //   (c) populate_mesh_buffer's internal finish_nolock dispatches dispatch_wait
+    //       for expected_num_workers_completed_[2] = compile-run value (45264),
+    //       which the device satisfies immediately (counter already ≥ 45264)
+    // Calling finish() here would dispatch another dispatch_wait(45264) AFTER the
+    // trace-capture bypass programs, creating a deadlock: dispatch_d waits for
+    // trace-capture workers which need GlobalCB data from a sender that dispatch_d
+    // hasn't launched yet.
+    fprintf(stderr, "[TT-P1-DBG] end_mesh_trace: skipping finish() (gather-outside-trace)\n"); fflush(stderr);
 
     // End DRAM high water mark tracking if trace_region_size is 0 (dynamic allocation mode)
     auto trace_region_size = this->allocator_impl()->get_config().trace_region_size;
@@ -1643,6 +1670,9 @@ void MeshDevice::replay_mesh_trace(uint8_t cq_id, const MeshTraceId& trace_id, b
     pimpl_->replay_mesh_trace(cq_id, trace_id, blocking);
 }
 void MeshDevice::release_mesh_trace(const MeshTraceId& trace_id) { pimpl_->release_mesh_trace(trace_id); }
+void MeshDevice::register_default_trace_on_active_manager(const MeshTraceId& trace_id) {
+    pimpl_->register_default_trace_on_active_manager(trace_id);
+}
 std::shared_ptr<MeshTraceBuffer> MeshDevice::get_mesh_trace(const MeshTraceId& trace_id) {
     return pimpl_->get_mesh_trace(trace_id);
 }

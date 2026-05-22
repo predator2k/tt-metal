@@ -664,6 +664,15 @@ class ModelArgs:
         self.use_qk_fused = not self.is_multimodal and not self.use_hf_rope
         if self.prefetcher is not None:
             self.use_qk_fused = False
+        # Tenstorrent-p1: on Blackhole the fused-QK path (rotary_embedding_llama_fused_qk +
+        # paged_fused_update_cache) uses a doubled transformation-matrix placed on 2× batch
+        # cores. With the sync-CCL no-prefetcher path on our [1,2] Blackhole mesh the fused
+        # and unfused paths produce near-zero PCC against each other — indicating a kernel
+        # incompatibility on this architecture. Force use_qk_fused=False on Blackhole so both
+        # the prefetcher and no-prefetcher paths use the same rope/cache-update kernels, making
+        # the PCC baseline comparison valid.
+        if is_blackhole():
+            self.use_qk_fused = False
 
         if self.mesh_device is not None:  # Avoid issue with test_torch.py not having a device
             # ============================================================================
@@ -1537,14 +1546,18 @@ class ModelArgs:
     def get_attn_sdpa_decode_program_config(self, prefetcher: Prefetcher = None):
         """Get the SDPA program config for decode mode."""
         if prefetcher is not None:
-            sdpa_grid_size = (8, 8)
-            start_core = prefetcher.worker_start_core
-            num_sdpa_cores = sdpa_grid_size[0] * sdpa_grid_size[1]
+            # Use the same safe worker rectangle as dynamic_worker_core_grid:
+            # (5,0)-(6,7) = 16 cores, all worker (no sender/receiver cores).
+            # This avoids the multi-sub-device dispatch crash when sub_core_grids spans
+            # non-worker cores, and avoids the invalid (1,56) grid from the old dynamic
+            # computation (worker_ranges[0] = (0,0)-(0,0) → row_width=1 → sdpa_grid=(1,56)).
+            worker_grid = prefetcher.dynamic_worker_core_grid(16)
+            num_sdpa_cores = worker_grid.num_cores()
+            sdpa_cols = num_sdpa_cores // 8
+            sdpa_grid_size = (sdpa_cols, 8)
             return ttnn.SDPAProgramConfig(
                 compute_with_storage_grid_size=sdpa_grid_size,
-                sub_core_grids=ttnn.num_cores_to_corerangeset_in_subcoregrids(
-                    start_core, num_sdpa_cores, prefetcher.all_worker_cores_range_set, row_wise=True
-                ),
+                sub_core_grids=worker_grid,
                 exp_approx_mode=False,
                 q_chunk_size=0,
                 k_chunk_size=0,
@@ -2117,7 +2130,12 @@ class ModelArgs:
     @lru_cache(maxsize=None)
     def get_norm_config(self, norm_type: str, mode: Mode, prefetcher: Prefetcher = None):
         """Get the norm config dict for attention, ff, or lm_head norms."""
-        prefetcher_norm_grid = ttnn.CoreGrid(y=8, x=4)
+        # Tenstorrent-p1: 16 cores (2 cols × 8 rows) matching dynamic_worker_core_grid(32)'s
+        # actual return value of (5,0)-(6,7) = 16 cores. Using 32 here caused a mismatch
+        # between sharded_program_config (32) and sharded_output_config (16 from
+        # dynamic_worker_core_grid), which would fail validate_sharded_input's
+        # "shard_spec.grid size does not fit within program_config grid" check.
+        prefetcher_norm_grid = ttnn.CoreGrid(y=8, x=2)
         match norm_type:
             case "attn":
                 if mode == Mode.DECODE and prefetcher is not None:

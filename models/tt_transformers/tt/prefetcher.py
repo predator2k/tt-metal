@@ -280,7 +280,12 @@ class PrefetcherSubDevice:
         assert len(self.sub_devices) > 0, "No subdevices have been created. Cannot create sub device manager."
         self.manager_id = self.mesh_device.create_sub_device_manager(self.sub_devices, 0)
         self.mesh_device.load_sub_device_manager(self.manager_id)
-        self.mesh_device.set_sub_device_stall_group(self.sub_devices_id)
+        # Only include the worker sub-device (last) in the stall group.
+        # Sender and receiver sub-devices run persistent kernels that never
+        # generate completion signals; including them in the stall group
+        # causes finish_nolock({}) — used internally by populate_mesh_buffer,
+        # cpu(), and blocking buffer ops — to hang indefinitely.
+        self.mesh_device.set_sub_device_stall_group([self.sub_devices_id[-1]])
 
 
 class Prefetcher(LightweightModule):
@@ -305,6 +310,7 @@ class Prefetcher(LightweightModule):
         self.enable_performance_mode: bool = True
         self.global_cb: Optional[ttnn.GlobalCircularBuffer] = None
         self.worker_sub_device_id: Optional[ttnn.SubDeviceId] = None
+        self.receiver_sub_device_id: Optional[ttnn.SubDeviceId] = None
         self.num_tensors: int = num_tensors
         self.num_layers: int = num_layers
         self.num_senders: int = len(self.pf_config["dram_banks"])
@@ -387,15 +393,7 @@ class Prefetcher(LightweightModule):
                 + [ttnn.CoreRange(ttnn.CoreCoord(right_range[0], 0), ttnn.CoreCoord(right_range[1] - 1, _grid_max_y))]
             )
 
-        ### Dynamic worker core grid: num_cores must be multiple of 8, spans cols 1-6 rows 0-7, plus cols 8+ if needed
-        def dynamic_worker_core_grid(num_cores):
-            cols = num_cores // 8
-            ranges = [ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(min(cols, 6), 7))]
-            if cols > 6:
-                ranges.append(ttnn.CoreRange(ttnn.CoreCoord(8, 0), ttnn.CoreCoord(cols + 1, 7)))
-            return ttnn.CoreRangeSet(ranges)
-
-        self.dynamic_worker_core_grid = dynamic_worker_core_grid
+        ### Dynamic worker core grid: deferred to method; see dynamic_worker_core_grid() below.
 
         ### Prefetched Tensors
         self.callbacks = []
@@ -410,6 +408,8 @@ class Prefetcher(LightweightModule):
         self.init_decode_done = False
         self.init_prefill_done = False
         self.prefetch_done = False
+        self._prefill_manager_id = None
+        self._decode_manager_id = None
 
     @property
     def worker_start_core(self):
@@ -418,6 +418,51 @@ class Prefetcher(LightweightModule):
         if not ranges:
             return ttnn.CoreCoord(1, 0)
         return ranges[0].start
+
+    def dynamic_worker_core_grid(self, num_cores):
+        """Return a rectangular CoreRangeSet of worker-only cores for sharded ops.
+
+        Returns the safe rectangular worker zone for the MUX-clamped Blackhole grid.
+        All callers (.num_cores()) read the actual core count from the returned value.
+
+        Design constraints:
+          - Must be a SINGLE rectangle (LayerNorm validator: num_cores == bbox_num_cores)
+          - Must lie entirely within the worker sub-device (no sender or receiver cores)
+          - Must remain valid before AND after prefetcher.init(Mode.DECODE)
+
+        MUX-clamped Blackhole layout for nrc ≤ 4 (the only valid nrc for Qwen3-8B TP=2):
+          Left senders: col 0, rows {1,3,5,7}
+          Right senders: col 7, rows {0,2,4,6}
+          Left receivers (nrc=4): cols 1–4, rows {1,3,5,7} (at left-sender rows)
+          Right receivers (nrc=4): cols {8,9,10,1} at right-sender rows {0,2,4,6}
+
+        Cols 5–6 have NO senders and NO receivers for any nrc ≤ 4 → ALL 8 rows are workers.
+        (5,0)–(6,7) is a 2×8 = 16 core rectangle fully within the compute sub-device.
+
+        Using 16 cores for both residual (requested 16) and norm (requested 32) shards:
+          - num_cores() = 16 → callers adapt shard_width = dim // 16 accordingly
+          - prefetcher_norm_grid must also be 16 cores (CoreGrid(y=8, x=2))
+          - ShardedLayerNorm: shard bbox (5,0)-(6,7) shifted to (0,0)-(1,7) fits in 2×8 ✓
+
+        num_cores_to_corerangeset_in_subcoregrids() is intentionally NOT used here: it
+        produces non-rectangular results when all_worker_cores_range_set has holes (sender
+        or receiver cores subtracted), causing both "Sharded layernorm does not support
+        non-rectangular core grids" TT_FATAL and multi-sub-device dispatch crashes.
+        """
+        # Safe worker-only rectangle: cols 5-6, all rows 0-7
+        # Valid for any nrc in legal_receiver_cores on MUX-clamped Blackhole (P150a, P300_X2).
+        # num_cores argument is accepted but the actual core count is always 16;
+        # callers use .num_cores() on the returned value so shard widths adapt automatically.
+        _WORKER_START_X = 5
+        _WORKER_END_X = 6  # 2 cols × 8 rows = 16 cores
+        _WORKER_START_Y = 0
+        _WORKER_END_Y = 7
+        return ttnn.CoreRangeSet(
+            [ttnn.CoreRange(
+                ttnn.CoreCoord(_WORKER_START_X, _WORKER_START_Y),
+                ttnn.CoreCoord(_WORKER_END_X, _WORKER_END_Y),
+            )]
+        )
 
     # NOTE: DRAM prefetched weights are prefetched in the order of the construction of the module
     def register_callback(self, callback: Callable[[], None]):
@@ -487,21 +532,46 @@ class Prefetcher(LightweightModule):
                         self.prefetcher_sub_device.add_sub_device(receiver_set)
                         self.prefetcher_sub_device.add_sub_device(compute_only)
                         self.all_worker_cores_range_set = compute_only
+                        # sub_devices_id layout: [sender(0), receiver(1), worker(2)]
+                        # The QKV ring-gather matmul takes x sharded on receiver cores;
+                        # store receiver sub_device_id so the factory intersection
+                        # (subdevice_cores ∩ x.shard_spec().grid) is non-empty.
+                        self._receiver_sub_device_idx = 1
                         logger.info(
                             f"[Prefetcher] 3-sub-device layout: "
                             f"{len(all_receivers)} receiver cores isolated from worker grid"
                         )
                     else:
+                        self._receiver_sub_device_idx = None
                         self.prefetcher_sub_device.add_sub_device(self.all_worker_cores_range_set)
                 else:
+                    self._receiver_sub_device_idx = None
                     self.prefetcher_sub_device.add_sub_device(self.all_worker_cores_range_set)
                 self.prefetcher_sub_device.init_sub_device_manager()
+                self._decode_manager_id = self.prefetcher_sub_device.manager_id
+                # Layer 15 fix: the program cache may hold entries compiled under the
+                # default manager's core partition. After switching to the decode
+                # sub-device manager (3-sub-device geometry), stale cache hits cause
+                # "Kernel group cores do not match sub device cores" at program.cpp:1811.
+                # Flush and re-enable so subsequent compilations use the new geometry.
+                self.mesh_device.disable_and_clear_program_cache()
+                self.mesh_device.enable_program_cache()
+                logger.info("[Prefetcher] Program cache cleared after decode sub-device manager switch")
             case Mode.PREFILL:
                 self.prefetcher_sub_device = PrefetcherSubDevice(self.mesh_device)
                 self.prefetcher_sub_device.add_sub_device(self.all_core_range_set)
                 self.prefetcher_sub_device.init_sub_device_manager()
+                self._prefill_manager_id = self.prefetcher_sub_device.manager_id
 
         self.worker_sub_device_id = self.prefetcher_sub_device.sub_devices_id[-1]
+        # In 3-sub-device layout: sub_devices_id[1] is the receiver sub_device.
+        # Fall back to worker_sub_device_id for 2-sub-device layouts (no isolated receivers).
+        _ridx = getattr(self, "_receiver_sub_device_idx", None)
+        self.receiver_sub_device_id = (
+            self.prefetcher_sub_device.sub_devices_id[_ridx]
+            if _ridx is not None
+            else self.worker_sub_device_id
+        )
         logger.info("=" * 50)
         logger.info("[Prefetcher Initialization]")
         logger.info(f"  Mode: {mode}")
@@ -516,6 +586,55 @@ class Prefetcher(LightweightModule):
         logger.info("=" * 50)
         self.init_decode_done = True if mode == Mode.DECODE else False
         self.init_prefill_done = True if mode == Mode.PREFILL else False
+
+    def load_prefill_manager(self):
+        """Activate the sub-device manager that was current when the prefill trace was captured."""
+        if self._prefill_manager_id is not None:
+            self.mesh_device.load_sub_device_manager(self._prefill_manager_id)
+
+    def load_decode_manager(self):
+        """Restore the decode sub-device manager after a prefill trace replay.
+
+        load_sub_device_manager resets the stall group to all sub-device IDs
+        ({0,1,2}) via reset_sub_device_stall_group().  We must re-apply the
+        worker-only restriction immediately afterward, otherwise finish_nolock({})
+        will wait for the persistent sender/receiver kernels and hang forever.
+        """
+        if self._decode_manager_id is not None:
+            self.mesh_device.load_sub_device_manager(self._decode_manager_id)
+            # Re-restrict stall group to worker sub-device only (see init_sub_device_manager).
+            self.mesh_device.set_sub_device_stall_group([self.prefetcher_sub_device.sub_devices_id[-1]])
+
+    def load_default_manager(self):
+        """Revert to the default (full-device, no sub-device partitioning) manager.
+
+        Use this before running prefill ops while the decode 3-sub-device manager
+        is active.  Under the default manager, ttnn operations use the full device
+        grid without sub-device intersection validation, avoiding the
+        "Kernel group cores do not match sub device cores" TT_FATAL that occurs
+        when any op's kernel grid spans inactive sender/receiver rows (which are
+        not assigned to any sub-device in the 3-sub-device decode layout).
+        """
+        self.mesh_device.clear_loaded_sub_device_manager()
+
+    def ensure_prefill_manager(self):
+        """Switch to the default (full-device, no sub-device partitioning) manager for prefill ops.
+
+        Fix 16.5: the prior implementation created a constrained sub-device using
+        all_core_range_set (rows 0-7 on MUX-clamped Blackhole), which is narrower than
+        the full hardware grid (9 rows on 2×P150a).  Ops such as rotary_embedding_llama /
+        rotary_embedding_hf use device->compute_with_storage_grid_size() to pick their
+        kernel grid, which returns the full 9-row hardware grid.  The intersection check
+        at program.cpp:1811 then fires: "Kernel group cores do not match sub device cores".
+
+        Replacing the constrained sub-device with the DEFAULT manager
+        (clear_loaded_sub_device_manager) disables intersection validation entirely, so
+        ops may target any hardware cores, exactly as they did before the prefetcher was
+        introduced.  Decode remains unaffected because load_decode_manager() is called
+        after each prefill trace replay.
+        """
+        self.load_default_manager()
+        logger.info("[Prefetcher] ensure_prefill_manager: activated default manager (full grid, no intersection check)")
 
     def create_address_tensor(self):
         """

@@ -1047,6 +1047,22 @@ void FDMeshCommandQueue::enqueue_trace(const MeshTraceId& trace_id, bool blockin
     const std::vector<SubDeviceId>* wait_ids_ptr =
         captured_ids_for_issue.empty() ? nullptr : &captured_ids_for_issue;
 
+    // [LAYER19-DIAG] Print expected values at issue_trace_commands time for remapped traces.
+    if (wait_ids_ptr && !wait_ids_ptr->empty()) {
+        const auto& cap_ids_diag = *wait_ids_ptr;
+        const auto& rem_ids_diag = descriptor->sub_device_ids;
+        for (size_t i = 0; i < cap_ids_diag.size(); ++i) {
+            log_warning(
+                LogMetal,
+                "[LAYER19-DIAG] issue_trace_commands: trace_id={} cap_idx={} rem_idx={} "
+                "expected[cap]_pre_issue={} expected[rem]_pre_issue={}",
+                *trace_id,
+                *cap_ids_diag[i],
+                *rem_ids_diag[i],
+                expected_num_workers_completed_[*cap_ids_diag[i]],
+                expected_num_workers_completed_[*rem_ids_diag[i]]);
+        }
+    }
     for (auto* device : mesh_device_->get_devices()) {
         trace_dispatch::issue_trace_commands(
             mesh_device_, device->sysmem_manager(), dispatch_md, id_, expected_num_workers_completed_, dispatch_core_,

@@ -61,7 +61,22 @@ EmbeddingsFusedProgramFactory::cached_program_t EmbeddingsFusedProgramFactory::c
         num_tiles_per_block = shard_spec.shape[1] / TILE_WIDTH;
         row_major = shard_spec.orientation == ShardOrientation::ROW_MAJOR;
     } else {
-        auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
+        // Use the stall-group (primary compute) sub-device's worker cores instead of
+        // compute_with_storage_grid_size().  On Blackhole the full compute grid includes
+        // MUX-clamped inactive rows (columns 0/7 sender rows) that belong to no sub-device;
+        // splitting work across them causes sub-device core-membership validation to fail.
+        // The stall group contains the sub-device(s) that must complete for a blocking wait
+        // to succeed.  Under the DEFAULT manager this is {0} (all cores).  Under the DECODE
+        // 3-sub-device prefetcher manager this is {2} (worker/compute cores only — the
+        // sender and receiver sub-devices run persistent kernels and are excluded from
+        // the stall group).  Using these cores ensures (1) no MUX-clamped rows are
+        // included, and (2) the embedding program is dispatched to the same sub-device as
+        // the surrounding transformer compute, so GO signals reach every core in the grid.
+        const auto& stall_group = device->get_sub_device_stall_group();
+        SubDeviceId compute_sub_device =
+            stall_group.empty() ? SubDeviceId{0} : stall_group.back();
+        CoreRangeSet compute_cores =
+            device->worker_cores(HalProgrammableCoreType::TENSIX, compute_sub_device);
         std::tie(
             std::ignore,
             all_cores,
@@ -69,7 +84,7 @@ EmbeddingsFusedProgramFactory::cached_program_t EmbeddingsFusedProgramFactory::c
             core_group_2,
             num_blocks_per_core_group_1,
             num_blocks_per_core_group_2) =
-            tt::tt_metal::split_work_to_cores(compute_with_storage_grid_size, num_blocks);
+            tt::tt_metal::split_work_to_cores(compute_cores, num_blocks);
         num_tiles_per_block = weights.padded_shape()[-1] / TILE_WIDTH;
         row_major = false;
     }

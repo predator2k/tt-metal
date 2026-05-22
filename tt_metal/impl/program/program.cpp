@@ -1806,12 +1806,22 @@ const std::vector<SubDeviceId>& detail::ProgramImpl::determine_sub_device_ids(co
                 num_cores += kg->core_ranges.num_cores();
             }
             TT_FATAL(
-                num_intersections == num_cores,
+                this->global_program_ || num_intersections == num_cores,
                 "Kernel group cores do not match sub device cores for programmable core type {}",
                 enchantum::to_string(core_type));
         };
         find_sub_device_ids(HalProgrammableCoreType::TENSIX);
         find_sub_device_ids(HalProgrammableCoreType::ACTIVE_ETH);
+        // For global programs (e.g. embedding ops on Blackhole with MUX-clamped inactive rows
+        // or programs whose kernel groups span cores across multiple sub-devices), collapse the
+        // sub-device set to exactly {0} so that enqueue_mesh_workload satisfies size() == 1.
+        // This is safe because global programs opt-out of the normal sub-device partitioning
+        // contract: they own cores from the default (full-device) manager and should always
+        // execute on sub-device 0.
+        if (this->global_program_) {
+            used_sub_device_ids.clear();
+            used_sub_device_ids.insert(SubDeviceId{0});
+        }
         auto [sub_device_ids, _] = sub_device_ids_map.insert_or_assign(
             sub_device_manager_id, std::vector<SubDeviceId>(used_sub_device_ids.begin(), used_sub_device_ids.end()));
         return sub_device_ids->second;
@@ -2095,6 +2105,9 @@ ProgramId detail::ProgramImpl::get_id() const { return this->id; }
 ProgramId detail::ProgramImpl::get_runtime_id() const { return this->runtime_id; }
 
 ProgramId Program::get_runtime_id() const { return internal_->get_runtime_id(); }
+
+void Program::set_global_program(bool v) { internal_->set_global_program(v); }
+bool Program::is_global_program() const { return internal_->is_global_program(); }
 
 size_t detail::ProgramImpl::num_kernels() const {
     size_t count = 0;

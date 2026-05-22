@@ -161,6 +161,20 @@ class Transformer(LightweightModule):
         logits = self._apply_norm_and_lm_head(logits)
         return logits
 
+    def slice_logits_for_prefill_trace(self, logits, last_token_idx):
+        """V2.5 split: run only the ttnn.slice part of process_logits_after_prefill_trace.
+
+        Called under DEFAULT manager (so ttnn.slice can use the full device grid).
+        The caller switches to DECODE manager before calling _apply_norm_and_lm_head.
+        """
+        get_last_token = (last_token_idx // 32) * 32
+        logits = ttnn.slice(
+            logits,
+            (0, 0, get_last_token, 0),
+            (1, 1, get_last_token + 32, logits.shape[-1]),
+        )
+        return logits
+
     def extract_last_tokens_batched_prefill(
         self, hidden_states, last_token_idx_list, padded_batch, prefill_seq_len, target_batch=None
     ):
@@ -712,10 +726,19 @@ class Transformer(LightweightModule):
         sampling_on_device=False,
         capture_sampling_trace=False,
         page_tables_per_layer=None,
+        use_barrier_semaphore=True,
     ):
         """
         This method will take device tensors and any other args to run forward.
         It returns ttnn device tensors.
+
+        use_barrier_semaphore: When True (default), all_gather_async uses the
+        barrier_semaphore for double-buffered pipelined synchronization between
+        successive trace replays. Set to False during the compile run (pre-trace)
+        because the barrier_semaphore requires at least two pipelined calls to
+        complete — a standalone compile run issues exactly one call and the
+        barrier never reaches completion, causing dispatch_d to hang in
+        finish_nolock after end_trace_capture.
         """
         rot_mats_global = self.rope_setup.get_rot_mats(rot_mat_idxs)
         rot_mats_local = self.rope_local_setup.get_rot_mats(rot_mat_idxs) if hasattr(self, "rope_local_setup") else None
@@ -755,21 +778,67 @@ class Transformer(LightweightModule):
         if self.args.num_devices > 1:
             cluster_axis = 0 if self.args.is_galaxy else None
             num_links = 2 if self.args.is_galaxy else 1
-            tt_logits = ttnn.experimental.all_gather_async(
-                tt_logits,
-                persistent_output_buffer=None,
-                dim=3,
-                multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
-                num_links=num_links,
-                memory_config=tt_logits.memory_config() if self.prefetcher is None else ttnn.DRAM_MEMORY_CONFIG,
-                cluster_axis=cluster_axis,
-                topology=self.args.ccl_topology(),
-                barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
-                chunks_per_sync=10,
-                num_workers_per_link=2,
-                num_buffers_per_channel=2,
-                subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
-            )
+            # Ensure logits are in DRAM before gathering; L1 INTERLEAVED input to
+            # all_gather / all_gather_async can return a zero buffer on Blackhole P150a.
+            if tt_logits.memory_config().buffer_type != ttnn.BufferType.DRAM:
+                tt_logits = ttnn.to_memory_config(tt_logits, ttnn.DRAM_MEMORY_CONFIG)
+            if self.prefetcher is not None:
+                # Prefetcher / trace path: final logit all-gather.
+                #
+                # Tenstorrent-p1 (Layer 19 — gather-inside-trace):
+                # ttnn.all_gather (synchronous) is legal during trace CAPTURE because
+                # the capture window only records device commands; finish() is NOT called
+                # during recording, so the 3-sub-device deadlock (compile-run-only issue)
+                # does NOT apply here.
+                #
+                # use_barrier_semaphore=False path: compile run only.  Skip gather+untilize
+                # to avoid the deadlock (3-sub-device manager calls finish() which stalls
+                # waiting for GlobalCB ACKs → mutual deadlock between sender and workers).
+                # Compile-run logits are discarded; correctness only matters in trace replay.
+                #
+                # use_barrier_semaphore=True path: trace capture.  Include all_gather +
+                # untilize in the trace binary so trace replay includes them without any
+                # extra eager dispatch round-trips.
+                if not use_barrier_semaphore:
+                    return tt_logits, None
+                tt_logits = ttnn.all_gather(
+                    tt_logits,
+                    dim=3,
+                    num_links=num_links,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    topology=self.args.ccl_topology(),
+                )
+            else:
+                # Standalone no-prefetcher path: use synchronous all_gather to avoid
+                # the double-buffered semaphore slot reuse issue that causes alternating
+                # zero output in multi-step decode. See distributed_norm.py for details.
+                # cluster_axis=None for P150a (non-Galaxy); Galaxy falls back to async.
+                if cluster_axis is None:
+                    tt_logits = ttnn.all_gather(
+                        tt_logits,
+                        dim=3,
+                        num_links=num_links,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        topology=self.args.ccl_topology(),
+                    )
+                else:
+                    # Galaxy path: fall back to async with a sync after.
+                    tt_logits = ttnn.experimental.all_gather_async(
+                        tt_logits,
+                        persistent_output_buffer=None,
+                        dim=3,
+                        multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(cluster_axis),
+                        num_links=num_links,
+                        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                        cluster_axis=cluster_axis,
+                        topology=self.args.ccl_topology(),
+                        barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(cluster_axis),
+                        chunks_per_sync=10,
+                        num_workers_per_link=2,
+                        num_buffers_per_channel=2,
+                        subdevice_id=None,
+                    )
+                    ttnn.synchronize_device(self.mesh_device)
 
         tt_logits = ttnn.untilize(
             tt_logits,

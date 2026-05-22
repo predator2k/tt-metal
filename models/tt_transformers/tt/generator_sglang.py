@@ -83,11 +83,12 @@ def initialize_sglang_text_transformer(
             num_devs = submesh.get_num_devices()
             # Tenstorrent-p1: gate uses default ring_size=16 which fails for
             # Qwen3-8B/num_devs=2 (1.67MB > 850KB cap). Iterate the constructor's
-            # legal_receiver_cores [1,2,3,8,10] (ring_sizes [8,16,24,64,80]) and
-            # accept if ANY passes.
+            # legal_receiver_cores [1,2,3,4,6,8,10] (ring_sizes [8,16,24,32,48,64,80]) and
+            # accept if ANY passes. nrc=4/6 (ring_size=32/48) unblock Qwen3-8B whose
+            # QKV tiles=96 require ring_size divisible by 96 (32 and 48 both divide 96).
             if any(
                 is_prefetcher_supported(hf_config._name_or_path, num_devs, ring_size=rs)
-                for rs in (8, 16, 24, 64, 80)
+                for rs in (8, 16, 24, 32, 48, 64, 80)
             ):
                 prefetcher = Prefetcher(submesh, num_tensors=5, num_layers=n_layers)
         prefetchers.append(prefetcher)

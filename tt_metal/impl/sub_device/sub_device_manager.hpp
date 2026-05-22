@@ -63,6 +63,11 @@ public:
     std::shared_ptr<distributed::MeshTraceBuffer>& create_trace(const distributed::MeshTraceId& trace_id);
     void release_trace(const distributed::MeshTraceId& trace_id);
     std::shared_ptr<distributed::MeshTraceBuffer> get_trace(const distributed::MeshTraceId& trace_id);
+    // Register an externally-created trace buffer under this manager so that
+    // replay_mesh_trace can find it when this is the active manager.
+    void register_trace(
+        const distributed::MeshTraceId& trace_id,
+        std::shared_ptr<distributed::MeshTraceBuffer> buffer);
 
     uint8_t num_sub_devices() const;
     bool has_allocations() const;

@@ -72,7 +72,8 @@ void issue_trace_commands(
     const TraceDispatchMetadata& dispatch_md,
     uint8_t cq_id,
     const DispatchArray<uint32_t>& expected_num_workers_completed,
-    CoreCoord dispatch_core);
+    CoreCoord dispatch_core,
+    const std::vector<SubDeviceId>* wait_sub_device_ids = nullptr);
 
 uint32_t compute_trace_cmd_size(uint32_t num_sub_devices);
 

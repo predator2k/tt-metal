@@ -52,11 +52,26 @@ EmbeddingsTilizedIndicesProgramFactory::cached_program_t EmbeddingsTilizedIndice
 
     uint32_t problem_size = volume;
 
-    auto compute_with_storage_grid_size = device->compute_with_storage_grid_size();
-    uint32_t num_cores_x = compute_with_storage_grid_size.x;
-    uint32_t num_cores_y = compute_with_storage_grid_size.y;
+    // Use the stall-group (primary compute) sub-device's worker cores to avoid
+    // MUX-clamped inactive rows (Blackhole col-0/7) and to stay within the correct
+    // sub-device under the DECODE 3-sub-device prefetcher manager.
+    // See embeddings_fused_program_factory.cpp for a detailed explanation.
+    const auto& stall_group = device->get_sub_device_stall_group();
+    SubDeviceId compute_sub_device =
+        stall_group.empty() ? SubDeviceId{0} : stall_group.back();
+    CoreRangeSet compute_cores =
+        device->worker_cores(HalProgrammableCoreType::TENSIX, compute_sub_device);
+    // Determine the bounding-box grid size from the compute sub-device cores.
+    // split_work_to_cores_aligned takes a CoreCoord grid size (x, y dims).
+    CoreCoord sub_device_grid_size{0, 0};
+    for (const auto& cr : compute_cores.ranges()) {
+        sub_device_grid_size.x = std::max(sub_device_grid_size.x, cr.end_coord.x + 1);
+        sub_device_grid_size.y = std::max(sub_device_grid_size.y, cr.end_coord.y + 1);
+    }
+    uint32_t num_cores_x = sub_device_grid_size.x;
+    uint32_t num_cores_y = sub_device_grid_size.y;
 
-    CoreSplitResult work = split_work_to_cores_aligned(compute_with_storage_grid_size, problem_size, FACE_HEIGHT);
+    CoreSplitResult work = split_work_to_cores_aligned(sub_device_grid_size, problem_size, FACE_HEIGHT);
 
     uint32_t num_cores = work.required_cores;
     CoreRangeSet all_cores = work.all_cores;

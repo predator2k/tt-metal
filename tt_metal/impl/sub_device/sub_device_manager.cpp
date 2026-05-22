@@ -142,6 +142,11 @@ std::shared_ptr<MeshTraceBuffer>& SubDeviceManager::create_trace(const MeshTrace
 
 void SubDeviceManager::release_trace(const MeshTraceId& trace_id) { trace_buffer_pool_.erase(trace_id); }
 
+void SubDeviceManager::register_trace(
+    const MeshTraceId& trace_id, std::shared_ptr<distributed::MeshTraceBuffer> buffer) {
+    trace_buffer_pool_.insert_or_assign(trace_id, std::move(buffer));
+}
+
 std::shared_ptr<MeshTraceBuffer> SubDeviceManager::get_trace(const MeshTraceId& trace_id) {
     auto trace = trace_buffer_pool_.find(trace_id);
     if (trace != trace_buffer_pool_.end()) {

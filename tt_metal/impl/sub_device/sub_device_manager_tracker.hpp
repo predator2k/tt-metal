@@ -8,6 +8,7 @@
 #include <memory>
 #include <unordered_map>
 
+#include <tt-metalium/mesh_trace_id.hpp>
 #include <tt-metalium/sub_device.hpp>
 #include <tt-metalium/sub_device_types.hpp>
 #include <tt_stl/span.hpp>
@@ -56,6 +57,13 @@ public:
 
     std::optional<DeviceAddr> lowest_occupied_compute_l1_address(
         tt::stl::Span<const SubDeviceId> sub_device_ids = {}) const;
+
+    // Register a trace that was captured under the default manager onto the
+    // currently-active (non-default) manager so that replay_mesh_trace can
+    // find it without switching managers.  The underlying MeshTraceBuffer is
+    // shared (no copy); releasing via the active manager or the default manager
+    // keeps the ref-count correct.
+    void register_default_trace_on_active_manager(const distributed::MeshTraceId& trace_id);
 
 private:
     void reset_sub_device_state(const std::unique_ptr<SubDeviceManager>& sub_device_manager);

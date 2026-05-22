@@ -590,6 +590,9 @@ class Attention(LightweightModule):
         # QKV matmuls
         # Use HiFi2 for DRAM-sharded matmuls as they are otherwise flop-bound. Loses 1 bit of activation precision.
         ###
+        # When ring_size does not evenly divide qkv_tiles, QKV falls back to the
+        # standard DRAM-sharded config (no prefetcher ring).  In that case do NOT
+        # pass global_cb / sub_device_id; MLP weights still use the prefetcher.
         xqkv_fused_sharded = ttnn.linear(
             x,
             self.wqkv,
@@ -598,7 +601,11 @@ class Attention(LightweightModule):
             compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
             dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-            sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+            # QKV ring-gather matmul: x is sharded on receiver cores, so the
+            # factory's subdevice_cores query must use receiver_sub_device_id
+            # (not worker_sub_device_id) to avoid an empty CoreRangeSet when
+            # intersecting x.shard_spec().grid with subdevice_cores.
+            sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
         )
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
@@ -799,20 +806,31 @@ class Attention(LightweightModule):
                     subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
                 )
             else:
-                all_gather_output = ttnn.experimental.all_gather_async(
-                    attn_output_cat,
-                    persistent_output_buffer=None,
-                    dim=3,
-                    multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
-                    num_links=1,
-                    topology=self.ccl_topology,
-                    memory_config=self.args.get_attn_all_gather_output_mem_config(Mode.DECODE, self.prefetcher),
-                    barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
-                    chunks_per_sync=10,
-                    num_workers_per_link=2,
-                    num_buffers_per_channel=2,
-                    subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
-                )
+                if self.prefetcher is not None:
+                    all_gather_output = ttnn.experimental.all_gather_async(
+                        attn_output_cat,
+                        persistent_output_buffer=None,
+                        dim=3,
+                        multi_device_global_semaphore=self.tt_ccl.get_and_cycle_ag_semaphore_handles(),
+                        num_links=1,
+                        topology=self.ccl_topology,
+                        memory_config=self.args.get_attn_all_gather_output_mem_config(Mode.DECODE, self.prefetcher),
+                        barrier_semaphore=self.tt_ccl.get_and_cycle_barrier_semaphore_handle(),
+                        chunks_per_sync=10,
+                        num_workers_per_link=2,
+                        num_buffers_per_channel=2,
+                        subdevice_id=self.prefetcher.worker_sub_device_id,
+                    )
+                else:
+                    # Standalone no-prefetcher path: use synchronous all_gather to avoid
+                    # CCL semaphore slot reuse issue (see distributed_norm.py).
+                    all_gather_output = ttnn.all_gather(
+                        attn_output_cat,
+                        dim=3,
+                        num_links=1,
+                        memory_config=self.args.get_attn_all_gather_output_mem_config(Mode.DECODE, self.prefetcher),
+                        topology=self.ccl_topology,
+                    )
                 dense_out_sharded = ttnn.linear(
                     all_gather_output,
                     self.wo_sharded_ring if self.prefetcher is not None else self.wo,
@@ -820,7 +838,9 @@ class Attention(LightweightModule):
                     program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
                     compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
                     global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                    sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                    # dense_out ring-gather matmul: all_gather_output is sharded on receiver cores,
+                    # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
+                    sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
                 )
                 ttnn.deallocate(all_gather_output)
             ttnn.deallocate(attn_output_cat)
@@ -866,7 +886,7 @@ class Attention(LightweightModule):
                 dtype=ttnn.bfloat8_b if self.TG else None,
                 compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
                 global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
             )
 
             ttnn.deallocate(attn_output_cat)

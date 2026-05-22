@@ -199,6 +199,12 @@ public:
     void set_runtime_id(ProgramId id);
     ProgramId get_runtime_id() const;
     ProgramId get_id() const;
+
+    // When true, skip the sub-device core-membership validation in determine_sub_device_ids.
+    // Use for programs whose compiled kernels may include cores that belong to no sub-device
+    // (e.g. MUX-clamped inactive rows on Blackhole).
+    void set_global_program(bool v) { global_program_ = v; }
+    bool is_global_program() const { return global_program_; }
     std::size_t num_kernels() const;
     std::span<const std::shared_ptr<CircularBufferImpl>> circular_buffers() const;
     const std::vector<Semaphore>& semaphores() const;
@@ -385,6 +391,7 @@ private:
     ProgramTransferInfo program_transfer_info;
 
     bool finalized_{false};
+    bool global_program_{false};  // opt-out of sub-device core-membership validation
     // Used only when devices do not have virtualization enabled and used to check that programs are only rerun on
     // the same device
     std::optional<uint64_t> cached_device_hash_;

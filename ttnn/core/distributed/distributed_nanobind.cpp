@@ -474,6 +474,21 @@ void py_module(nb::module_& mod) {
                back to all SubDevice IDs.
            )doc")
         .def(
+            "register_default_trace_on_active_manager",
+            [](MeshDevice& self, const tt::tt_metal::distributed::MeshTraceId& trace_id) {
+                self.register_default_trace_on_active_manager(trace_id);
+            },
+            nb::arg("trace_id"),
+            R"doc(
+               Register a trace that was captured under the default sub-device manager onto the
+               currently-active custom sub-device manager so that execute_trace succeeds without
+               switching managers.  The trace buffer is shared (no copy); ref-count is maintained
+               correctly across both managers.  No-op if the active manager IS the default manager.
+
+               Args:
+                   trace_id (MeshTraceId): The trace ID to register on the active manager.
+           )doc")
+        .def(
             "num_program_cache_entries",
             &MeshDevice::num_program_cache_entries,
             "Number of entries in the program cache for this device")
