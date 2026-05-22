@@ -701,6 +701,15 @@ class ModelArgs:
             q_gate_mult = 2 if self.attn_output_gate else 1
             self.q_gate_size = self.head_dim * self.n_heads if self.attn_output_gate else 0
             self.qkv_size = self.head_dim * (q_gate_mult * self.n_heads + 2 * self.n_kv_heads)
+            # WS-A.4: post-concat-heads attention-output width. For most models
+            # this equals self.dim (= hidden_size), but Qwen3.5 has
+            # n_heads * head_dim = 2 * dim (e.g. 0.8B: 8 * 256 = 2048 = 2*1024).
+            # The 3 attention-output sharding helpers below must use this width
+            # instead of self.dim; everything else (residual / MLP / norm /
+            # lm_head) stays in hidden_size space. For Llama/Qwen2/Qwen3-8B/
+            # Mistral/GptOss attn_output_dim == dim, so the helpers are
+            # byte-equivalent.
+            self.attn_output_dim = self.n_heads * self.head_dim
             self.min_kv_prefill_shard_seqlen = (ttnn.TILE_SIZE * 8 * 8) / (self.n_kv_heads // self.cluster_shape[1])
 
             # All Gather Matmul for Dense Out (DO) - computed flag stored as instance attribute
@@ -1842,12 +1851,17 @@ class ModelArgs:
 
     @lru_cache(maxsize=None)
     def get_attn_concat_heads_output_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
-        """Get the memory config for attention concat_heads output before WO matmul."""
+        """Get the memory config for attention concat_heads output before WO matmul.
+
+        Sharding width derives from the attention-output dimension
+        (n_heads * head_dim), not hidden_size. For most models they are equal;
+        Qwen3.5 has n_heads*head_dim = 2*dim. See ModelArgs.attn_output_dim.
+        """
         if mode == Mode.DECODE:
             if prefetcher is not None:
                 wo_out_shard_shape_ring = (
                     32,
-                    self.dim // self.cluster_shape[1] // prefetcher.ring_size,
+                    self.attn_output_dim // self.cluster_shape[1] // prefetcher.ring_size,
                 )  # Use padded N
                 return ttnn.create_sharded_memory_config(
                     shape=wo_out_shard_shape_ring,
@@ -1866,7 +1880,7 @@ class ModelArgs:
                         num_to_core_range_set(self.num_devices),
                         [
                             self.tile_padded_batch_rows,
-                            self.dim // self.num_devices,
+                            self.attn_output_dim // self.num_devices,
                         ],
                         ttnn.ShardOrientation.ROW_MAJOR,
                     ),
@@ -1878,11 +1892,17 @@ class ModelArgs:
 
     @lru_cache(maxsize=None)
     def get_attn_all_gather_output_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
-        """Get the memory config for attention all-gather output."""
+        """Get the memory config for attention all-gather output.
+
+        The gathered tensor (across dim=3) has per-device width equal to the
+        attention-output dimension (n_heads * head_dim), not hidden_size, so
+        the shard width must size off attn_output_dim. Equal to dim for
+        Llama/Qwen2/Qwen3-8B/Mistral/GptOss; doubled for Qwen3.5.
+        """
         if mode == Mode.DECODE:
             if prefetcher is not None:
                 return ttnn.create_sharded_memory_config(
-                    shape=(32, self.dim // prefetcher.ring_size),  # Use padded N
+                    shape=(32, self.attn_output_dim // prefetcher.ring_size),  # Use padded N
                     core_grid=prefetcher.to_core_range_set(
                         prefetcher.receiver_cores(sender_active=True, receiver_active=True)
                     ),
@@ -1900,7 +1920,7 @@ class ModelArgs:
                         num_to_core_range_set(self.num_devices),
                         [
                             self.tile_padded_batch_rows,
-                            self.dim // self.num_devices,
+                            self.attn_output_dim // self.num_devices,
                         ],
                         ttnn.ShardOrientation.ROW_MAJOR,
                     ),
@@ -1912,10 +1932,16 @@ class ModelArgs:
 
     @lru_cache(maxsize=None)
     def get_attn_all_gather_matmul_program_config(self, mode: Mode, prefetcher: Prefetcher = None):
-        """Get the program config for fused all-gather matmul in attention."""
+        """Get the program config for fused all-gather matmul in attention.
+
+        WO matmul is [batch, attn_output_dim] @ [attn_output_dim, dim] -> [batch, dim].
+        K (matmul input width) sizes from attn_output_dim; N (output width)
+        sizes from dim. For all existing models attn_output_dim == dim, so the
+        config matches the previous behaviour; for Qwen3.5 K = 2*dim.
+        """
         if mode == Mode.DECODE:
             if prefetcher is not None:
-                k_wo = self.dim
+                k_wo = self.attn_output_dim
                 n_wo = self.dim // self.cluster_shape[1]
                 return self.matmul_1d_ring_config(
                     1,
@@ -1933,9 +1959,9 @@ class ModelArgs:
                     )
                     return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
                         compute_with_storage_grid_size=do_core_grid_size,
-                        in0_block_w=self.dim
+                        in0_block_w=self.attn_output_dim
                         // ttnn.TILE_SIZE
-                        // (do_core_grid_size[0] * do_core_grid_size[1]),  # [32 x 8k] x [8k x 1k] = [32 x 1k]
+                        // (do_core_grid_size[0] * do_core_grid_size[1]),  # [32 x K] x [K x N] = [32 x N]
                         out_subblock_h=1,
                         out_subblock_w=get_out_subblock_w(
                             do_per_core_N, out_subblock_h=1
@@ -1973,10 +1999,15 @@ class ModelArgs:
 
     @lru_cache(maxsize=None)
     def get_attn_wo_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
-        """Get the program config for WO (dense output) matmul in attention."""
+        """Get the program config for WO (dense output) matmul in attention.
+
+        WO matmul has K = attn_output_dim (post-concat width) and N = dim
+        (hidden_size). Byte-equivalent for models where attn_output_dim==dim
+        (Llama/Qwen2/Qwen3-8B/Mistral/GptOss); Qwen3.5 needs the wider K.
+        """
         if mode == Mode.DECODE:
             if prefetcher is not None:
-                k_wo = self.dim
+                k_wo = self.attn_output_dim
                 n_wo = self.dim // self.cluster_shape[1]
                 return self.matmul_1d_ring_config(
                     1,
