@@ -3058,16 +3058,27 @@ class ModelArgs:
         return self.model_config
 
     def get_hf_model_cls(self):
+        # transformers ≥5.x dropped ``AutoModelForVision2Seq`` (folded into
+        # ``AutoModelForImageTextToText``); 4.x still ships both. Import each
+        # symbol independently so we keep multimodal coverage on whichever
+        # version is installed.
+        from transformers import AutoModelForCausalLM
+
         try:
-            from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoModelForVision2Seq
+            from transformers import AutoModelForVision2Seq
         except ImportError:
-            from transformers import AutoModelForCausalLM
-            AutoModelForImageTextToText = AutoModelForVision2Seq = None
+            AutoModelForVision2Seq = None
+        try:
+            from transformers import AutoModelForImageTextToText
+        except ImportError:
+            AutoModelForImageTextToText = None
 
         if not self.is_multimodal:
             return AutoModelForCausalLM
 
         for model_cls in (AutoModelForVision2Seq, AutoModelForImageTextToText):
+            if model_cls is None:
+                continue
             if type(self.hf_config) in model_cls._model_mapping:
                 return model_cls
 

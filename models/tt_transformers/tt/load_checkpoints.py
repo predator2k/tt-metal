@@ -120,8 +120,17 @@ def standardize_hf_keys(state_dict):
     key_hf = "model.embed_tokens.weight"
 
     if not key_meta in state_dict and key_hf in state_dict:
+        # Tied-word-embeddings case: the safetensors only ship
+        # ``model.embed_tokens.weight`` (no separate ``lm_head.weight``).
+        # COPY into ``lm_head`` instead of MOVING — downstream the embedding
+        # layer still needs ``model.embed_tokens.weight`` (it gets renamed to
+        # ``tok_embeddings.weight`` by ``map_hf_to_meta_keys`` and read at
+        # ``embedding.py:22``). The pre-fix MOVE caused
+        # ``KeyError: 'tok_embeddings.weight'`` for Qwen3.5-0.8B and any other
+        # tied-embedding HF checkpoint.
+        # The non-tied case (e.g. Qwen3-8B) ships both keys, so this branch
+        # never enters and behavior is preserved.
         state_dict[key_meta] = state_dict[key_hf]
-        del state_dict[key_hf]
 
     return state_dict
 
