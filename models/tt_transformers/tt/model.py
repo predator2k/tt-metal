@@ -164,11 +164,19 @@ class Transformer(LightweightModule):
             TG=args.is_galaxy,
         )
 
+        # WS-A.15 (2026-05-22): when ``args.lm_head_dtype`` is set (Qwen3.5
+        # with SGLANG_TT_QWEN35_FULL_BF16=1) lift the LM head WEIGHT storage
+        # to that dtype as well — by default LMHead receives ``dtype`` from
+        # the top-level Transformer ``dtype`` arg (BFP8), and ``lm_head_dtype``
+        # only controls the matmul OUTPUT precision. For non-Qwen3.5 models
+        # the attribute is absent so the original BFP8 path is preserved
+        # byte-equivalent.
+        lm_head_weight_dtype = getattr(args, "lm_head_dtype", dtype)
         self.lm_head = LMHead(
             args=args,
             mesh_device=mesh_device,
             tt_ccl=self.tt_ccl,
-            dtype=dtype,
+            dtype=lm_head_weight_dtype,
             state_dict=state_dict,
             state_dict_prefix=state_dict_prefix,
             weight_cache_path=weight_cache_path,

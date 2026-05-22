@@ -222,9 +222,50 @@ class ModelOptimizations:
             # so a future operator can opt-in via env without rebuilding.
             # Set `SGLANG_TT_QWEN35_WO_PRECISION=bf16` (full HIFI4) or
             # `wo_only` (Wo lift only) to opt-in; default = bfp8 (no-op).
+            #
+            # WS-A.15 (2026-05-22) FULL BF16 lift, env-gated, takes priority
+            # over `SGLANG_TT_QWEN35_WO_PRECISION` when both are set.
+            # Hypothesis: a single consistent BF16 lift across ALL Qwen3.5
+            # weights (FF1/FF3, FF2, WQKV, WO, KV cache, LM head) plus
+            # HIFI4 everywhere finally compounds into a meaningful PCC gain.
+            # Memory ~2× (rough 1.6 GB → 3.2 GB for Qwen3.5-0.8B) — fits
+            # P150a easily. LM head dtype is plumbed via
+            # ``args.lm_head_dtype`` set in ``_set_model_specific_params``.
+            # See WS-A.15 findings doc for the measured PCC outcome and
+            # whether this preset stays opt-in or becomes the new default.
             import os as _os
+            _qwen35_full_bf16 = _os.environ.get(
+                "SGLANG_TT_QWEN35_FULL_BF16", "0"
+            ).lower() in ("1", "true", "yes")
             _qwen35_wo = _os.environ.get("SGLANG_TT_QWEN35_WO_PRECISION", "bfp8").lower()
-            if _qwen35_wo == "bf16":
+            if _qwen35_full_bf16:
+                logger.info(
+                    f"Model {model_name}: WS-A.15 FULL BF16 preset "
+                    f"(FF1/FF3 + FF2 + WQKV + WO + KV + LM head all BF16, "
+                    f"all compute kernels HIFI4)"
+                )
+                inst = cls(
+                    {
+                        "TensorPrecision": {
+                            TensorGroup.FF1_FF3: PrecisionSetting.BF16,
+                            TensorGroup.FF2: PrecisionSetting.BF16,
+                            TensorGroup.WQKV: PrecisionSetting.BF16,
+                            TensorGroup.WO: PrecisionSetting.BF16,
+                            TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                        },
+                        "OpFidelity": {
+                            OpGroup.LI_FF1_FF3: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_FF2: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                            OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                        },
+                    }
+                )
+            elif _qwen35_wo == "bf16":
                 logger.info(
                     f"Model {model_name}: WS-A.13 BF16 attention preset (WO + WQKV + KV)"
                 )
@@ -2844,6 +2885,20 @@ class ModelArgs:
                 except ValueError:
                     self.kv_head_replicate_factor = 2
                 self._apply_kv_head_replicate()
+            # WS-A.15 (2026-05-22): when SGLANG_TT_QWEN35_FULL_BF16=1, lift
+            # the LM head weights to BF16. The LM head dtype is not exposed
+            # through the TensorGroup precision matrix; it falls back to
+            # ``ttnn.bfloat8_b`` in ``LMHead.__init__`` / ``LMHead.forward``
+            # when ``args.lm_head_dtype`` is absent. This is the only
+            # remaining BFP8 surface on Qwen3.5 once the full-BF16
+            # ``ModelOptimizations`` preset lifts FF/WQKV/WO/KV. Default
+            # (env var unset) leaves ``lm_head_dtype`` unset so the
+            # ``hasattr`` fallback continues to pick BFP8 — byte-equivalent
+            # to the pre-WS-A.15 path.
+            if os.getenv("SGLANG_TT_QWEN35_FULL_BF16", "0").lower() in (
+                "1", "true", "yes"
+            ):
+                self.lm_head_dtype = ttnn.bfloat16
         return
 
     def _set_params_from_dict(self, config):
