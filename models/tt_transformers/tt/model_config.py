@@ -689,7 +689,18 @@ class ModelArgs:
 
             assert self.n_kv_heads % self.cluster_shape[1] == 0, "n_kv_heads must be divisible by num_devices"
             self.n_local_heads = self.n_heads // self.cluster_shape[1]
-            self.qkv_size = self.head_dim * (2 * self.n_kv_heads + self.n_heads)
+            # WS-A.3: Qwen3.5 sets attn_output_gate=True, which doubles the Q
+            # projection: q_proj.weight is [2 * n_heads * head_dim, hidden_size]
+            # (per-head [q | gate] interleaved). All wqkv sizing — DRAM-sharded
+            # mem config, program configs, prefetcher tile math — must account
+            # for the extra gate slot, otherwise create_dram_sharded_mem_config
+            # under-provisions the wqkv tensor and TT_FATAL with shard-vs-cores.
+            # Default False keeps pre-existing models (Llama, Qwen2/3, Mistral,
+            # GptOss) byte-equivalent.
+            self.attn_output_gate = bool(getattr(self, "_text_config", {}).get("attn_output_gate", False))
+            q_gate_mult = 2 if self.attn_output_gate else 1
+            self.q_gate_size = self.head_dim * self.n_heads if self.attn_output_gate else 0
+            self.qkv_size = self.head_dim * (q_gate_mult * self.n_heads + 2 * self.n_kv_heads)
             self.min_kv_prefill_shard_seqlen = (ttnn.TILE_SIZE * 8 * 8) / (self.n_kv_heads // self.cluster_shape[1])
 
             # All Gather Matmul for Dense Out (DO) - computed flag stored as instance attribute

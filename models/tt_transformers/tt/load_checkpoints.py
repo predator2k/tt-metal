@@ -168,7 +168,7 @@ def standardize_hf_keys_multimodal(state_dict):
 
 def convert_hf_to_meta(state_dict, head_dim, n_heads=None, n_kv_heads=None):
     state_dict = split_hf_keys(state_dict, n_heads, n_kv_heads)
-    state_dict = convert_hf_qkv_to_meta_format(state_dict, head_dim)
+    state_dict = convert_hf_qkv_to_meta_format(state_dict, head_dim, n_heads=n_heads)
     state_dict = map_hf_to_meta_keys(state_dict)
     return state_dict
 
@@ -423,21 +423,64 @@ def split_hf_keys(loaded_weights, n_heads=None, n_kv_heads=None):
     return converted_weights
 
 
-def convert_hf_qkv_to_meta_format(loaded_weights, head_dim):
-    """Convert HuggingFace QKV weights to Meta format for RoPE compatibility."""
+def convert_hf_qkv_to_meta_format(loaded_weights, head_dim, n_heads=None):
+    """Convert HuggingFace QKV weights to Meta format for RoPE compatibility.
+
+    WS-A.3 gate handling:
+      Qwen3.5 (attn_output_gate=True) ships q_proj with shape
+      [2 * n_heads * head_dim, hidden] in per-head interleaved layout
+      [q_h0 | gate_h0 | q_h1 | gate_h1 | ...]. The gate stream does NOT
+      go through RoPE, so reverse_permute must only touch the q-half of
+      each head, leaving the gate-half untouched. We detect the gated
+      case from shape (when ``n_heads`` is provided): if
+      ``tensor.shape[0] == 2 * n_heads * head_dim`` then it's gated.
+      We then split per-head, apply reverse_permute to the q-half only,
+      and re-interleave [q_h, gate_h] per head. Downstream attention
+      code treats the result as a single 2x-wide q_proj.
+    """
     converted_weights = {}
     for key, tensor in loaded_weights.items():
         if "vision_tower" in key:
             # Skip conversion for vision tower weights (Mistral vision support)
             converted_weights[key] = tensor
-        elif "q_proj.weight" in key or "k_proj.weight" in key:
+        elif "q_proj.weight" in key:
+            # For weights: n_heads_inferred = tensor.shape[0] // head_dim
+            inferred = tensor.shape[0] // head_dim
+            if n_heads is not None and tensor.shape[0] == 2 * n_heads * head_dim:
+                # Gated case: per-head [q | gate] interleaved. Split, permute
+                # q-only, leave gate alone, re-interleave per head.
+                hidden = tensor.shape[1]
+                t = tensor.view(n_heads, 2, head_dim, hidden)  # [n_heads, 2, head_dim, hidden]
+                q_only = t[:, 0, :, :].reshape(n_heads * head_dim, hidden)
+                gate_only = t[:, 1, :, :].reshape(n_heads * head_dim, hidden)
+                q_only = reverse_permute(q_only, n_heads, q_only.shape[0], q_only.shape[1])
+                # Re-interleave per head: [n_heads, head_dim, hidden] + [n_heads, head_dim, hidden]
+                q_only = q_only.view(n_heads, head_dim, hidden)
+                gate_only = gate_only.view(n_heads, head_dim, hidden)
+                stacked = torch.stack([q_only, gate_only], dim=1)  # [n_heads, 2, head_dim, hidden]
+                converted_weights[key] = stacked.reshape(2 * n_heads * head_dim, hidden)
+            else:
+                converted_weights[key] = reverse_permute(tensor, inferred, tensor.shape[0], tensor.shape[1])
+        elif "k_proj.weight" in key:
             # For weights: n_heads = tensor.shape[0] // head_dim
-            n_heads = tensor.shape[0] // head_dim
-            converted_weights[key] = reverse_permute(tensor, n_heads, tensor.shape[0], tensor.shape[1])
-        elif "q_proj.bias" in key or "k_proj.bias" in key:
-            # For biases: n_heads = tensor.shape[0] // head_dim
-            n_heads = tensor.shape[0] // head_dim
-            converted_weights[key] = reverse_permute(tensor, n_heads, tensor.shape[0], 1).squeeze(-1)
+            inferred = tensor.shape[0] // head_dim
+            converted_weights[key] = reverse_permute(tensor, inferred, tensor.shape[0], tensor.shape[1])
+        elif "q_proj.bias" in key:
+            # Bias mirrors weight gating: gated → split, permute q-half, re-interleave.
+            if n_heads is not None and tensor.shape[0] == 2 * n_heads * head_dim:
+                t = tensor.view(n_heads, 2, head_dim)
+                q_only = t[:, 0, :].reshape(n_heads * head_dim)
+                gate_only = t[:, 1, :].reshape(n_heads * head_dim)
+                q_only = reverse_permute(q_only, n_heads, q_only.shape[0], 1).squeeze(-1)
+                q_only = q_only.view(n_heads, head_dim)
+                gate_only = gate_only.view(n_heads, head_dim)
+                converted_weights[key] = torch.stack([q_only, gate_only], dim=1).reshape(2 * n_heads * head_dim)
+            else:
+                inferred = tensor.shape[0] // head_dim
+                converted_weights[key] = reverse_permute(tensor, inferred, tensor.shape[0], 1).squeeze(-1)
+        elif "k_proj.bias" in key:
+            inferred = tensor.shape[0] // head_dim
+            converted_weights[key] = reverse_permute(tensor, inferred, tensor.shape[0], 1).squeeze(-1)
         elif "q_norm.weight" in key or "k_norm.weight" in key:
             converted_weights[key] = reverse_permute_1d(tensor)
         else:

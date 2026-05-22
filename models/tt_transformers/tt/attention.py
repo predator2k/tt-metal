@@ -236,7 +236,21 @@ class Attention(LightweightModule):
         assert configuration.qkv_size % self.num_devices_per_group == 0
         assert configuration.dim % self.num_devices_per_group == 0
 
-        # wqkv: 4096 x 3072 (2 devices): width-sharded on 12 banks, 3072 over 12 banks.
+        # WS-A.3: when attn_output_gate=True (e.g. Qwen3.5), the loaded q_proj
+        # weight has shape [2 * n_heads * head_dim, hidden] in per-head
+        # interleaved layout [q_h0 | gate_h0 | q_h1 | gate_h1 | ...] (each block
+        # is head_dim rows). Plain torch.chunk(..., num_devices, dim=0) still
+        # works to split heads across devices (each device gets its local
+        # heads' q+gate pairs), but downstream attention math wants q and gate
+        # to be CONTIGUOUSLY grouped — first all q-heads then all gate-heads —
+        # so a single ttnn.reshape can split them after nlp_create_qkv_heads.
+        # We deinterleave here, ONCE, at weight-load time.
+        self.attn_output_gate = getattr(configuration, "attn_output_gate", False)
+
+        # wqkv DRAM-sharded width per device:
+        #   - non-gated:   (n_heads + 2*n_kv_heads) * head_dim / num_devices
+        #   - gated (Qwen3.5): (2*n_heads + 2*n_kv_heads) * head_dim / num_devices
+        # (encoded as configuration.qkv_size already includes the gate factor).
         wqkv_mem_config = configuration.create_dram_sharded_mem_config(
             configuration.dim, configuration.qkv_size // configuration.num_devices
         )
@@ -247,6 +261,22 @@ class Attention(LightweightModule):
             wq_selected = torch.chunk(state_dict[f"{wq_str}.weight"], self.num_devices_per_group, dim=0)[i]
             wk_selected = torch.chunk(state_dict[f"{wk_str}.weight"], self.num_devices_per_group, dim=0)[i]
             wv_selected = torch.chunk(state_dict[f"{wv_str}.weight"], self.num_devices_per_group, dim=0)[i]
+
+            # WS-A.3: deinterleave [q_h | gate_h] interleaved -> [all_q | all_gate]
+            # PER DEVICE, so the final wqkv columns lay out as
+            # [q_0,...,q_local_N-1, g_0,...,g_local_N-1, k_0,...,v_local_K-1].
+            # After the QKV matmul + nlp_create_qkv_heads(num_heads=2*N_local),
+            # the resulting Q tensor's leading "heads" are q-heads followed by
+            # gate-heads, so a single reshape splits them.
+            if self.attn_output_gate:
+                # wq_selected shape: [n_local_heads * 2 * head_dim, hidden]
+                # per-head layout [q_h0, g_h0, q_h1, g_h1, ...]
+                hidden = wq_selected.shape[-1]
+                wq_selected = wq_selected.view(self.n_local_heads, 2, self.head_dim, hidden)
+                # split q and gate, concat along head-row dim with all-q first
+                wq_q = wq_selected[:, 0, :, :].reshape(self.n_local_heads * self.head_dim, hidden)
+                wq_g = wq_selected[:, 1, :, :].reshape(self.n_local_heads * self.head_dim, hidden)
+                wq_selected = torch.cat([wq_q, wq_g], dim=0)
 
             # Transpose the selected chunks
             wq = torch.transpose(wq_selected, -2, -1)
@@ -663,16 +693,53 @@ class Attention(LightweightModule):
         ###
         # Reshape and rotary embeddings
         ###
+        # WS-A.3: when attn_output_gate, wqkv has been built per-device as
+        # [q (n_local_heads*head_dim) | gate (n_local_heads*head_dim) | k | v].
+        # Tell nlp_create_qkv_heads to treat the Q section as 2*n_local_heads
+        # "heads" of head_dim each; the kernel returns Q with shape
+        # [1, batch, 2*n_local_heads, head_dim] where the first n_local_heads
+        # are the real q-heads and the next n_local_heads are gate-heads.
+        create_num_heads = self.n_local_heads * 2 if self.attn_output_gate else self.n_local_heads
         (
             q_heads_pre_rot_1BQD,
             k_heads_pre_rot_1BKD,
             v_heads_1BKD,
         ) = ttnn.experimental.nlp_create_qkv_heads_decode(
             xqkv_fused,
-            num_heads=self.n_local_heads,
+            num_heads=create_num_heads,
             num_kv_heads=self.n_local_kv_heads,
             memory_config=self.args.get_attn_create_head_output_mem_config(Mode.DECODE, self.prefetcher),
         )
+        # Split Q tensor into [q | gate]. The sharded layout has shards of
+        # [num_q_heads_padded, head_dim]; we move to DRAM_INTERLEAVED to do a
+        # safe reshape+slice, then re-shard back to the original mem config.
+        gate_heads_1BQD = None
+        if self.attn_output_gate:
+            q_mem_cfg = q_heads_pre_rot_1BQD.memory_config()
+            q_il = ttnn.sharded_to_interleaved(q_heads_pre_rot_1BQD, ttnn.DRAM_MEMORY_CONFIG)
+            ttnn.deallocate(q_heads_pre_rot_1BQD)
+            # shape: [1, batch, 2*n_local_heads, head_dim]; first n_local_heads
+            # are q, next n_local_heads are gate.
+            full_batch = q_il.shape[1]
+            q_only = ttnn.slice(
+                q_il,
+                [0, 0, 0, 0],
+                [1, full_batch, self.n_local_heads, self.head_dim],
+            )
+            gate_only = ttnn.slice(
+                q_il,
+                [0, 0, self.n_local_heads, 0],
+                [1, full_batch, 2 * self.n_local_heads, self.head_dim],
+            )
+            ttnn.deallocate(q_il)
+            # Re-shard q_only back to the original layout (matches what the
+            # downstream RoPE / SDPA expect).
+            q_heads_pre_rot_1BQD = ttnn.to_memory_config(q_only, q_mem_cfg)
+            ttnn.deallocate(q_only)
+            # Keep gate in DRAM_INTERLEAVED; we use it post-SDPA, after
+            # nlp_concat_heads_decode, where the tensor is in DRAM-interleaved
+            # form anyway.
+            gate_heads_1BQD = gate_only
         norm_config = self.args.get_norm_config("attn", Mode.DECODE, None)
         q_heads_pre_rot_1BQD = self.q_norm(q_heads_pre_rot_1BQD, mode=Mode.DECODE, norm_config=norm_config)
         k_heads_pre_rot_1BKD = self.k_norm(k_heads_pre_rot_1BKD, mode=Mode.DECODE, norm_config=norm_config)
@@ -778,6 +845,22 @@ class Attention(LightweightModule):
         )
         ttnn.deallocate(attn_output_11BH)
         ttnn.deallocate(attn_output_1G4D)
+
+        # WS-A.3: apply attn_output_gate = sigmoid(gate) * attn_output before
+        # o_proj. After nlp_concat_heads_decode, attn_output_cat has shape
+        # [1, 1, batch, n_local_heads*head_dim]; gate_heads_1BQD has shape
+        # [1, batch, n_local_heads, head_dim] in DRAM_INTERLEAVED. Reshape gate
+        # and match memory_config of attn_output_cat for elementwise mul.
+        if self.attn_output_gate and gate_heads_1BQD is not None:
+            gate_flat = ttnn.reshape(
+                gate_heads_1BQD,
+                [1, 1, gate_heads_1BQD.shape[1], self.n_local_heads * self.head_dim],
+            )
+            gate_flat = ttnn.sigmoid(gate_flat)
+            gate_flat = ttnn.to_memory_config(gate_flat, attn_output_cat.memory_config())
+            attn_output_cat = ttnn.multiply(attn_output_cat, gate_flat)
+            ttnn.deallocate(gate_flat)
+            ttnn.deallocate(gate_heads_1BQD)
 
         if self.use_fused_all_gather_matmul or self.prefetcher is not None:
             attn_output_cat = ttnn.to_memory_config(
@@ -995,6 +1078,10 @@ class Attention(LightweightModule):
 
         ttnn.deallocate(x_11SH)
 
+        # WS-A.3: when attn_output_gate, the Q slot in wqkv is 2*n_local_heads
+        # heads wide (q + gate). Tell nlp_create_qkv_heads to split it; we'll
+        # peel off the gate heads after.
+        create_num_heads_prefill = self.n_local_heads * 2 if self.attn_output_gate else self.n_local_heads
         # split qkv into heads
         (
             q_heads_1QSD_pre_rot,
@@ -1002,7 +1089,7 @@ class Attention(LightweightModule):
             v_heads_1VSD,
         ) = ttnn.experimental.nlp_create_qkv_heads(
             xqkv_fused,
-            num_heads=self.n_local_heads,
+            num_heads=create_num_heads_prefill,
             num_kv_heads=self.n_local_kv_heads,
             transpose_k_heads=False,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
@@ -1022,6 +1109,27 @@ class Attention(LightweightModule):
         q_heads_1QSD_pre_rot = _strip_to_head_dim(q_heads_1QSD_pre_rot)
         k_heads_1KSD_pre_rot = _strip_to_head_dim(k_heads_1KSD_pre_rot)
         v_heads_1VSD = _strip_to_head_dim(v_heads_1VSD)
+
+        # WS-A.3: peel off gate-heads from the Q tensor. Output shape from
+        # nlp_create_qkv_heads is [1, num_q_heads, seq, head_dim]; with gate
+        # the first n_local_heads heads are q, the next n_local_heads are gate.
+        gate_heads_prefill = None
+        if self.attn_output_gate:
+            full_shape = list(q_heads_1QSD_pre_rot.shape)  # [1, 2*N, S, D]
+            q_only_p = ttnn.slice(
+                q_heads_1QSD_pre_rot,
+                [0, 0, 0, 0],
+                [full_shape[0], self.n_local_heads, full_shape[2], full_shape[3]],
+            )
+            gate_only_p = ttnn.slice(
+                q_heads_1QSD_pre_rot,
+                [0, self.n_local_heads, 0, 0],
+                [full_shape[0], 2 * self.n_local_heads, full_shape[2], full_shape[3]],
+            )
+            ttnn.deallocate(q_heads_1QSD_pre_rot)
+            q_heads_1QSD_pre_rot = q_only_p
+            gate_heads_prefill = gate_only_p
+
         q_heads_1QSD_pre_rot = self.q_norm(q_heads_1QSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
         k_heads_1KSD_pre_rot = self.k_norm(k_heads_1KSD_pre_rot, mode=Mode.PREFILL, norm_config=norm_config)
 
@@ -1175,6 +1283,22 @@ class Attention(LightweightModule):
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         )
         ttnn.deallocate(attn_output_1QSD)
+
+        # WS-A.3: apply attn_output_gate = sigmoid(gate) * attn_output before
+        # o_proj in prefill. gate_heads_prefill has shape [1, n_local_heads, S, D]
+        # and attn_output_11SH is [B, 1, S_per_user, H*D]. Concat gate heads
+        # into a flat per-token vector matching attn_output_11SH layout.
+        if self.attn_output_gate and gate_heads_prefill is not None:
+            gate_concat = ttnn.experimental.nlp_concat_heads(
+                gate_heads_prefill,
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+            ttnn.deallocate(gate_heads_prefill)
+            if batch_size > 1:
+                gate_concat = ttnn.reshape(gate_concat, [1, 1, seq_len, -1])
+            gate_concat = ttnn.sigmoid(gate_concat)
+            attn_output_11SH = ttnn.multiply(attn_output_11SH, gate_concat)
+            ttnn.deallocate(gate_concat)
 
         # For batched prefill, reshape to concatenate batch dimension into sequence
         # This MUST happen AFTER nlp_concat_heads to preserve correct data layout
