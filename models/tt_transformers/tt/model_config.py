@@ -2704,6 +2704,36 @@ class ModelArgs:
 
         return activation_map.get(hidden_activation, ttnn.UnaryOpType.SILU)
 
+    def _apply_kv_head_replicate(self):
+        """WS-A.10: load-time KV-head replicate (Qwen3.5-0.8B SDPA-decode workaround).
+
+        Cloning K/V projection rows so per-device ``n_local_kv_heads`` becomes 2
+        (was 1) bypasses a tt-metal SDPA-decode kernel bug at
+        ``(n_q_heads=4, n_kv_heads=1, head_dim=256)`` which writes heads 0/1
+        identically and zeros heads 2/3. Mathematically equivalent to GQA (the
+        redundant K/V heads carry identical weights -> identical activations ->
+        SDPA reads the same K[g], V[g] regardless of which redundant index a
+        q-head reads).
+
+        Defaults: ``kv_head_replicate_factor = 1`` for every model (no-op,
+        byte-equivalent). Set to >1 only when ``_set_model_specific_params``
+        decides the current model needs the workaround.
+
+        Idempotent: ``self._n_kv_heads_orig`` is captured the first time this
+        runs and re-used on subsequent calls, so multiplying the factor twice
+        on the same instance would be caught and treated as a no-op.
+        """
+        factor = int(getattr(self, "kv_head_replicate_factor", 1))
+        if factor <= 1:
+            return
+        if getattr(self, "_kv_head_replicate_applied", False):
+            return
+        # Preserve the original n_kv_heads value (used by the loader to split
+        # any fused qkv_proj that still uses the un-replicated layout).
+        self._n_kv_heads_orig = int(self.n_kv_heads)
+        self.n_kv_heads = self._n_kv_heads_orig * factor
+        self._kv_head_replicate_applied = True
+
     def _set_model_specific_params(self):
         # WS-A.5: Qwen3.5 uses Gemma-style RMSNorm with ``output * (1.0 + weight)``
         # (see transformers/models/qwen3_5/modeling_qwen3_5.py:Qwen3_5RMSNorm.forward —
@@ -2731,6 +2761,27 @@ class ModelArgs:
             if os.getenv("SGLANG_TT_DISABLE_HF_ROPE_FORCE") != "1":
                 self.use_hf_rope = True
                 self.use_qk_fused = False
+            # WS-A.10: load-time KV-head replicate for Qwen3.5-0.8B per-device
+            # config (n_q_heads=4, n_kv_heads=1, head_dim=256) which hits a
+            # tt-metal SDPA decode kernel bug. Set the factor to 2 (per-device
+            # n_local_kv_heads 1 -> 2). Caller can disable the workaround via
+            # SGLANG_TT_QWEN35_KV_REPLICATE=0 if a future tt-metal release
+            # fixes the underlying kernel. _apply_kv_head_replicate() then
+            # rescales self.n_kv_heads so every downstream consumer (qkv_size,
+            # attention.n_local_kv_heads, KV cache shape, prog configs) picks
+            # up the doubled value naturally.
+            if os.getenv("SGLANG_TT_QWEN35_KV_REPLICATE", "1") != "0":
+                # Default factor 2 (1 -> 2 per-device KV heads). Allow the env
+                # var to set an explicit override; values >2 are useful for
+                # bisecting which SDPA kernel configuration starts working
+                # (e.g. factor=4 forces per-device n_local_kv_heads=4 which
+                # matches n_local_q_heads=4 — MHA-equivalent at the device).
+                _env_factor = os.getenv("SGLANG_TT_QWEN35_KV_REPLICATE")
+                try:
+                    self.kv_head_replicate_factor = int(_env_factor) if _env_factor and _env_factor != "1" else 2
+                except ValueError:
+                    self.kv_head_replicate_factor = 2
+                self._apply_kv_head_replicate()
         return
 
     def _set_params_from_dict(self, config):
@@ -2751,6 +2802,14 @@ class ModelArgs:
         self.dim = text_config.get("dim", text_config.get("hidden_size"))
         self.n_heads = text_config.get("n_heads", text_config.get("num_attention_heads"))
         self.n_kv_heads = text_config.get("n_kv_heads", text_config.get("num_key_value_heads"))
+        # WS-A.10: ``_n_kv_heads_orig`` is the HF-config-defined KV head count
+        # *before* the optional load-time KV-replicate factor is applied (see
+        # ``_apply_kv_head_replicate``). Default identity; the loader uses this
+        # to split a fused qkv_proj that's still laid out at the un-replicated
+        # head count. Stays equal to ``self.n_kv_heads`` for every non-Qwen3.5
+        # model (factor=1), keeping the conversion path byte-equivalent.
+        self._n_kv_heads_orig = self.n_kv_heads
+        self.kv_head_replicate_factor = 1
         self.n_layers = text_config.get("n_layers", text_config.get("num_hidden_layers"))
         # multimodal llama additionally adds cross attention layers
         # they are calculated in HF but not calculated in Meta
@@ -3255,12 +3314,34 @@ class ModelArgs:
             self.fuse_qkv = any(["qkv" in layer_name for layer_name in state_dict.keys()])
             self.fuse_mlp = any(["gate_up" in layer_name for layer_name in state_dict.keys()])
             state_dict = standardize_hf_keys(state_dict)
+            # WS-A.10: pass the ORIGINAL (un-replicated) n_kv_heads to the
+            # split routine so a fused qkv_proj is split with the layout the
+            # HF checkpoint actually has on disk. The conversion helper then
+            # replicates K/V rows kv_head_replicate_factor times so the
+            # post-conversion state_dict matches the doubled self.n_kv_heads
+            # every downstream consumer expects. For models without the
+            # workaround (factor=1) both arguments are equal and the helper
+            # is byte-equivalent to the pre-WS-A.10 behavior.
+            _n_kv_heads_for_split = int(getattr(self, "_n_kv_heads_orig", self.n_kv_heads))
+            _kv_replicate = int(getattr(self, "kv_head_replicate_factor", 1))
             if self.use_hf_rope:
                 # For Attention: skip QKV format conversion
-                state_dict = convert_hf_to_meta_no_qkv_permute(state_dict, self.head_dim, self.n_heads, self.n_kv_heads)
+                state_dict = convert_hf_to_meta_no_qkv_permute(
+                    state_dict,
+                    self.head_dim,
+                    self.n_heads,
+                    _n_kv_heads_for_split,
+                    kv_head_replicate_factor=_kv_replicate,
+                )
             else:
                 # Standard: convert to Meta format
-                state_dict = convert_hf_to_meta(state_dict, self.head_dim, self.n_heads, self.n_kv_heads)
+                state_dict = convert_hf_to_meta(
+                    state_dict,
+                    self.head_dim,
+                    self.n_heads,
+                    _n_kv_heads_for_split,
+                    kv_head_replicate_factor=_kv_replicate,
+                )
 
         keys_dict = list(state_dict.keys())[:]
         remv = [f"layers.{i}." for i in list(range(self.n_layers, self.full_model_n_layers))]

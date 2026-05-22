@@ -28,22 +28,20 @@ def _ws_a7_dump_enabled(layer_num: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# WS-A.8 Bug 2 workaround: KV head replication for Qwen3.5-0.8B.
-# Default-off (no behavior change when SGLANG_TT_QWEN35_KV_REPLICATE is unset).
-# When set, after nlp_create_qkv_heads_decode in forward_decode, K and V are
-# duplicated along their kv-head axis (dim=2 of [1, batch, n_local_kv_heads,
-# head_dim]). This dodges a kernel bug in
-# ttnn.transformer.paged_scaled_dot_product_attention_decode that produces
-# catastrophic ~1e36 output on the per-device config
-# (n_local_heads=4, n_local_kv_heads=1, head_dim=256). Mathematically the
-# SDPA output is unchanged because GQA(Q, [K,K], [V,V], groups=2)
-# == GQA(Q, K, V, groups=4) when K,V are doubled by replication.
-# The cache must also be allocated with 2x n_kv_heads; the harness in
-# _prefetcher_harness.build_paged_kv_cache checks the same env var.
+# WS-A.8 Bug 2 workaround (SUPERSEDED by WS-A.10 load-time KV-head replicate):
+# Runtime ttnn.concat replication of K and V along the kv-head axis after
+# nlp_create_qkv_heads_decode. The motivation was the same SDPA decode kernel
+# bug on (n_local_heads=4, n_local_kv_heads=1, head_dim=256), but the on-device
+# concat + re-shard path hangs in some configs. WS-A.10 moves the replication
+# to weight-load time inside ``load_checkpoints.convert_hf_to_meta*`` so the
+# QKV matmul itself produces n_local_kv_heads=2 outputs without any runtime
+# concat. The runtime path here is left in for debugging only and is gated
+# behind an explicit opt-in (``SGLANG_TT_QWEN35_KV_REPLICATE_RUNTIME=1``).
+# Never enable both the runtime and load-time paths at once.
 # ---------------------------------------------------------------------------
 def _ws_a8_kv_replicate_enabled() -> bool:
     import os as _os
-    return _os.environ.get("SGLANG_TT_QWEN35_KV_REPLICATE", "") == "1"
+    return _os.environ.get("SGLANG_TT_QWEN35_KV_REPLICATE_RUNTIME", "") == "1"
 
 
 def _ws_a7_dump_save(name: str, tensor):

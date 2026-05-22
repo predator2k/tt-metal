@@ -166,20 +166,85 @@ def standardize_hf_keys_multimodal(state_dict):
     return output
 
 
-def convert_hf_to_meta(state_dict, head_dim, n_heads=None, n_kv_heads=None):
+def _replicate_kv_proj_rows(state_dict, head_dim, kv_head_replicate_factor):
+    """WS-A.10: Clone every ``k_proj.weight``/``v_proj.weight`` (and their
+    biases / norms when present) ``factor`` times along the head-row axis so
+    the per-device ``n_local_kv_heads`` ends up at ``original * factor``.
+
+    Operates on the post-``split_hf_keys`` state_dict (the keys are still in
+    HF naming — ``k_proj.weight`` / ``v_proj.weight`` / ``k_proj.bias`` /
+    ``k_norm.weight``). The two callers (``convert_hf_to_meta`` and
+    ``convert_hf_to_meta_no_qkv_permute``) invoke this helper before they hand
+    off to either ``convert_hf_qkv_to_meta_format`` or ``map_hf_to_meta_keys``,
+    so any downstream per-head row permutation (RoPE permute, attn_output_gate
+    deinterleave) sees the replicated layout naturally.
+
+    Factor=1 is a no-op (returns the same state_dict). Math is invariant: each
+    replicated K/V head carries identical weights, so SDPA reads the same
+    K[g],V[g] no matter which redundant copy a q-head indexes — matches the
+    runtime KV-replicate workaround (WS-A.8) but avoids its on-device concat
+    hang.
+    """
+    factor = int(kv_head_replicate_factor)
+    if factor <= 1:
+        return state_dict
+
+    def _repeat_rows(tensor: torch.Tensor, num_heads: int) -> torch.Tensor:
+        # weight: [num_heads * head_dim, hidden] or bias [num_heads * head_dim]
+        if tensor.dim() == 2:
+            rows = tensor.view(num_heads, head_dim, tensor.shape[-1])
+            rows = rows.repeat_interleave(factor, dim=0)
+            return rows.reshape(num_heads * factor * head_dim, tensor.shape[-1]).contiguous()
+        if tensor.dim() == 1:
+            # Either per-head*head_dim bias OR a per-head_dim norm scale. For
+            # the per-head_dim norm scale the length equals head_dim (single
+            # head's worth of scale shared across all KV heads), so replicate
+            # is a no-op shape-wise. For the per-head*head_dim bias we slice
+            # into per-head rows and repeat_interleave.
+            if tensor.shape[0] == head_dim:
+                return tensor
+            rows = tensor.view(num_heads, head_dim)
+            rows = rows.repeat_interleave(factor, dim=0)
+            return rows.reshape(num_heads * factor * head_dim).contiguous()
+        return tensor
+
+    out = {}
+    for key, tensor in state_dict.items():
+        if key.endswith("k_proj.weight") or key.endswith("v_proj.weight"):
+            num_heads = tensor.shape[0] // head_dim
+            out[key] = _repeat_rows(tensor, num_heads)
+        elif key.endswith("k_proj.bias") or key.endswith("v_proj.bias"):
+            num_heads = tensor.shape[0] // head_dim
+            out[key] = _repeat_rows(tensor, num_heads)
+        else:
+            out[key] = tensor
+    return out
+
+
+def convert_hf_to_meta(state_dict, head_dim, n_heads=None, n_kv_heads=None, kv_head_replicate_factor=1):
     state_dict = split_hf_keys(state_dict, n_heads, n_kv_heads)
+    state_dict = _replicate_kv_proj_rows(state_dict, head_dim, kv_head_replicate_factor)
     state_dict = convert_hf_qkv_to_meta_format(state_dict, head_dim, n_heads=n_heads)
     state_dict = map_hf_to_meta_keys(state_dict)
     return state_dict
 
 
-def convert_hf_to_meta_no_qkv_permute(state_dict, head_dim, n_heads=None, n_kv_heads=None):
+def convert_hf_to_meta_no_qkv_permute(state_dict, head_dim, n_heads=None, n_kv_heads=None, kv_head_replicate_factor=1):
     """Convert HF to Meta format but skip QKV weight permutation.
 
     This keeps weights in HF format for use with HF-style RoPE.
     Only key mapping is performed (q_proj -> wq, etc.).
+
+    ``kv_head_replicate_factor`` > 1 clones each k_proj / v_proj head ``factor``
+    times along the head-row axis (load-time KV-head replicate, WS-A.10). The
+    caller (``ModelArgs.load_state_dict``) passes the ORIGINAL HF n_kv_heads
+    via ``n_kv_heads`` so any fused qkv_proj still on disk is split correctly,
+    and passes ``kv_head_replicate_factor`` matching the value baked into
+    ``ModelArgs.n_kv_heads`` (which is the *post*-replicate count). The two
+    sides agree by construction.
     """
     state_dict = split_hf_keys(state_dict, n_heads, n_kv_heads)
+    state_dict = _replicate_kv_proj_rows(state_dict, head_dim, kv_head_replicate_factor)
     # SKIP convert_hf_qkv_to_meta_format - keep weights in HF format
     state_dict = map_hf_to_meta_keys(state_dict)
     return state_dict
