@@ -2695,6 +2695,22 @@ class ModelArgs:
         return activation_map.get(hidden_activation, ttnn.UnaryOpType.SILU)
 
     def _set_model_specific_params(self):
+        # WS-A.5: Qwen3.5 uses Gemma-style RMSNorm with ``output * (1.0 + weight)``
+        # (see transformers/models/qwen3_5/modeling_qwen3_5.py:Qwen3_5RMSNorm.forward —
+        # the "Qwen3_5 is (x * w).to(float16)" comment and the
+        # ``(1.0 + self.weight.float())`` line). Default is False (plain
+        # ``output * weight``), which produces ~5x scale errors at the lm_head
+        # for Qwen3.5 because the trained weights are centered near zero (mean
+        # ~0.08-0.24) instead of near 1. Without this fix, full-model PCC vs
+        # the HF reference is ~0 even though the linear-attention host
+        # fallback math is exact (verified via /tmp/qwen35_deltanet_unit.py
+        # which compared to HF torch_recurrent_gated_delta_rule and got PCC=1.0).
+        #
+        # Behavior preserved for every other model: this branch only fires
+        # when the model name starts with "Qwen3.5"; Llama, Qwen2, Qwen3-8B,
+        # Mistral, GptOss, Phi all keep ``rms_norm_add_unit_offset = False``.
+        if self.base_model_name.startswith("Qwen3.5"):
+            self.rms_norm_add_unit_offset = True
         return
 
     def _set_params_from_dict(self, config):
