@@ -505,6 +505,10 @@ class ModelArgs:
         "Qwen2.5-VL-72B-Instruct": "models/tt_transformers/model_params/Qwen2.5-VL-72B-Instruct",
         "Qwen3-VL-32B-Instruct": "models/tt_transformers/model_params/Qwen3-VL-32B-Instruct",
         "Qwen3-32B": "models/tt_transformers/model_params/Qwen3-32B",
+        # WS-B placeholder for Qwen3.5-0.8B (hybrid GatedDeltaNet + softmax attention).
+        # Real kernels TBD by WS-A; config.json is a verbatim copy of the HF release
+        # so _set_hf_params/AutoConfig has something to ingest without network.
+        "Qwen3.5-0.8B": "models/tt_transformers/model_params/Qwen3.5-0.8B",
         "Qwen2.5-72B-Instruct": "models/tt_transformers/model_params/Qwen2.5-72B-Instruct",
         "Qwen2.5-32B-Instruct": "models/tt_transformers/model_params/Qwen2.5-32B-Instruct",
         "Meta-Llama-3-8B": "models/tt_transformers/model_params/Meta-Llama-3-8B",
@@ -2412,6 +2416,9 @@ class ModelArgs:
                 "Qwen3-32B": {"N150": None, "N300": None, "T3K": 64, "TG": 128, "P150x4": 128},
                 "Qwen3-1.7B": {"N150": 128, "N300": 128, "T3K": 128, "TG": 128, "P150x4": 128, "P300": 128},
                 "Qwen3-8B": {"N150": 4, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128, "P300": 64},
+                # WS-B placeholder. 0.8B is small enough to live single-chip; copy Qwen3-1.7B
+                # chunk sizes for the smoke (will get retuned in Stage 3 once Mamba2 cache fits).
+                "Qwen3.5-0.8B": {"N150": 128, "N300": 128, "T3K": 128, "TG": 128, "P150x4": 128, "P300": 128},
                 "Qwen3-Embedding-8B": {"N150": 4, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128},
                 "Phi-4": {"N150": 4, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128},
                 "Mistral-Small-3.1-24B": {"N150": 8, "N300": 128, "T3K": 128, "TG": 128, "P150x4": 128},
