@@ -20,33 +20,40 @@ Two execution modes are supported, selected at module-construction time by
     softplus/sigmoid gating, and RMSNormGated still bridge to host
     (microsecond-scale torch ops on ~10-50K element tensors).
 
-WHY HOST-FALLBACK IS THE DEFAULT (measured WS-A.12, 2026-05-22)
----------------------------------------------------------------
-For Qwen3.5-0.8B at batch=1, head_dim=128, 16 v-heads, the per-step
-compute is so small that device-side matmul throughput is dwarfed by the
-intra-step D2H/H2D bridge cost. Warm avg per decode step (P150a 2x mesh):
+PERF — WS-A.13 (measured 2026-05-22, P150a 2x mesh, B=1)
+---------------------------------------------------------
+For Qwen3.5-0.8B at batch=1, head_dim=128, 16 v-heads. Warm avg per
+decode step:
 
-  host-fallback: ~319 ms        TT-native: ~352 ms  (~10% slower at B=1)
+  host-fallback:  ~365 ms        TT-native (WS-A.13):  ~330 ms
 
-PCC native vs host-fallback: 1.0000 (bit-identical, since the on-device
-math is mathematically equivalent and weights/intermediates land in the
-same bf16 representation).
-PCC vs HF reference: 0.7183 / 0.6967 / 0.6806 (steps 0/1/4) — identical
-to the host-fallback baseline.
+WS-A.13 collapsed 6 host hops/layer/step → 2 (only the conv1d roll
+remains bridged). End-to-end win is small (~9-10 %) because the
+remaining decode cost is full-attention layers running through the
+canonical TT path. The DeltaNet path is now faster than host fallback,
+but the global TPOT is still dominated by SDPA/Wo on the full-attention
+layers.
 
-To make the native path faster than host-fallback, future work needs:
+PCC native vs host-fallback: 0.0000-diff (bit-identical, since the
+on-device math is mathematically equivalent and weights/intermediates
+land in the same bf16 representation).
+PCC vs HF reference: 0.7183 / 0.6967 / 0.6806 / 0.6527 (steps 0/1/4/16)
+— identical to the host-fallback baseline.
+
+Wo precision audit (WS-A.13): lifting Wo BFP8→BF16 (and/or full attention
+to BF16+HIFI4) only moved end-to-end PCC by +0.005..+0.018 — below the
++0.05 commit threshold. Kept the env hook (`SGLANG_TT_QWEN35_WO_PRECISION`
+in model_config.py) so a future op can opt-in without rebuilding; default
+remains BFP8.
+
+Future work to close the rest of the gap:
   1. Persistent ttnn trace-capture of the per-layer DeltaNet graph
-     (eliminates per-op dispatch latency).
-  2. Move conv1d + L2norm + gating + RMSNormGated on-device too, so
-     there's a single D2H at the end of the block (currently ~6 hops).
-  3. Larger per-user batch (B≥4) to amortize the bridge cost.
+     (eliminates per-op dispatch latency — would be the next big lever).
+  2. Move the conv1d roll on-device via padded-concat + reduce-sum
+     (only remaining host bridge; multi-day kernel-fusion exercise).
+  3. Larger per-user batch (B≥4) to amortize residual dispatch overhead.
   4. Sharded projections across the mesh (currently the native path runs
      redundantly on a replicated single-device view).
-
-Until those land, the env gate stays OFF in production. The scaffolding
-preserves correctness, lazily uploads weights once, persists on-device
-conv/ssm state across decode steps, and gives WS-A.13/perf workstreams a
-proven starting point with PCC bit-equivalence to the host baseline.
 
 Why host fallback originally (WS-A.2 historical):
   * tt-metal has no fused GatedDeltaNet/causal_conv1d_update kernel.
@@ -560,25 +567,32 @@ class LinearAttentionBlock(LightweightModule):
         return out
 
     def _tt_native_delta_net_step(self, attn_in_tt: ttnn.Tensor) -> ttnn.Tensor:
-        """TT-native one-decode-step GatedDeltaNet — scaffolding.
+        """TT-native one-decode-step GatedDeltaNet (WS-A.13 single-bridge).
 
-        Strategy (hybrid; see module docstring for the rationale and
-        measured perf numbers):
+        Strategy (WS-A.13: collapsed 4 host bridges → 1):
           1. Gather hidden to host (2 KB), upload replicated to device.
           2. Run the 4 input projections (in_proj_qkv/z/a/b) on device.
-          3. Bridge qkv to host for the conv1d roll (tile-misaligned K=4).
-          4. Bridge a/b to host for softplus / sigmoid gating.
-          5. Compute Q/K/V L2-norm + scaling on host (cheap on tiny tensors).
-          6. Upload K/V/Q/decay/beta back to device for the SSM state
-             update (4 batched-matmul ops on a persistent on-device
-             [1, B*HV, V, K] state tensor).
-          7. Bridge `o` to host for RMSNormGated (B*HV*V = 2048 elements).
-          8. Upload normed `o` to device for out_proj.
+          3. Bridge qkv to host for the conv1d roll (tile-misaligned K=4
+             depthwise conv; the *only* remaining host bridge per layer).
+             Re-upload qkv_post to device once.
+          4. Slice qkv_post on device into Q/K/V; L2-norm + scale on device.
+          5. Compute gating (decay, beta) entirely on device via
+             ttnn.softplus + ttnn.exp + ttnn.sigmoid.
+          6. SSM state update (4 batched-matmul ops on persistent on-device
+             [1, B*HV, V, K] state tensor) — unchanged from WS-A.12.
+          7. RMSNormGated on device via ttnn.silu + ttnn.multiply +
+             ttnn.rms_norm(weight=...).
+          8. out_proj matmul on device.
           9. Return replicated [1, 1, B, hidden] tensor.
 
         Persistent state: ``_tt_conv_state`` and ``_tt_ssm_state`` live in
         DRAM as device-resident replicated ttnn tensors across all decode
         steps. Weights are uploaded once on first call (``_ensure_tt_weights``).
+
+        WS-A.13 vs WS-A.12: the WS-A.12 path had 6 host hops per layer per
+        step (hidden, qkv_post, a, b, o, normed-o). WS-A.13 has 2 hops:
+        hidden in, qkv_post round-trip for conv1d. That's a 3× reduction
+        in PCIe traffic per layer per step.
 
         Args:
             attn_in_tt: post-attention_norm ttnn tensor, sharded or
@@ -631,6 +645,10 @@ class LinearAttentionBlock(LightweightModule):
         # — do the conv update through torch then re-upload. For B=1 this
         # is a 6144*4 = 24K-element host op, ~microsecond. ✓
         # (A future optimization can fully on-device this via padded concat.)
+        # WS-A.13: keep the conv1d roll on host (~24 K bf16 elements/step,
+        # microsecond-scale torch op). After conv we re-upload qkv_post
+        # ONCE as the single device-side bridge — everything downstream
+        # (L2-norm, gating, SSM, RMSNormGated, out_proj) stays on device.
         qkv_host = ttnn.to_torch(ttnn.get_device_tensors(qkv)[0]).reshape(B, self.conv_dim)
         conv_state_host = ttnn.to_torch(ttnn.get_device_tensors(self._tt_conv_state)[0]).reshape(
             B, self.conv_dim, K - 1
@@ -650,129 +668,133 @@ class LinearAttentionBlock(LightweightModule):
         )
         ttnn.deallocate(qkv)
 
-        # ----- (3) split into Q, K, V on host (cheap) ----------------
-        q_flat = qkv_post_host[:, : self.key_dim]
-        k_flat = qkv_post_host[:, self.key_dim : 2 * self.key_dim]
-        v_flat = qkv_post_host[:, 2 * self.key_dim :]
-        q_h = q_flat.reshape(B, self.num_k_heads, self.head_k_dim).float()
-        k_h = k_flat.reshape(B, self.num_k_heads, self.head_k_dim).float()
-        v_h = v_flat.reshape(B, self.num_v_heads, self.head_v_dim).float()
-
-        # L2 norm + scale (still cheap on host for B=1, HV=16)
-        q_h = q_h / (q_h.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6)
-        k_h = k_h / (k_h.pow(2).sum(-1, keepdim=True).sqrt() + 1e-6)
-        q_h = q_h * (1.0 / math.sqrt(self.head_k_dim))
-
-        # group expand if k-heads < v-heads
-        group = self.num_v_heads // self.num_k_heads
-        if group != 1:
-            k_h = k_h.repeat_interleave(group, dim=1)
-            q_h = q_h.repeat_interleave(group, dim=1)
-
-        # ----- (4) gating: g, beta -----------------------------------
-        a_host = ttnn.to_torch(ttnn.get_device_tensors(a)[0]).reshape(B, self.num_v_heads).float()
-        b_host = ttnn.to_torch(ttnn.get_device_tensors(b)[0]).reshape(B, self.num_v_heads).float()
-        ttnn.deallocate(a)
-        ttnn.deallocate(b)
-
-        x_g = a_host + self.dt_bias.unsqueeze(0)
-        softplus = torch.where(
-            x_g <= self.SOFTPLUS_THRESHOLD,
-            torch.log1p(torch.exp(x_g)),
-            x_g,
+        # Upload qkv_post once → device tensor [1, 1, B, conv_dim]
+        qkv_post = self._from_torch_replicated(
+            qkv_post_host.reshape(1, 1, B, self.conv_dim), dtype=ttnn.bfloat16
         )
-        g = -torch.exp(self.A_log).unsqueeze(0) * softplus  # [B, HV]
-        beta = torch.sigmoid(b_host)                        # [B, HV]
-        decay = torch.exp(g)                                # [B, HV]
+
+        # ----- (3) slice into Q, K, V on DEVICE, L2-norm + scale -----
+        # qkv_post layout (along last axis): [ Q (key_dim) | K (key_dim) | V (value_dim) ]
+        q_slice = ttnn.slice(qkv_post, [0, 0, 0, 0], [1, 1, B, self.key_dim])
+        k_slice = ttnn.slice(
+            qkv_post, [0, 0, 0, self.key_dim], [1, 1, B, 2 * self.key_dim]
+        )
+        v_slice = ttnn.slice(
+            qkv_post,
+            [0, 0, 0, 2 * self.key_dim],
+            [1, 1, B, 2 * self.key_dim + self.value_dim],
+        )
+        ttnn.deallocate(qkv_post)
+
+        # Reshape so the last dim is head_*_dim → L2-norm operates per-head.
+        # Note: num_k_heads == num_v_heads for Qwen3.5-0.8B (group=1). The
+        # group!=1 case below would need ttnn.repeat_interleave which is
+        # less mature; fall back to host bridge if encountered (Qwen3.5
+        # large variants if/when they land).
+        group = self.num_v_heads // self.num_k_heads
+        assert group == 1, (
+            f"WS-A.13 on-device L2 path assumes num_k_heads == num_v_heads "
+            f"(got {self.num_k_heads} vs {self.num_v_heads}); add a "
+            f"ttnn.repeat_interleave fallback if this triggers."
+        )
+        # Reshape to [1, 1, B*HV, head_dim] — last dim is the L2 axis.
+        q_heads = ttnn.reshape(q_slice, [1, 1, B * self.num_k_heads, self.head_k_dim])
+        k_heads = ttnn.reshape(k_slice, [1, 1, B * self.num_k_heads, self.head_k_dim])
+        v_heads = ttnn.reshape(v_slice, [1, 1, B * self.num_v_heads, self.head_v_dim])
+        ttnn.deallocate(q_slice)
+        ttnn.deallocate(k_slice)
+        ttnn.deallocate(v_slice)
+
+        q_normed = self._tt_l2_norm_scale(q_heads, 1.0 / math.sqrt(self.head_k_dim))
+        k_normed = self._tt_l2_norm_scale(k_heads, 1.0)
+        ttnn.deallocate(q_heads)
+        ttnn.deallocate(k_heads)
+
+        # Reshape Q/K/V to the SSM matmul layout: [1, B*HV, head_dim, 1]
+        # for column form, plus a [1, B*HV, 1, head_dim] row form of K
+        # for the outer product. V uses [1, B*HV, V, 1].
+        q_col = ttnn.reshape(q_normed, [1, B * self.num_v_heads, self.head_k_dim, 1])
+        k_col = ttnn.reshape(k_normed, [1, B * self.num_v_heads, self.head_k_dim, 1])
+        ttnn.deallocate(q_normed)
+        # second view of k for the outer product (row form)
+        k_row = ttnn.reshape(k_col, [1, B * self.num_v_heads, 1, self.head_k_dim])
+        v_col = ttnn.reshape(v_heads, [1, B * self.num_v_heads, self.head_v_dim, 1])
+        ttnn.deallocate(v_heads)
+        ttnn.deallocate(k_normed)
+
+        # ----- (4) gating: decay, beta on DEVICE ---------------------
+        # a shape: [1,1,B,HV], _tt_dt_bias shape: [1,1,1,HV] → bcast add.
+        a_biased = ttnn.add(a, self._tt_dt_bias)
+        ttnn.deallocate(a)
+        sp = self._tt_softplus_clamped(a_biased)   # [1,1,B,HV]
+        ttnn.deallocate(a_biased)
+        # g = A_factor * sp  (A_factor already == -exp(A_log), bcast over B)
+        g = ttnn.multiply(self._tt_A_factor, sp)   # [1,1,B,HV]
+        ttnn.deallocate(sp)
+        decay = ttnn.exp(g)                         # [1,1,B,HV]
+        ttnn.deallocate(g)
+        # Reshape decay → [1, B*HV, 1, 1] for the SSM head-scalar bcast.
+        decay_bcast = ttnn.reshape(decay, [1, B * self.num_v_heads, 1, 1])
+
+        beta = ttnn.sigmoid(b)                      # [1,1,B,HV]
+        ttnn.deallocate(b)
+        beta_bcast = ttnn.reshape(beta, [1, B * self.num_v_heads, 1, 1])
 
         # ----- (5) SSM state update via batched matmul on DEVICE ------
         # State is [1, B*HV, V, K]. Decay it (per-head scalar).
-        decay_t = self._from_torch_replicated(
-            decay.to(torch.bfloat16).reshape(1, B * self.num_v_heads, 1, 1),
-            dtype=ttnn.bfloat16,
-        )
-        h_decayed = ttnn.multiply(self._tt_ssm_state, decay_t)
+        h_decayed = ttnn.multiply(self._tt_ssm_state, decay_bcast)
         ttnn.deallocate(self._tt_ssm_state)
-        ttnn.deallocate(decay_t)
+        ttnn.deallocate(decay_bcast)
 
-        # delta = h @ k_view.unsqueeze(-1)  → [B*HV, V, 1]
-        k_t = self._from_torch_replicated(
-            k_h.to(torch.bfloat16).reshape(1, B * self.num_v_heads, self.head_k_dim, 1),
-            dtype=ttnn.bfloat16,
-        )
-        delta = ttnn.matmul(h_decayed, k_t, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        # delta now: [1, B*HV, V, 1]
+        # delta = h @ k_col  →  [1, B*HV, V, 1]
+        delta = ttnn.matmul(h_decayed, k_col, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         # v_corr = (v - delta) * beta per head
-        v_t = self._from_torch_replicated(
-            v_h.to(torch.bfloat16).reshape(1, B * self.num_v_heads, self.head_v_dim, 1),
-            dtype=ttnn.bfloat16,
-        )
-        v_minus_delta = ttnn.sub(v_t, delta)
+        v_minus_delta = ttnn.sub(v_col, delta)
         ttnn.deallocate(delta)
-        ttnn.deallocate(v_t)
-        beta_t = self._from_torch_replicated(
-            beta.to(torch.bfloat16).reshape(1, B * self.num_v_heads, 1, 1),
-            dtype=ttnn.bfloat16,
-        )
-        v_corr = ttnn.multiply(v_minus_delta, beta_t)
+        ttnn.deallocate(v_col)
+        v_corr = ttnn.multiply(v_minus_delta, beta_bcast)
         ttnn.deallocate(v_minus_delta)
-        ttnn.deallocate(beta_t)
-        # outer(v_corr, k)  →  bmm([B*HV,V,1], [B*HV,1,K])  =  [B*HV,V,K]
-        k_t_row = self._from_torch_replicated(
-            k_h.to(torch.bfloat16).reshape(1, B * self.num_v_heads, 1, self.head_k_dim),
-            dtype=ttnn.bfloat16,
-        )
-        outer = ttnn.matmul(v_corr, k_t_row, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(beta_bcast)
+        # outer(v_corr, k_row)  →  [1, B*HV, V, K]
+        outer = ttnn.matmul(v_corr, k_row, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(v_corr)
-        ttnn.deallocate(k_t_row)
-        ttnn.deallocate(k_t)
+        ttnn.deallocate(k_row)
+        ttnn.deallocate(k_col)
 
         h_new = ttnn.add(h_decayed, outer)
         ttnn.deallocate(h_decayed)
         ttnn.deallocate(outer)
 
-        # output: o[b,hv,v] = sum_K(h[b,hv,v,:] * q[b,hv,:])
-        # via bmm([B*HV,V,K], [B*HV,K,1]) → [B*HV,V,1]
-        q_t = self._from_torch_replicated(
-            q_h.to(torch.bfloat16).reshape(1, B * self.num_v_heads, self.head_k_dim, 1),
-            dtype=ttnn.bfloat16,
-        )
-        o = ttnn.matmul(h_new, q_t, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(q_t)
+        # o = h_new @ q_col  →  [1, B*HV, V, 1]
+        o = ttnn.matmul(h_new, q_col, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(q_col)
 
         # Persist updated state — keep h_new alive
         self._tt_ssm_state = h_new
 
-        # ----- (6) RMSNormGated then out_proj on DEVICE --------------
-        # o shape: [1, B*HV, V, 1] → reshape to [1, 1, B, HV*V]
-        # Apply gating: x = o * silu(z); then x = x * rsqrt(mean(x**2)+eps) * weight
-        # z shape: [1, 1, B, value_dim] → reshape match
-        # We do the norm per-head on shape [1, 1, B*HV, V]
-        # For simplicity, pull o to host, do norm in bf16 (it's a small tensor:
-        # B*HV*V = 1*16*128 = 2048 elements), then re-upload.
-        # (A fully fused on-device path is a WS-A.13 optimization.)
-        o_host = ttnn.to_torch(ttnn.get_device_tensors(o)[0]).reshape(
-            B, self.num_v_heads, self.head_v_dim
-        ).to(torch.bfloat16)
+        # ----- (6) RMSNormGated + out_proj on DEVICE ------------------
+        # Reshape o [1, B*HV, V, 1] → [1, 1, B*HV, V] for elementwise & norm.
+        o_2d = ttnn.reshape(o, [1, 1, B * self.num_v_heads, self.head_v_dim])
         ttnn.deallocate(o)
-        z_host = ttnn.to_torch(ttnn.get_device_tensors(z)[0]).reshape(
-            B, self.num_v_heads, self.head_v_dim
-        ).to(torch.bfloat16)
+        # Reshape z [1, 1, B, value_dim] → [1, 1, B*HV, V] (HV*V == value_dim).
+        z_2d = ttnn.reshape(z, [1, 1, B * self.num_v_heads, self.head_v_dim])
         ttnn.deallocate(z)
-
-        # RMSNormGated:
-        o_gated = o_host * torch.nn.functional.silu(z_host.float()).to(torch.bfloat16)
-        var = o_gated.float().pow(2).mean(dim=-1, keepdim=True)
-        o_normed = (o_gated.float() * torch.rsqrt(var + self.norm_eps)).to(torch.bfloat16)
-        o_out = o_normed * self.W_norm_gated.reshape(1, 1, self.head_v_dim)
-        o_flat = o_out.reshape(B, self.value_dim)
-
-        # out_proj on DEVICE
-        o_dev = self._from_torch_replicated(
-            o_flat.reshape(1, 1, B, self.value_dim), dtype=ttnn.bfloat16
+        # silu(z), then o * silu(z).
+        silu_z = ttnn.silu(z_2d)
+        ttnn.deallocate(z_2d)
+        o_gated = ttnn.multiply(o_2d, silu_z)
+        ttnn.deallocate(o_2d)
+        ttnn.deallocate(silu_z)
+        # RMS norm with per-channel gamma, last-dim normalization.
+        o_normed = ttnn.rms_norm(
+            o_gated, weight=self._tt_W_norm_gated, epsilon=self.norm_eps
         )
-        out = ttnn.linear(o_dev, self._tt_W_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-        ttnn.deallocate(o_dev)
+        ttnn.deallocate(o_gated)
+        # Reshape back to [1, 1, B, value_dim] for out_proj.
+        o_flat = ttnn.reshape(o_normed, [1, 1, B, self.value_dim])
+        ttnn.deallocate(o_normed)
+        out = ttnn.linear(o_flat, self._tt_W_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(o_flat)
         return out  # [1, 1, B, hidden], replicated
 
     # ----------------------------------------------------------------

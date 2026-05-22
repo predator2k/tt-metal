@@ -207,6 +207,68 @@ class ModelOptimizations:
                     },
                 }
             )
+        elif base_model_name in ["Qwen3.5-0.8B"]:
+            # WS-A.13 Wo precision audit (2026-05-22, REVERT — kept as docs).
+            # Hypothesis: lifting Wo BFP8 → BF16 + HIFI4 (mirroring the
+            # Qwen2.5-7B preset) would close the per-op `12_post_o_proj`
+            # gap (PCC 0.8472 at the o_proj output) and lift end-to-end
+            # PCC from 0.72 → 0.85+.
+            # Measured (native + KV_REPLICATE=1, 3-step smoke vs HF ref):
+            #   baseline (BFP8 Wo)        : 0.7183 / 0.6967 / 0.6806
+            #   BF16 Wo only              : 0.7363 / 0.6972 / 0.6866
+            #   BF16 Wo+WQKV+KV + HIFI4   : 0.7312 / 0.7007 / 0.6852
+            # Gain is +0.005..+0.018 — below the +0.05 commit threshold.
+            # Reverting to default (BFP8) per the rule; keeping this branch
+            # so a future operator can opt-in via env without rebuilding.
+            # Set `SGLANG_TT_QWEN35_WO_PRECISION=bf16` (full HIFI4) or
+            # `wo_only` (Wo lift only) to opt-in; default = bfp8 (no-op).
+            import os as _os
+            _qwen35_wo = _os.environ.get("SGLANG_TT_QWEN35_WO_PRECISION", "bfp8").lower()
+            if _qwen35_wo == "bf16":
+                logger.info(
+                    f"Model {model_name}: WS-A.13 BF16 attention preset (WO + WQKV + KV)"
+                )
+                inst = cls(
+                    {
+                        "TensorPrecision": {
+                            TensorGroup.WQKV: PrecisionSetting.BF16,
+                            TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                            TensorGroup.WO: PrecisionSetting.BF16,
+                        },
+                        "OpFidelity": {
+                            OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                            OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                        },
+                    }
+                )
+            elif _qwen35_wo == "wo_only":
+                logger.info(
+                    f"Model {model_name}: WS-A.13 BF16 Wo only (WQKV/KV stay BFP8)"
+                )
+                inst = cls(
+                    {
+                        "TensorPrecision": {
+                            TensorGroup.WO: PrecisionSetting.BF16,
+                        },
+                        "OpFidelity": {
+                            OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                            OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                        },
+                    }
+                )
+            else:
+                # Default BFP8 path — same settings the generic else branch
+                # below produces for unknown models.
+                inst = cls(
+                    {
+                        "TensorPrecision": {TensorGroup.FF1_FF3: PrecisionSetting.BFP4},
+                        "OpFidelity": {OpGroup.LI_FF1_FF3: MathFidelitySetting.LOFI},
+                    }
+                )
         elif base_model_name in ["Qwen3-8B"]:
             import os as _os
             _qwen3_mode = _os.environ.get("SGLANG_TT_QWEN3_PRECISION", "balanced")
