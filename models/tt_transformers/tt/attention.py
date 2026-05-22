@@ -27,6 +27,25 @@ def _ws_a7_dump_enabled(layer_num: int) -> bool:
     return _os.environ.get("SGLANG_TT_DUMP_LAYER3", "") == "1" and int(layer_num) == 3
 
 
+# ---------------------------------------------------------------------------
+# WS-A.8 Bug 2 workaround: KV head replication for Qwen3.5-0.8B.
+# Default-off (no behavior change when SGLANG_TT_QWEN35_KV_REPLICATE is unset).
+# When set, after nlp_create_qkv_heads_decode in forward_decode, K and V are
+# duplicated along their kv-head axis (dim=2 of [1, batch, n_local_kv_heads,
+# head_dim]). This dodges a kernel bug in
+# ttnn.transformer.paged_scaled_dot_product_attention_decode that produces
+# catastrophic ~1e36 output on the per-device config
+# (n_local_heads=4, n_local_kv_heads=1, head_dim=256). Mathematically the
+# SDPA output is unchanged because GQA(Q, [K,K], [V,V], groups=2)
+# == GQA(Q, K, V, groups=4) when K,V are doubled by replication.
+# The cache must also be allocated with 2x n_kv_heads; the harness in
+# _prefetcher_harness.build_paged_kv_cache checks the same env var.
+# ---------------------------------------------------------------------------
+def _ws_a8_kv_replicate_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("SGLANG_TT_QWEN35_KV_REPLICATE", "") == "1"
+
+
 def _ws_a7_dump_save(name: str, tensor):
     """Best-effort save: ttnn -> torch -> append to dict on disk."""
     import os as _os
@@ -874,6 +893,49 @@ class Attention(LightweightModule):
 
         ttnn.deallocate(q_heads_pre_rot_1BQD)
         ttnn.deallocate(k_heads_pre_rot_1BKD)
+
+        # WS-A.8 Bug 2 workaround: replicate K, V along kv-head axis to dodge
+        # paged_scaled_dot_product_attention_decode kernel bug at
+        # n_local_kv_heads=1, head_dim=256 (Qwen3.5-0.8B per-device config).
+        # Gated on env var; doubles n_local_kv_heads from 1 to 2. The
+        # downstream cache must be allocated with matching doubled shape
+        # (see _prefetcher_harness.build_paged_kv_cache).
+        if _ws_a8_kv_replicate_enabled():
+            # K, V from create_qkv + rope are HEIGHT_SHARDED on L1. Concat
+            # requires interleaved layout; paged_update_cache then requires
+            # sharded again. Round-trip via DRAM_INTERLEAVED, concat (along
+            # the kv-head dim), then re-shard. Shard each kv-head onto its
+            # own core: (TILE_SIZE, head_dim) per core on a CoreRange of
+            # _nkv_doubled cores. The replicated cache stays at the original
+            # n_kv_heads_total (e.g. 2 for Qwen3.5-0.8B), so writing the
+            # doubled-head K populates BOTH cache slots with the same per-
+            # device K rather than leaving slot 1 as garbage that SDPA's
+            # GQA grouping later reads into q-heads 2-3.
+            # Shape [1, batch, n_local_kv_heads, head_dim] -> [1, batch, 2*n_local_kv_heads, head_dim]
+            k_il = ttnn.sharded_to_interleaved(k_heads_1BKD, ttnn.DRAM_MEMORY_CONFIG) if k_heads_1BKD.is_sharded() else k_heads_1BKD
+            v_il = ttnn.sharded_to_interleaved(v_heads_1BKD, ttnn.DRAM_MEMORY_CONFIG) if v_heads_1BKD.is_sharded() else v_heads_1BKD
+            k_il_doubled = ttnn.concat([k_il, k_il], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            v_il_doubled = ttnn.concat([v_il, v_il], dim=2, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+            if k_il is not k_heads_1BKD:
+                ttnn.deallocate(k_il)
+            if v_il is not v_heads_1BKD:
+                ttnn.deallocate(v_il)
+            ttnn.deallocate(k_heads_1BKD)
+            ttnn.deallocate(v_heads_1BKD)
+            _hd_doubled = k_il_doubled.shape[3]
+            _nkv_doubled = k_il_doubled.shape[2]
+            _shard_grid = ttnn.CoreRangeSet(
+                {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(_nkv_doubled - 1, 0))}
+            )
+            _shard_spec = ttnn.ShardSpec(_shard_grid, (ttnn.TILE_SIZE, _hd_doubled), ttnn.ShardOrientation.ROW_MAJOR)
+            _doubled_shard_memcfg = ttnn.MemoryConfig(
+                ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, _shard_spec
+            )
+            k_heads_1BKD = ttnn.to_memory_config(k_il_doubled, _doubled_shard_memcfg)
+            v_heads_1BKD = ttnn.to_memory_config(v_il_doubled, _doubled_shard_memcfg)
+            ttnn.deallocate(k_il_doubled)
+            ttnn.deallocate(v_il_doubled)
+
         ###
         # KV update
         ###
