@@ -314,14 +314,8 @@ AllGatherProgramArtifacts build_all_gather_async_minimal_default_program_artifac
         topology == ccl::Topology::Linear ? num_targets_backward : ring_size - 1,
         mesh_device);
 
-    // ag_matmul Stage 1: lifted Linear+fuse_op TT_FATAL to allow exercising
-    // the fused all-gather + matmul path on a 2x P150a Linear-topology mesh
-    // (P300_X2 cluster surface is not exposed; ccl_topology() returns Linear).
-    // This is a structural-plumbing gate, not a kernel correctness invariant.
-    // Subsequent stages will fix the downstream consequences (boundary-mode
-    // hardcoding in ccl_common.cpp and direction==1 semaphore in
-    // minimal_default_writer.cpp). Behavior on Ring topology is unchanged.
-    (void)fuse_op;
+    TT_FATAL(
+        !((topology == ccl::Topology::Linear) && fuse_op), "linear is not support when using fused for all-gather");
     const auto [all_core_range, all_cores] = ttnn::ccl::choose_worker_cores(
         num_links, num_cores_per_link, mesh_device, sub_device_id, core_grid_offset, sub_core_grid);
 
