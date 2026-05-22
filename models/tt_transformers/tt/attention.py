@@ -3,10 +3,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import os
 
 import torch
 
 import ttnn
+
+# ag_matmul Stage 1 debug knob (TEMPORARY): bypass the
+# `ccl_topology == Ring and prefetcher is None` inner gate at the WO call
+# site so the fused all-gather + matmul path can be exercised on a 2x P150a
+# Linear-topology mesh while the prefetcher is active. Removed once Stages
+# 2/3 (boundary-mode + fuse-op signaling) land and the gate can be widened
+# permanently.
+_SGLANG_TT_FORCE_AG_MATMUL_FUSION = os.getenv("SGLANG_TT_FORCE_AG_MATMUL_FUSION", "0") == "1"
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.utility_functions import nearest_32
@@ -779,7 +788,10 @@ class Attention(LightweightModule):
             )
 
             # Fused AGMM only valid for ring topology
-            if self.ccl_topology == ttnn.Topology.Ring and self.prefetcher is None:
+            # ag_matmul Stage 1 debug bypass: SGLANG_TT_FORCE_AG_MATMUL_FUSION=1
+            # forces the fused-op call site to be exercised even on Linear+prefetcher,
+            # so the next downstream blocker can be identified. TEMPORARY.
+            if (self.ccl_topology == ttnn.Topology.Ring and self.prefetcher is None) or _SGLANG_TT_FORCE_AG_MATMUL_FUSION:
                 _, dense_out_sharded = ttnn.experimental.all_gather_matmul_async(
                     attn_output_cat,
                     self.wo,
