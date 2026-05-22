@@ -224,6 +224,19 @@ class TransformerBlock(LightweightModule):
             x.memory_config() == skip_mem_cfg
         ), f"decoder input memcfg mismatch: {x.memory_config()} != {skip_mem_cfg}"
 
+        # WS-A.7 diagnostic only: dump layer-3 input pre-norm. Default off.
+        # ``mode`` may be the Mode enum (Mode.DECODE = "decode") or the
+        # raw string. Compare via .value-or-str fallback.
+        _ws_a7_mode_str = getattr(mode, "value", mode)
+        _ws_a7_dump_layer3 = (
+            __import__("os").environ.get("SGLANG_TT_DUMP_LAYER3", "") == "1"
+            and int(self.layer_num) == 3
+            and _ws_a7_mode_str == "decode"
+        )
+        if _ws_a7_dump_layer3:
+            from models.tt_transformers.tt.attention import _ws_a7_dump_save as _ws_save
+            _ws_save("00_layer3_input", x)
+
         # Choose the correct rotation matrices based on the mode
         rot_mats = (
             rot_mats_local if (hasattr(self.attention, "is_sliding") and self.attention.is_sliding) else rot_mats_global
@@ -318,5 +331,9 @@ class TransformerBlock(LightweightModule):
             if TG and not self.args.is_distributed_norm(mode)
             else activation_dtype or ttnn.bfloat16,
         )
+
+        if _ws_a7_dump_layer3:
+            from models.tt_transformers.tt.attention import _ws_a7_dump_save as _ws_save
+            _ws_save("13_layer3_output", out)
 
         return out  # fractured across devices

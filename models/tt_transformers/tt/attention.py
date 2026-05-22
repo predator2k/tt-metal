@@ -16,6 +16,42 @@ from models.tt_transformers.tt.model_config import OpGroup, TensorGroup, num_to_
 from models.tt_transformers.tt.rope import qwen35_partial_rotary_head_perm
 
 
+# ---------------------------------------------------------------------------
+# WS-A.7 diagnostic helper: env-var-gated per-op tensor dump for layer 3.
+# Default-off (no behavior change when SGLANG_TT_DUMP_LAYER3 is unset). When
+# set, forward_decode tees specific tensors after each significant op into a
+# torch .pt dict at SGLANG_TT_DUMP_LAYER3_PATH (default /tmp/qwen35_diag_tt_layer3.pt).
+# ---------------------------------------------------------------------------
+def _ws_a7_dump_enabled(layer_num: int) -> bool:
+    import os as _os
+    return _os.environ.get("SGLANG_TT_DUMP_LAYER3", "") == "1" and int(layer_num) == 3
+
+
+def _ws_a7_dump_save(name: str, tensor):
+    """Best-effort save: ttnn -> torch -> append to dict on disk."""
+    import os as _os
+    try:
+        if hasattr(tensor, "shape") and not isinstance(tensor, torch.Tensor):
+            # ttnn.Tensor: bring back to host.
+            try:
+                t = ttnn.to_torch(ttnn.get_device_tensors(tensor)[0]).float().cpu()
+            except Exception:
+                t = ttnn.to_torch(tensor).float().cpu()
+        else:
+            t = tensor.float().cpu() if isinstance(tensor, torch.Tensor) else tensor
+        path = _os.environ.get("SGLANG_TT_DUMP_LAYER3_PATH", "/tmp/qwen35_diag_tt_layer3.pt")
+        existing = {}
+        if _os.path.exists(path):
+            try:
+                existing = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                existing = {}
+        existing[name] = t
+        torch.save(existing, path)
+    except Exception as exc:
+        print(f"[ws-a7-dump] WARN saving {name}: {type(exc).__name__}: {exc}", flush=True)
+
+
 class Attention(LightweightModule):
     def __init__(
         self,
@@ -39,6 +75,10 @@ class Attention(LightweightModule):
         self.num_devices = configuration.num_devices
         self.prefetcher = prefetcher
         self.TG = self.num_devices == 32
+        # WS-A.7 diagnostic only: layer_num retained for env-gated layer-3
+        # tensor dumps (see SGLANG_TT_DUMP_LAYER3 in forward_decode). Off by
+        # default; zero behavioral impact when the env var is unset.
+        self.layer_num = layer_num
         self.hidden_size = configuration.dim
         self.n_heads = configuration.n_heads
         self.head_dim = configuration.head_dim
@@ -676,6 +716,10 @@ class Attention(LightweightModule):
         x: (seq_len, 1, batch, dim)
         current_pos: (batch_size), current token position in the sequence for each user
         """
+        # WS-A.7 (diagnostic, default-off): dump layer-3 input.
+        _ws_dump = _ws_a7_dump_enabled(self.layer_num)
+        if _ws_dump:
+            _ws_a7_dump_save("01_post_input_layernorm", x)
 
         ###
         # QKV matmuls
@@ -750,6 +794,9 @@ class Attention(LightweightModule):
         xqkv_fused = ttnn.reshape(
             xqkv_fused, (1, 1, self.batch_size_per_device_group, fqkv_shape[3]), (1, 1, 32, fqkv_shape[3])
         )
+        # WS-A.7 diagnostic dump: full QKV matmul output (pre head split).
+        if _ws_dump:
+            _ws_a7_dump_save("02_post_q_proj_raw", xqkv_fused)
 
         ###
         # Reshape and rotary embeddings
@@ -801,15 +848,29 @@ class Attention(LightweightModule):
             # nlp_concat_heads_decode, where the tensor is in DRAM-interleaved
             # form anyway.
             gate_heads_1BQD = gate_only
+        # WS-A.7 diagnostic dumps: post-split Q, K, V heads + gate.
+        if _ws_dump:
+            _ws_a7_dump_save("03a_q_only", q_heads_pre_rot_1BQD)
+            if gate_heads_1BQD is not None:
+                _ws_a7_dump_save("03b_gate_only", gate_heads_1BQD)
+            _ws_a7_dump_save("04_post_k_proj", k_heads_pre_rot_1BKD)
+            _ws_a7_dump_save("05_post_v_proj", v_heads_1BKD)
+
         norm_config = self.args.get_norm_config("attn", Mode.DECODE, None)
         q_heads_pre_rot_1BQD = self.q_norm(q_heads_pre_rot_1BQD, mode=Mode.DECODE, norm_config=norm_config)
         k_heads_pre_rot_1BKD = self.k_norm(k_heads_pre_rot_1BKD, mode=Mode.DECODE, norm_config=norm_config)
+        if _ws_dump:
+            _ws_a7_dump_save("06_post_q_norm", q_heads_pre_rot_1BQD)
+            _ws_a7_dump_save("07_post_k_norm", k_heads_pre_rot_1BKD)
         ttnn.deallocate(xqkv_fused)
 
         # Q, K Rotary Embeddings
         q_heads_1BQD, k_heads_1BKD = self.rotary_embedding_decode(
             q_heads_pre_rot_1BQD, k_heads_pre_rot_1BKD, rot_mats, current_pos
         )
+        if _ws_dump:
+            _ws_a7_dump_save("08_post_rope_q", q_heads_1BQD)
+            _ws_a7_dump_save("09_post_rope_k", k_heads_1BKD)
 
         ttnn.deallocate(q_heads_pre_rot_1BQD)
         ttnn.deallocate(k_heads_pre_rot_1BKD)
@@ -906,6 +967,8 @@ class Attention(LightweightModule):
         )
         ttnn.deallocate(attn_output_11BH)
         ttnn.deallocate(attn_output_1G4D)
+        if _ws_dump:
+            _ws_a7_dump_save("10_post_sdpa", attn_output_cat)
 
         # WS-A.3: apply attn_output_gate = sigmoid(gate) * attn_output before
         # o_proj. After nlp_concat_heads_decode, attn_output_cat has shape
@@ -918,8 +981,12 @@ class Attention(LightweightModule):
                 [1, 1, gate_heads_1BQD.shape[1], self.n_local_heads * self.head_dim],
             )
             gate_flat = ttnn.sigmoid(gate_flat)
+            if _ws_dump:
+                _ws_a7_dump_save("11_sigmoid_gate", gate_flat)
             gate_flat = ttnn.to_memory_config(gate_flat, attn_output_cat.memory_config())
             attn_output_cat = ttnn.multiply(attn_output_cat, gate_flat)
+            if _ws_dump:
+                _ws_a7_dump_save("11b_post_gate_mul", attn_output_cat)
             ttnn.deallocate(gate_flat)
             ttnn.deallocate(gate_heads_1BQD)
 
@@ -992,6 +1059,8 @@ class Attention(LightweightModule):
                 dense_out_sharded,
                 self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
             )
+            if _ws_dump:
+                _ws_a7_dump_save("12_post_o_proj", dense_out_sharded)
             return dense_out_sharded
 
         else:
@@ -1056,6 +1125,8 @@ class Attention(LightweightModule):
                 dense_out_reduced = ttnn.to_memory_config(
                     dense_out_reduced, self.args.get_attn_dense_output_mem_config(Mode.DECODE, None)
                 )
+            if _ws_dump:
+                _ws_a7_dump_save("12_post_o_proj", dense_out_reduced)
 
             return dense_out_reduced
 
