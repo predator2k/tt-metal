@@ -151,7 +151,9 @@ class MLP(LightweightModule):
             program_config=pc_1,
             memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
-            sub_device_id=self.prefetcher.worker_sub_device_id
+            # ag_matmul Stage 2: gather_in0 matmul — receiver sub-device, not
+            # compute_only (see Prefetcher.receiver_sub_device_id docstring).
+            sub_device_id=self.prefetcher.receiver_sub_device_id
             if self.prefetcher is not None and mode == Mode.DECODE
             else None,
         )
@@ -164,7 +166,8 @@ class MLP(LightweightModule):
             program_config=pc_3,
             memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
-            sub_device_id=self.prefetcher.worker_sub_device_id
+            # ag_matmul Stage 2: gather_in0 matmul — receiver sub-device.
+            sub_device_id=self.prefetcher.receiver_sub_device_id
             if self.prefetcher is not None and mode == Mode.DECODE
             else None,
         )
@@ -289,7 +292,8 @@ class MLP(LightweightModule):
                 memory_config=self.args.get_mlp_ff2_mem_config(mode, self.prefetcher),
                 core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
                 global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
-                sub_device_id=self.prefetcher.worker_sub_device_id
+                # ag_matmul Stage 2: gather_in0 matmul — receiver sub-device.
+                sub_device_id=self.prefetcher.receiver_sub_device_id
                 if self.prefetcher is not None and mode == Mode.DECODE
                 else None,
             )

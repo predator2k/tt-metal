@@ -607,7 +607,15 @@ class Attention(LightweightModule):
             compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
             dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
             global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-            sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+            # ag_matmul Stage 2: gather_in0 matmul kernels and their
+            # semaphores live on the receiver cores (where the global CB
+            # lives and where the input shard is placed by
+            # get_attn_qkv_mm_mem_config). The 3-sub-device layout's
+            # worker_sub_device_id == compute_only excludes receivers, so
+            # passing it here yields an empty intersection at
+            # matmul_multicore_reuse_mcast_1d_program_factory.cpp:2014–2038
+            # and crashes CreateSemaphore. Use receiver_sub_device_id.
+            sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
         )
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
@@ -808,7 +816,10 @@ class Attention(LightweightModule):
                     chunks_per_sync=self.model_config["ATTN_AGMM_CONFIG"]["chunks_per_sync"],
                     num_workers_per_link=self.model_config["ATTN_AGMM_CONFIG"]["num_workers_per_link"],
                     num_buffers_per_channel=2,
-                    subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                    # ag_matmul Stage 2: the fused AGMM internally invokes
+                    # the gather_in0 matmul program factory, which needs the
+                    # receiver sub-device (see receiver_sub_device_id docstring).
+                    subdevice_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
                 )
             else:
                 all_gather_output = ttnn.experimental.all_gather_async(
@@ -832,7 +843,9 @@ class Attention(LightweightModule):
                     program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
                     compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
                     global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                    sub_device_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                    # ag_matmul Stage 2: gather_in0 WO matmul — receiver
+                    # sub-device (see receiver_sub_device_id docstring).
+                    sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
                 )
                 ttnn.deallocate(all_gather_output)
             ttnn.deallocate(attn_output_cat)
