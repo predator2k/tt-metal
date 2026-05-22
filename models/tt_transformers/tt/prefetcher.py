@@ -412,41 +412,6 @@ class Prefetcher(LightweightModule):
         self.prefetch_done = False
 
     @property
-    def receiver_sub_device_id(self) -> Optional[ttnn.SubDeviceId]:
-        """
-        ag_matmul Stage 2 — Sub-device ID containing ONLY the receiver cores.
-
-        The 3-sub-device DECODE layout (sender / receiver / compute_only)
-        deliberately excludes receiver cores from `worker_sub_device_id`
-        (which is `sub_devices_id[-1] == compute_only`) to prevent L1 CB
-        clashes between the prefetcher global CB and model-op L1.
-
-        However, every gather_in0 matmul (QKV, WO, MLP) needs its semaphore
-        and kernel dispatch to land on the cores where the input shard lives
-        — which is the receiver_set, NOT compute_only. Passing
-        `worker_sub_device_id` to those matmuls collapses the
-        `subdevice_cores ∩ input_shard_grid` intersection at
-        matmul_multicore_reuse_mcast_1d_program_factory.cpp:2014–2038 to
-        empty and trips a CreateSemaphore TT_FATAL.
-
-        For those gather_in0 sites, pass this property instead. It returns
-        `sub_devices_id[1]` (the receiver sub-device) when the 3-sub-device
-        layout is active, and `worker_sub_device_id` (i.e. the only worker
-        sub-device) when only 2 sub-devices were created.
-
-        Returns None until `init(Mode.DECODE)` has populated
-        `prefetcher_sub_device`.
-        """
-        if self.worker_sub_device_id is None:
-            return None
-        sub_ids = self.prefetcher_sub_device.sub_devices_id
-        # 3-sub-device layout: [sender, receiver, compute_only]. The receiver
-        # ID is index 1. With the 2-sub-device fallback (no receiver_mapping)
-        # the receivers are inside `all_worker_cores_range_set` itself, so
-        # the worker sub-device IS the receiver sub-device.
-        return sub_ids[1] if len(sub_ids) == 3 else self.worker_sub_device_id
-
-    @property
     def worker_start_core(self):
         """First valid start_core inside the (possibly carved-by-receivers) worker grid."""
         ranges = self.all_worker_cores_range_set.ranges()
