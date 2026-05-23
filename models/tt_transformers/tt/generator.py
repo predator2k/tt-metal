@@ -651,7 +651,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         sampling_on_device_requested = sampling_params is not None
 
         # we need this here because of tt-metal tests
-        if warmup_prefill:
+        # WS-A.18: SGLANG_TT_DISABLE_PREFILL_WARMUP=1 skips the internal
+        # warmup loop (which probes seq_lens up to context_length using
+        # _mock_tokens). On Qwen3.5-0.8B the DeltaNet host fallback at
+        # seq_len=2048 OOMs the process; bypassing the warmup lets the
+        # first real request just compile what it needs. Identity for
+        # every other model (Qwen3-8B etc.) when the env var is unset.
+        if warmup_prefill and os.environ.get("SGLANG_TT_DISABLE_PREFILL_WARMUP", "0") != "1":
             sampling_on_device_enabled = (
                 getattr(self.model[0], "_supports_on_device_sampling", False)
                 and getattr(self.model[0], "sampling", None) is not None
