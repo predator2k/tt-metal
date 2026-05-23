@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import List
 
 import torch
@@ -13,6 +14,57 @@ from models.common.utility_functions import is_wormhole_b0
 from models.tt_transformers.tt.generator import Generator, create_submeshes
 from models.tt_transformers.tt.model import Transformer
 from models.tt_transformers.tt.model_config import DecodersPrecision, ModelArgs, TensorGroup
+
+# ATTACK-2: env-gated logit magnitude probe. Logs (step, max_abs, has_nan,
+# has_inf, top_token_id) for the first SGLANG_TT_LOGIT_PROBE_STEPS=N decode
+# steps. Use this to distinguish "first replay is dirty" from "every replay
+# is dirty", and to detect mode-collapse / corruption before sampler crashes.
+_LOGIT_PROBE_STEPS_REMAINING = None
+_LOGIT_PROBE_STEP_COUNTER = 0
+
+
+def _logit_probe(label, result):
+    """Inspect a decode-forward result and log magnitude / NaN stats.
+
+    `result` may be a torch.Tensor (logits) or a tuple/list whose elements
+    contain a torch.Tensor with `.float()` (the typical SGLang shape after
+    process_decode_output_host).  Errors are swallowed — this is a probe.
+    """
+    global _LOGIT_PROBE_STEPS_REMAINING, _LOGIT_PROBE_STEP_COUNTER
+    if _LOGIT_PROBE_STEPS_REMAINING is None:
+        try:
+            _LOGIT_PROBE_STEPS_REMAINING = int(os.getenv("SGLANG_TT_LOGIT_PROBE_STEPS", "0") or 0)
+        except ValueError:
+            _LOGIT_PROBE_STEPS_REMAINING = 0
+    if _LOGIT_PROBE_STEPS_REMAINING <= 0:
+        return
+    _LOGIT_PROBE_STEP_COUNTER += 1
+    try:
+        candidate = result
+        # Unwrap tuple/list.
+        while isinstance(candidate, (list, tuple)) and len(candidate) > 0:
+            candidate = candidate[0]
+        if not isinstance(candidate, torch.Tensor):
+            return
+        t = candidate.detach().float()
+        max_abs = float(t.abs().max().item()) if t.numel() else float("nan")
+        has_nan = bool(torch.isnan(t).any().item())
+        has_inf = bool(torch.isinf(t).any().item())
+        # Top token id of the first user/slot.
+        try:
+            flat = t.reshape(-1, t.shape[-1])[0]
+            top_id = int(flat.argmax().item())
+        except Exception:
+            top_id = -1
+        logger.warning(
+            f"[LOGIT-PROBE] {label} step={_LOGIT_PROBE_STEP_COUNTER} "
+            f"shape={tuple(t.shape)} max_abs={max_abs:.3e} "
+            f"has_nan={has_nan} has_inf={has_inf} top_id={top_id}"
+        )
+    except Exception as _exc:
+        logger.warning(f"[LOGIT-PROBE] {label} step={_LOGIT_PROBE_STEP_COUNTER} probe FAILED: {_exc}")
+    finally:
+        _LOGIT_PROBE_STEPS_REMAINING -= 1
 
 
 def allocate_sglang_kv_cache(kv_cache_shape, dtype, num_layers, dp_model: List[Transformer], tt_cache_path):
@@ -249,7 +301,9 @@ class QwenForCausalLM(Generator):
         return super().prefill_forward_text(*args, **kwargs)
 
     def decode_forward(self, *args, **kwargs):
-        return super().decode_forward(*args, **kwargs)
+        result = super().decode_forward(*args, **kwargs)
+        _logit_probe("Qwen", result)
+        return result
 
     def allocate_kv_cache(self, *args, **kwargs):
         return allocate_sglang_kv_cache(*args, **kwargs, dp_model=self.model, tt_cache_path=self.cache_path)

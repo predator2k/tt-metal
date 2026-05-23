@@ -411,6 +411,50 @@ class Prefetcher(LightweightModule):
         self._prefill_manager_id = None
         self._decode_manager_id = None
 
+        # Per-layer bisect knob (ATTACK 1 for prefetcher-correctness bug).
+        # SGLANG_TT_PREFETCHER_LAYERS=N limits the prefetcher producer/consumer
+        # path to the first N decoder layers; layers N..(num_layers-1) fall
+        # back to plain DRAM-sharded matmul (no GlobalCB). Default (env unset
+        # or N >= num_layers) preserves prior behavior — prefetcher active
+        # for ALL layers. Read env at __init__ but only resolve against
+        # num_layers in `effective_layer_limit` (some callers set num_layers
+        # AFTER __init__ via prefetcher.num_layers = ...).
+        try:
+            self._env_layer_limit = int(os.getenv("SGLANG_TT_PREFETCHER_LAYERS", "0") or 0)
+        except ValueError:
+            self._env_layer_limit = 0
+
+    @property
+    def layer_limit(self):
+        """Resolve the per-layer bisect limit against the (possibly late-set)
+        num_layers attribute. Returns num_layers (no limit) if env unset,
+        invalid, or out of range."""
+        n = self.num_layers
+        if not isinstance(n, int) or n <= 0:
+            return n
+        lim = getattr(self, "_env_layer_limit", 0)
+        if lim > 0 and lim < n:
+            return lim
+        return n
+
+    def use_for_layer(self, layer_num) -> bool:
+        """Return True iff the prefetcher consumer path should be used for layer_num.
+
+        Used by attention.py / mlp.py to short-circuit the GlobalCB consumer
+        kwargs (global_cb, sub_device_id, ring-sharded weight, prefetcher-aware
+        program / mem configs) when ATTACK-1 per-layer bisect is engaged.
+        """
+        try:
+            n = int(layer_num)
+        except (TypeError, ValueError):
+            return True
+        if n < 0:
+            return True
+        lim = self.layer_limit
+        if not isinstance(lim, int) or lim <= 0:
+            return True
+        return n < lim
+
     @property
     def worker_start_core(self):
         """First valid start_core inside the (possibly carved-by-receivers) worker grid."""
@@ -733,9 +777,31 @@ class Prefetcher(LightweightModule):
             self.prefetched_tt_addr_tensor = self.create_address_tensor()
 
         # Run prefetcher op (prefetcher op will start asynchronously prefetching weights until prefetcher.stop() is called)
+        # ATTACK 1 layer-bisect: when SGLANG_TT_PREFETCHER_LAYERS=N limits
+        # the consumer to the first N layers, the producer must match — it
+        # writes num_tensors_per_layer * effective_layers pages to GlobalCB,
+        # and consumers in layers >= N skip GlobalCB entirely (their matmul
+        # reads weights directly from DRAM with no GlobalCB kwarg). The
+        # producer's tensor_addrs buffer is layer-major (layer 0 tensors
+        # first, layer 1 next, ...), so truncating num_layers just stops the
+        # producer earlier in the address list. The 5 tensor handles in the
+        # input list are still valid — they only carry shape/dtype/shard-spec
+        # metadata; the per-layer address comes from tensor_addrs.
+        _lim = self.layer_limit
+        if isinstance(_lim, int) and _lim > 0:
+            effective_num_layers = min(self.num_layers, _lim)
+        else:
+            effective_num_layers = self.num_layers
+        if not getattr(self, "_layer_limit_logged", False):
+            logger.warning(
+                f"[Prefetcher] run(): num_layers={self.num_layers} "
+                f"effective_num_layers={effective_num_layers} "
+                f"(SGLANG_TT_PREFETCHER_LAYERS={getattr(self, '_env_layer_limit', 0)})"
+            )
+            self._layer_limit_logged = True
         self.garbage = ttnn.dram_prefetcher(
             self.prefetched_tensors[: self.num_tensors] + [self.prefetched_tt_addr_tensor],
-            num_layers=self.num_layers,
+            num_layers=effective_num_layers,
             global_cb=self.global_cb,
             enable_performance_mode=self.enable_performance_mode,
         )

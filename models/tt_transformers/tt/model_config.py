@@ -330,6 +330,74 @@ class ModelOptimizations:
                         OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
                     },
                 })
+            elif _qwen3_mode == "full_bf16":
+                # 2026-05-23 GSM8K accuracy lift: the "balanced" default uses
+                # BFP4 for FF1/FF3 (lowest precision available) which compounds
+                # noise across the 36 decoder layers and degrades CoT math
+                # reasoning (e.g. Q3 of GSM8K few-shot test set degenerates to
+                # "#### 20"; Q2 picks the wrong final number; baseline = 2/5
+                # CORRECT vs HF-CPU bf16 reference at 5/5). The existing
+                # "hifi" preset only lifts attention (WQKV/WO/KV/SDPA), which
+                # is a no-op on the eval (also 2/5) since the noise budget is
+                # being burned in MLP, not attention. This preset lifts every
+                # per-layer weight surface (FF1/FF3 + FF2 + WQKV + WO + KV
+                # cache) to BF16 and every compute kernel to HIFI4.
+                # LM head stays on BFP8 — lifting it to BF16 blows L1 cap
+                # via the Qwen3-8B-specific program config (151936 vocab); the
+                # LM head is also a single op (not compounded over 36 layers)
+                # so its noise contribution is small. Memory cost ~2× the
+                # baseline weight cache (still fits 2× P150a 16 GB easily).
+                logger.info(
+                    f"Model {model_name}: FULL BF16 preset "
+                    f"(FF1/FF3 + FF2 + WQKV + WO + KV all BF16, "
+                    f"LM head stays BFP8, all compute kernels HIFI4)"
+                )
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.FF1_FF3: PrecisionSetting.BF16,
+                        TensorGroup.FF2: PrecisionSetting.BF16,
+                        TensorGroup.WQKV: PrecisionSetting.BF16,
+                        TensorGroup.WO: PrecisionSetting.BF16,
+                        TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_FF2: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                    },
+                })
+            elif _qwen3_mode == "bfp8":
+                # Intermediate preset: keep MLP weights on BFP8 (default for
+                # most models) and lift attention to BF16+HIFI4. Hypothesis:
+                # most of the BFP4-vs-BFP8 gap is recoverable without paying
+                # the full BF16 MLP weight-load latency. Useful as a fast
+                # ablation point to attribute the lift to MLP precision vs
+                # full BF16 vs attention precision. No FF1/FF3 override =>
+                # inherits BFP8 from ``_default_settings``.
+                logger.info(
+                    f"Model {model_name}: BFP8 MLP + BF16 attention preset "
+                    f"(FF1/FF3 lifted BFP4->BFP8, attention BF16+HIFI4)"
+                )
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.WQKV: PrecisionSetting.BF16,
+                        TensorGroup.KV_CACHE: PrecisionSetting.BF16,
+                        TensorGroup.WO: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                    },
+                })
             else:
                 logger.info(f"Model {model_name}: BFP4 MLP + HIFI2 fidelity (balanced)")
                 inst = cls({
@@ -2914,6 +2982,19 @@ class ModelArgs:
                 "1", "true", "yes"
             ):
                 self.lm_head_dtype = ttnn.bfloat16
+        # 2026-05-23: BF16 LM-head lift for Qwen3-8B was attempted under
+        # SGLANG_TT_QWEN3_PRECISION=full_bf16 but the Qwen3-8B LM head
+        # program config blows L1 circular buffers at BF16 weights+output
+        # (vocab=151936, hidden=4096 → matmul CB = 2.3 MB > 1.5 MB L1 cap;
+        # crashes at "Statically allocated circular buffers on core range
+        # [0-0 - 7-0] grow to 2337280 B"). Qwen3.5 doesn't hit this because
+        # its LM head program config picks different splits.
+        # The MLP+attention BF16 lift is the dominant gain anyway since
+        # they're compounded across 36 decoder layers. LM head is a single
+        # op at the end — staying on BFP8 has minimal noise contribution.
+        # Keeping the dtype unset → LMHead falls through to BFP8 storage
+        # and BFP8 output, which matches the pre-patch behavior. No-op for
+        # all Qwen3-8B precision modes.
         return
 
     def _set_params_from_dict(self, config):
