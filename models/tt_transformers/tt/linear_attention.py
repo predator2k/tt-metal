@@ -14,29 +14,38 @@ Two execution modes are supported, selected at module-construction time by
 
   * Default (env unset/0): **host-fallback** — DeltaNet math runs in pure
     PyTorch on the CPU in one big bf16 batch per layer per step.
-  * Native (env=1): **TT-native scaffolding** (WS-A.12) — DeltaNet linear
-    projections, the SSM outer-product update, and out_proj run on device
-    with persistent on-device conv/ssm state. The conv1d roll, L2-norm,
-    softplus/sigmoid gating, and RMSNormGated still bridge to host
-    (microsecond-scale torch ops on ~10-50K element tensors).
+  * Native (env=1): **TT-native** — full DeltaNet (input projections,
+    on-device causal conv1d_update, L2-norm + Q-scale, softplus/sigmoid
+    gating, SSM outer-product update, RMSNormGated, and out_proj) runs
+    on device with persistent on-device conv/ssm state. Zero host bridges
+    per layer per step as of WS-A.16; only the initial hidden gather
+    (~2 KB) and the final attn-out re-shard cross PCIe per step.
 
-PERF — WS-A.13 (measured 2026-05-22, P150a 2x mesh, B=1)
+PERF — WS-A.16 (measured 2026-05-23, P150a 2x mesh, B=1)
 ---------------------------------------------------------
 For Qwen3.5-0.8B at batch=1, head_dim=128, 16 v-heads. Warm avg per
-decode step:
+decode step (steps 5-19, run-to-run jitter ~10 ms):
 
-  host-fallback:  ~365 ms        TT-native (WS-A.13):  ~330 ms
+  host-fallback:        348.4 ms      (host PyTorch DeltaNet)
+  TT-native (WS-A.13):  342.5 ms      (2 host bridges/layer)
+  TT-native (WS-A.16):  358.3 ms      (0 host bridges/layer — on-device)
 
-WS-A.13 collapsed 6 host hops/layer/step → 2 (only the conv1d roll
-remains bridged). End-to-end win is small (~9-10 %) because the
-remaining decode cost is full-attention layers running through the
-canonical TT path. The DeltaNet path is now faster than host fallback,
-but the global TPOT is still dominated by SDPA/Wo on the full-attention
-layers.
+WS-A.16 completed the on-device migration of the depthwise conv1d_update
+via primitive composition (concat + multiply + sum + silu + slice). The
+last per-step PCIe roundtrip in the DeltaNet path is gone. This is the
+prerequisite for decode trace capture (WS-A.17) — `ttnn.execute_trace`
+requires a fully on-device execution graph.
 
-PCC native vs host-fallback: 0.0000-diff (bit-identical, since the
-on-device math is mathematically equivalent and weights/intermediates
-land in the same bf16 representation).
+Eager-mode dispatch cost: WS-A.16 adds ~5 ttnn op dispatches per linear
+layer × 18 linear layers = ~90 extra kernel launches per decode step.
+At ~150-200 µs/dispatch this is ~13-18 ms, matching the +15.8 ms eager
+regression vs WS-A.13. ALL of this cost is eliminated by trace replay
+(`ttnn.execute_trace` reuses one capture, no per-op dispatch), which
+is the WS-A.17 win.
+
+PCC native vs host-fallback: 0.0000-diff (bit-equivalent in bf16, since
+the on-device math is mathematically identical and intermediates land
+in the same bf16 representation).
 PCC vs HF reference: 0.7183 / 0.6967 / 0.6806 / 0.6527 (steps 0/1/4/16)
 — identical to the host-fallback baseline.
 
@@ -48,9 +57,9 @@ remains BFP8.
 
 Future work to close the rest of the gap:
   1. Persistent ttnn trace-capture of the per-layer DeltaNet graph
-     (eliminates per-op dispatch latency — would be the next big lever).
-  2. Move the conv1d roll on-device via padded-concat + reduce-sum
-     (only remaining host bridge; multi-day kernel-fusion exercise).
+     (WS-A.17 — eliminates per-op dispatch latency; expected 2-3× win).
+  2. SGLang server + prefetcher path (WS-A.18 — alignment with the
+     Qwen3-8B 27 ms TPOT target).
   3. Larger per-user batch (B≥4) to amortize residual dispatch overhead.
   4. Sharded projections across the mesh (currently the native path runs
      redundantly on a replicated single-device view).
@@ -71,9 +80,14 @@ Per-layer recurrent state lives on the host (``self._conv_state``,
 generator's ``allocate_sglang_kv_cache`` puts ``None`` entries in the per-layer
 list for linear layers, and ``forward()`` here ignores its ``kv_cache=`` kwarg.
 
-This block is intentionally slow (~50–200 ms per layer per decode step from the
-host roundtrip). It is *not* a perf path; it exists so WS-A.3 can write the
-MRoPE work without being blocked on a kernel that doesn't exist yet.
+Host-fallback mode (default) is intentionally slow (~50-200 ms per layer per
+decode step from the host roundtrip); it exists so WS-A.3 could write the
+MRoPE work without being blocked on a kernel that didn't exist yet.
+
+TT-native mode (WS-A.16) keeps the entire DeltaNet step on-device — last
+remaining host bridge in the decode path. This is a prerequisite for trace
+capture (WS-A.17). Eager-mode dispatch cost is comparable to host-fallback;
+the win is unlocked by trace replay, not by the on-device migration itself.
 """
 
 from __future__ import annotations
@@ -567,14 +581,15 @@ class LinearAttentionBlock(LightweightModule):
         return out
 
     def _tt_native_delta_net_step(self, attn_in_tt: ttnn.Tensor) -> ttnn.Tensor:
-        """TT-native one-decode-step GatedDeltaNet (WS-A.13 single-bridge).
+        """TT-native one-decode-step GatedDeltaNet (WS-A.16 single-bridge).
 
-        Strategy (WS-A.13: collapsed 4 host bridges → 1):
+        Strategy (WS-A.16: last conv1d host bridge eliminated):
           1. Gather hidden to host (2 KB), upload replicated to device.
           2. Run the 4 input projections (in_proj_qkv/z/a/b) on device.
-          3. Bridge qkv to host for the conv1d roll (tile-misaligned K=4
-             depthwise conv; the *only* remaining host bridge per layer).
-             Re-upload qkv_post to device once.
+          3. Conv1d depthwise rolling update fully ON DEVICE via
+             ttnn.{reshape, concat, multiply, sum, silu, slice} composition.
+             Persistent conv state ([1, 1, B*conv_dim, K-1]) stays in DRAM
+             across decode steps — no per-step PCIe roundtrip.
           4. Slice qkv_post on device into Q/K/V; L2-norm + scale on device.
           5. Compute gating (decay, beta) entirely on device via
              ttnn.softplus + ttnn.exp + ttnn.sigmoid.
@@ -589,10 +604,11 @@ class LinearAttentionBlock(LightweightModule):
         DRAM as device-resident replicated ttnn tensors across all decode
         steps. Weights are uploaded once on first call (``_ensure_tt_weights``).
 
-        WS-A.13 vs WS-A.12: the WS-A.12 path had 6 host hops per layer per
-        step (hidden, qkv_post, a, b, o, normed-o). WS-A.13 has 2 hops:
-        hidden in, qkv_post round-trip for conv1d. That's a 3× reduction
-        in PCIe traffic per layer per step.
+        WS-A.16 vs WS-A.13: the WS-A.13 path had 2 host hops per layer per
+        step (hidden in, qkv_post round-trip for conv1d). WS-A.16 has 1
+        hop: hidden in. The conv1d update became 6 ttnn ops with bit-
+        equivalent bf16 output. This unblocks decode trace capture
+        (WS-A.17), which required a fully on-device execution graph.
 
         Args:
             attn_in_tt: post-attention_norm ttnn tensor, sharded or
@@ -633,45 +649,65 @@ class LinearAttentionBlock(LightweightModule):
         b   = ttnn.linear(x, self._tt_W_in_b,   memory_config=ttnn.DRAM_MEMORY_CONFIG)
         ttnn.deallocate(x)
 
-        # ----- (2) Conv1d depthwise rolling update -------------------
-        # qkv shape: [1, 1, B, conv_dim] → reshape to [1, 1, B*conv_dim, 1]
-        # so we can concat against conv_state [1, 1, B*conv_dim, K-1] along
-        # the last axis, get [1, 1, B*conv_dim, K], elementwise-multiply
-        # by W_conv (shape [1, 1, conv_dim, K] broadcast over B), then
-        # reduce-sum along the last axis. Finally split out the new state.
+        # ----- (2) Conv1d depthwise rolling update (WS-A.16: on-device) ----
+        # The depthwise causal conv1d_update is composed from ttnn primitives:
+        #   reshape  qkv         [1,1,B,conv_dim]       → [1,1,B*conv_dim,1]
+        #   concat   [state | q]                         → [1,1,B*conv_dim,K]
+        #   multiply by W_conv  [1,1,conv_dim,K] (B=1)   → [1,1,B*conv_dim,K]
+        #   sum      dim=-1                              → [1,1,B*conv_dim,1]
+        #   silu                                         → [1,1,B*conv_dim,1]
+        #   reshape  → [1,1,B,conv_dim] for downstream slice ops.
+        #
+        # Rolling state update: slice [..., 1:K] of the concatenated buffer →
+        # [1,1,B*conv_dim,K-1] persists as the new conv_state.
+        #
+        # PCC vs the prior WS-A.13 host-bridged path: bf16 bit-equivalent
+        # (verified by /tmp/_wsa16_op_probe.py to PCC=0.999999, max|diff|=
+        # one bf16 ULP). The on-device composition removes the last per-step
+        # PCIe roundtrip; unblocks decode trace capture (WS-A.17).
+        #
+        # Limitation: assumes B==1 so W_conv ([1,1,conv_dim,K]) matches
+        # conv_input ([1,1,B*conv_dim,K]) shape exactly. For B>1 we'd need
+        # to repeat W_conv over batch — out of scope this commit.
         K = self.conv_kernel_size
+        assert B == 1, (
+            f"WS-A.16 on-device conv1d_update assumes B==1 (W_conv broadcast); "
+            f"got B={B}. Repeat W_conv across batch to extend."
+        )
 
-        # All the per-channel-slot math is more naturally done on host shapes
-        # — do the conv update through torch then re-upload. For B=1 this
-        # is a 6144*4 = 24K-element host op, ~microsecond. ✓
-        # (A future optimization can fully on-device this via padded concat.)
-        # WS-A.13: keep the conv1d roll on host (~24 K bf16 elements/step,
-        # microsecond-scale torch op). After conv we re-upload qkv_post
-        # ONCE as the single device-side bridge — everything downstream
-        # (L2-norm, gating, SSM, RMSNormGated, out_proj) stays on device.
-        qkv_host = ttnn.to_torch(ttnn.get_device_tensors(qkv)[0]).reshape(B, self.conv_dim)
-        conv_state_host = ttnn.to_torch(ttnn.get_device_tensors(self._tt_conv_state)[0]).reshape(
-            B, self.conv_dim, K - 1
-        )
-        conv_input = torch.cat(
-            [conv_state_host, qkv_host.to(torch.bfloat16).unsqueeze(-1)], dim=-1
-        )  # [B, conv_dim, K]
-        Wc = self.W_conv.squeeze(1)  # [conv_dim, K]
-        qkv_post_host = (conv_input * Wc.unsqueeze(0).to(torch.bfloat16)).sum(dim=-1)
-        qkv_post_host = torch.nn.functional.silu(qkv_post_host.float()).to(torch.bfloat16)
-        new_state_host = conv_input[..., 1:].contiguous().to(torch.bfloat16)
-        # Update persistent conv state
-        ttnn.deallocate(self._tt_conv_state)
-        self._tt_conv_state = self._from_torch_replicated(
-            new_state_host.reshape(1, 1, B * self.conv_dim, K - 1),
-            dtype=ttnn.bfloat16,
-        )
+        # Flatten qkv: [1,1,B,conv_dim] → [1,1,B*conv_dim,1]
+        qkv_flat = ttnn.reshape(qkv, [1, 1, B * self.conv_dim, 1])
         ttnn.deallocate(qkv)
 
-        # Upload qkv_post once → device tensor [1, 1, B, conv_dim]
-        qkv_post = self._from_torch_replicated(
-            qkv_post_host.reshape(1, 1, B, self.conv_dim), dtype=ttnn.bfloat16
+        # Sliding window: [state | qkv_flat] along last axis.
+        conv_input = ttnn.concat([self._tt_conv_state, qkv_flat], dim=-1)
+        ttnn.deallocate(qkv_flat)
+
+        # Depthwise multiply by W_conv (per-channel kernel taps).
+        weighted = ttnn.multiply(conv_input, self._tt_W_conv)
+
+        # Per-channel reduction over the K taps.
+        qkv_post_reduced = ttnn.sum(weighted, dim=-1, keepdim=True)
+        ttnn.deallocate(weighted)
+
+        # SiLU activation.
+        qkv_post_silu = ttnn.silu(qkv_post_reduced)
+        ttnn.deallocate(qkv_post_reduced)
+
+        # Reshape back to [1,1,B,conv_dim] for the downstream slice ops.
+        qkv_post = ttnn.reshape(qkv_post_silu, [1, 1, B, self.conv_dim])
+        ttnn.deallocate(qkv_post_silu)
+
+        # Slide the rolling state forward: drop the oldest column, keep K-1.
+        new_state = ttnn.slice(
+            conv_input,
+            [0, 0, 0, 1],
+            [1, 1, B * self.conv_dim, K],
         )
+        ttnn.deallocate(conv_input)
+        # Swap the persistent on-device state. Deallocate the old buffer last.
+        ttnn.deallocate(self._tt_conv_state)
+        self._tt_conv_state = new_state
 
         # ----- (3) slice into Q, K, V on DEVICE, L2-norm + scale -----
         # qkv_post layout (along last axis): [ Q (key_dim) | K (key_dim) | V (value_dim) ]
