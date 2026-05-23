@@ -592,12 +592,26 @@ class Attention(LightweightModule):
 
         # Insert the tensors into the prefetcher only in decode mode, we do not use prefetcher in prefill mode
         if self.prefetcher is not None:
+            # SGLANG_TT_PREFETCHER_SKIP_WO: when set, do NOT route WO through the
+            # prefetcher's GlobalCB. WO falls back to a canonical-style ring matmul
+            # that reads weights directly from DRAM (mirrors the lm_head
+            # `prefetch=False, num_global_cb_receivers=1` pattern). Used to ablate
+            # whether the prefetcher BFP8 corruption is WO-specific (suspect S3).
+            # SGLANG_TT_PREFETCHER_SKIP_WQKV: skip WQKV too (S1/S2 narrowing).
+            import os as _os_pref
+            self._skip_wo_prefetcher = _os_pref.environ.get("SGLANG_TT_PREFETCHER_SKIP_WO", "0") == "1"
+            self._skip_wqkv_prefetcher = _os_pref.environ.get("SGLANG_TT_PREFETCHER_SKIP_WQKV", "0") == "1"
 
             def register_weights():
-                self.prefetcher.insert_tensor(self.wqkv)
-                self.prefetcher.insert_tensor(self.wo_sharded_ring)
+                if not self._skip_wqkv_prefetcher:
+                    self.prefetcher.insert_tensor(self.wqkv)
+                if not self._skip_wo_prefetcher:
+                    self.prefetcher.insert_tensor(self.wo_sharded_ring)
 
             self.prefetcher.register_callback(register_weights)
+        else:
+            self._skip_wo_prefetcher = False
+            self._skip_wqkv_prefetcher = False
 
     def init_kv_cache(self, configuration, weight_cache_path):
         """
@@ -817,20 +831,47 @@ class Attention(LightweightModule):
         # When ring_size does not evenly divide qkv_tiles, QKV falls back to the
         # standard DRAM-sharded config (no prefetcher ring).  In that case do NOT
         # pass global_cb / sub_device_id; MLP weights still use the prefetcher.
-        xqkv_fused_sharded = ttnn.linear(
-            x,
-            self.wqkv,
-            memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
-            program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
-            compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
-            dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
-            global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-            # QKV ring-gather matmul: x is sharded on receiver cores, so the
-            # factory's subdevice_cores query must use receiver_sub_device_id
-            # (not worker_sub_device_id) to avoid an empty CoreRangeSet when
-            # intersecting x.shard_spec().grid with subdevice_cores.
-            sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
-        )
+        # SGLANG_TT_PREFETCHER_SKIP_WQKV: bypass the prefetcher GlobalCB read for WQKV
+        # while keeping all output shard layout prefetcher-compatible. Same trick as
+        # SKIP_WO: use ring matmul config with prefetch=False, num_global_cb_receivers=1.
+        if self.prefetcher is not None and getattr(self, "_skip_wqkv_prefetcher", False):
+            _k_qkv_skip = self.args.dim // self.args.cluster_shape[0]
+            _n_qkv_skip = self.args.qkv_size // self.args.cluster_shape[1]
+            _qkv_skip_pc = self.args.matmul_1d_ring_config(
+                1,
+                32,
+                _k_qkv_skip,
+                _n_qkv_skip,
+                self.prefetcher.ring_size,
+                num_global_cb_receivers=1,
+                prefetch=False,
+                untilize_out=True,
+            )
+            xqkv_fused_sharded = ttnn.linear(
+                x,
+                self.wqkv,
+                memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
+                program_config=_qkv_skip_pc,
+                compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+                dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+                global_cb=None,
+                sub_device_id=self.prefetcher.receiver_sub_device_id,
+            )
+        else:
+            xqkv_fused_sharded = ttnn.linear(
+                x,
+                self.wqkv,
+                memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
+                program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
+                compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+                dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+                global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+                # QKV ring-gather matmul: x is sharded on receiver cores, so the
+                # factory's subdevice_cores query must use receiver_sub_device_id
+                # (not worker_sub_device_id) to avoid an empty CoreRangeSet when
+                # intersecting x.shard_spec().grid with subdevice_cores.
+                sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+            )
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
             # select the bias tensor based on the number of tiles in the rows
@@ -1203,17 +1244,45 @@ class Attention(LightweightModule):
                     _ws_a7_dump_save("11d_all_gather_output", all_gather_output)
                 # WS-A.14 H3: optional Wo matmul precision lift (env-gated).
                 _wo_kernel_cfg = _ws_a14_wo_kernel_cfg(self.li_o_decode_compute_kernel_cfg)
-                dense_out_sharded = ttnn.linear(
-                    all_gather_output,
-                    self.wo_sharded_ring if self.prefetcher is not None else self.wo,
-                    memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
-                    program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
-                    compute_kernel_config=_wo_kernel_cfg,
-                    global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                    # dense_out ring-gather matmul: all_gather_output is sharded on receiver cores,
-                    # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
-                    sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
-                )
+                # SGLANG_TT_PREFETCHER_SKIP_WO ablation: keep all upstream
+                # mem_configs / output layout prefetcher-aligned (so downstream
+                # layers don't see a layout change), but bypass the prefetcher
+                # GlobalCB read for the WO weight itself. Construct a ring matmul
+                # program config with `prefetch=False, num_global_cb_receivers=1`
+                # (same trick lm_head.py uses when it opts out of prefetcher).
+                if self.prefetcher is not None and getattr(self, "_skip_wo_prefetcher", False):
+                    _k_wo_skip = self.args.attn_output_dim
+                    _n_wo_skip = self.args.dim // self.args.cluster_shape[1]
+                    _wo_skip_pc = self.args.matmul_1d_ring_config(
+                        1,
+                        32,
+                        _k_wo_skip,
+                        _n_wo_skip,
+                        self.prefetcher.ring_size,
+                        num_global_cb_receivers=1,
+                        prefetch=False,
+                    )
+                    dense_out_sharded = ttnn.linear(
+                        all_gather_output,
+                        self.wo_sharded_ring,
+                        memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
+                        program_config=_wo_skip_pc,
+                        compute_kernel_config=_wo_kernel_cfg,
+                        global_cb=None,
+                        sub_device_id=self.prefetcher.receiver_sub_device_id,
+                    )
+                else:
+                    dense_out_sharded = ttnn.linear(
+                        all_gather_output,
+                        self.wo_sharded_ring if self.prefetcher is not None else self.wo,
+                        memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
+                        program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
+                        compute_kernel_config=_wo_kernel_cfg,
+                        global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+                        # dense_out ring-gather matmul: all_gather_output is sharded on receiver cores,
+                        # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
+                        sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+                    )
                 ttnn.deallocate(all_gather_output)
             ttnn.deallocate(attn_output_cat)
             dense_out_sharded = ttnn.to_memory_config(

@@ -163,7 +163,21 @@ def initialize_sglang_text_transformer(
                 is_prefetcher_supported(hf_config._name_or_path, num_devs, ring_size=rs)
                 for rs in (8, 16, 24, 32, 48, 64, 80)
             ):
-                prefetcher = Prefetcher(submesh, num_tensors=5, num_layers=n_layers)
+                # SGLANG_TT_PREFETCHER_SKIP_WO/SKIP_WQKV/SKIP_W1/SKIP_W3/SKIP_W2:
+                # each excludes one weight from the prefetcher per-layer queue.
+                # Default 5 weights/layer (wqkv, wo, w1, w3, w2).
+                import os as _os_pf
+                _num_pref_tensors = 5
+                for _flag in (
+                    "SGLANG_TT_PREFETCHER_SKIP_WO",
+                    "SGLANG_TT_PREFETCHER_SKIP_WQKV",
+                    "SGLANG_TT_PREFETCHER_SKIP_W1",
+                    "SGLANG_TT_PREFETCHER_SKIP_W3",
+                    "SGLANG_TT_PREFETCHER_SKIP_W2",
+                ):
+                    if _os_pf.environ.get(_flag, "0") == "1":
+                        _num_pref_tensors -= 1
+                prefetcher = Prefetcher(submesh, num_tensors=_num_pref_tensors, num_layers=n_layers)
         prefetchers.append(prefetcher)
         model_args_i = ModelArgs(
             submesh,

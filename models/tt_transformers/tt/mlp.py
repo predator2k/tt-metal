@@ -107,13 +107,28 @@ class MLP(LightweightModule):
 
         # Insert the tensors into the prefetcher if it is used
         if self.prefetcher is not None:
+            # SGLANG_TT_PREFETCHER_SKIP_W1/_W3/_W2: skip individual MLP weights
+            # from the prefetcher's per-layer queue. Bug-narrowing ablation:
+            # combined with SKIP_WO/SKIP_WQKV, we can isolate the corruption
+            # source weight or dtype (BFP4 vs BFP8).
+            import os as _os_mlp
+            self._skip_w1 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W1", "0") == "1"
+            self._skip_w3 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W3", "0") == "1"
+            self._skip_w2 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W2", "0") == "1"
 
             def register_weights():
-                self.prefetcher.insert_tensor(self.w1)
-                self.prefetcher.insert_tensor(self.w3)
-                self.prefetcher.insert_tensor(self.w2)
+                if not self._skip_w1:
+                    self.prefetcher.insert_tensor(self.w1)
+                if not self._skip_w3:
+                    self.prefetcher.insert_tensor(self.w3)
+                if not self._skip_w2:
+                    self.prefetcher.insert_tensor(self.w2)
 
             self.prefetcher.register_callback(register_weights)
+        else:
+            self._skip_w1 = False
+            self._skip_w3 = False
+            self._skip_w2 = False
 
     def forward(self, x: ttnn.Tensor, mode: Mode) -> ttnn.Tensor:
         """
@@ -142,15 +157,37 @@ class MLP(LightweightModule):
         pc_2 = self.args.get_mlp_ff2_prg_config(mode, seq_len, self.prefetcher)
         pc_3 = self.args.get_mlp_ff1_3_prg_config(mode, seq_len, self.prefetcher)
 
+        # SGLANG_TT_PREFETCHER_SKIP_W{1,3} ablation: when a weight is excluded
+        # from the prefetcher queue, the matmul reads its DRAM-sharded weight
+        # directly (no GlobalCB read) using a prefetch=False ring program
+        # config (same pattern as lm_head.py / SKIP_WO).
+        if self.prefetcher is not None and mode == Mode.DECODE and (
+            getattr(self, "_skip_w1", False) or getattr(self, "_skip_w3", False)
+        ):
+            _pc_w13_skip = self.args.matmul_1d_ring_config(
+                1,
+                32,
+                self.args.dim,
+                self.args.hidden_dim // self.args.cluster_shape[1],
+                self.prefetcher.ring_size,
+                num_global_cb_receivers=1,
+                prefetch=False,
+            )
+        else:
+            _pc_w13_skip = None
+
+        _w1_use_skip = self.prefetcher is not None and mode == Mode.DECODE and getattr(self, "_skip_w1", False)
+        _w3_use_skip = self.prefetcher is not None and mode == Mode.DECODE and getattr(self, "_skip_w3", False)
+
         w1_out = ttnn.linear(
             x,
             self.w1,
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
-            program_config=pc_1,
+            program_config=_pc_w13_skip if _w1_use_skip else pc_1,
             memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
-            global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
+            global_cb=None if _w1_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
             sub_device_id=self.prefetcher.receiver_sub_device_id
             if self.prefetcher is not None and mode == Mode.DECODE
             else None,
@@ -161,9 +198,9 @@ class MLP(LightweightModule):
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
-            program_config=pc_3,
+            program_config=_pc_w13_skip if _w3_use_skip else pc_3,
             memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
-            global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
+            global_cb=None if _w3_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
             sub_device_id=self.prefetcher.receiver_sub_device_id
             if self.prefetcher is not None and mode == Mode.DECODE
             else None,
@@ -280,15 +317,28 @@ class MLP(LightweightModule):
                 config=pc_2,
             )
         else:
+            _w2_use_skip = self.prefetcher is not None and mode == Mode.DECODE and getattr(self, "_skip_w2", False)
+            if _w2_use_skip:
+                _pc_w2_skip = self.args.matmul_1d_ring_config(
+                    1,
+                    32,
+                    self.args.hidden_dim // self.args.cluster_shape[1],
+                    self.args.dim,
+                    self.prefetcher.ring_size,
+                    num_global_cb_receivers=1,
+                    prefetch=False,
+                )
+            else:
+                _pc_w2_skip = None
             w2_out = ttnn.linear(
                 w2_in,
                 self.w2,
                 compute_kernel_config=li_ff2_compute_kernel_cfg,
                 dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
-                program_config=pc_2,
+                program_config=_pc_w2_skip if _w2_use_skip else pc_2,
                 memory_config=self.args.get_mlp_ff2_mem_config(mode, self.prefetcher),
                 core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
-                global_cb=self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None,
+                global_cb=None if _w2_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
                 sub_device_id=self.prefetcher.receiver_sub_device_id
                 if self.prefetcher is not None and mode == Mode.DECODE
                 else None,
