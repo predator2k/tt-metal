@@ -985,10 +985,16 @@ class LinearAttentionBlock(LightweightModule):
         )
         ttnn.deallocate(qkv_post)
 
+        # WS-A.20: GQA-style head grouping for Qwen3.5-9B (num_k_heads=16,
+        # num_v_heads=32 → group=2). Each K/Q head feeds ``group`` V-heads;
+        # we replicate per-K-head Q/K along the head axis via
+        # ``ttnn.repeat_interleave`` so the per-V-head SSM matmuls in steps
+        # (5)–(6) see a properly-broadcast (Q, K) pair. ``group == 1`` (e.g.
+        # Qwen3.5-0.8B) is the identity path and stays byte-equivalent.
         group = self.num_v_heads // self.num_k_heads
-        assert group == 1, (
-            f"WS-A.17 trace-safe path assumes num_k_heads == num_v_heads "
-            f"(got {self.num_k_heads} vs {self.num_v_heads})."
+        assert group >= 1 and self.num_v_heads == group * self.num_k_heads, (
+            f"WS-A.17 trace-safe path requires num_v_heads to be a positive "
+            f"multiple of num_k_heads (got {self.num_k_heads} vs {self.num_v_heads})."
         )
         q_heads = ttnn.reshape(q_slice, [1, 1, B * self.num_k_heads, self.head_k_dim])
         k_heads = ttnn.reshape(k_slice, [1, 1, B * self.num_k_heads, self.head_k_dim])
@@ -1001,6 +1007,16 @@ class LinearAttentionBlock(LightweightModule):
         k_normed = self._tt_l2_norm_scale(k_heads, 1.0)
         ttnn.deallocate(q_heads)
         ttnn.deallocate(k_heads)
+
+        # Expand Q/K from num_k_heads to num_v_heads via repeat_interleave on
+        # the head axis (dim=-2). For group=1 this is a no-op identity.
+        if group > 1:
+            q_expanded = ttnn.repeat_interleave(q_normed, group, dim=2)
+            k_expanded = ttnn.repeat_interleave(k_normed, group, dim=2)
+            ttnn.deallocate(q_normed)
+            ttnn.deallocate(k_normed)
+            q_normed = q_expanded
+            k_normed = k_expanded
 
         q_col = ttnn.reshape(q_normed, [1, B * self.num_v_heads, self.head_k_dim, 1])
         k_col = ttnn.reshape(k_normed, [1, B * self.num_v_heads, self.head_k_dim, 1])
@@ -1092,15 +1108,85 @@ class LinearAttentionBlock(LightweightModule):
     # ttnn ↔ host bridge
     # ----------------------------------------------------------------
     def _to_host_replicated(self, x_tt: ttnn.Tensor) -> torch.Tensor:
-        """Materialize a replicated TT tensor onto host CPU as torch.
+        """Materialize a TT tensor onto host CPU as torch ``[B, hidden]``.
 
-        After ``attention_norm`` with all_gather, every device has the same
-        full hidden replica (modulo numerical noise from the gather), so
-        device 0's view IS the full hidden activation. We trim leading
-        singleton dims so callers see ``[B, hidden]``.
+        After ``attention_norm`` the layout differs per (model, mode):
+
+          * Decode + small hidden (e.g. Qwen3.5-0.8B, dim=1024): replicated;
+            every device has the full hidden — device 0's view IS the full
+            activation.
+          * Decode + large hidden (e.g. Qwen3.5-9B-Base, dim=4096): may also
+            arrive replicated on the decode path, in which case device 0 still
+            holds the full hidden.
+          * Prefill + large hidden: arrives width-sharded across the mesh;
+            device 0 only holds ``hidden / num_devices``. WS-A.20 (2026-05-22):
+            we detect the sharded layout by comparing device 0's last dim to
+            ``self.hidden_size`` and concatenate per-device shards along the
+            hidden axis when needed. Identity for the replicated case.
         """
         device_tensors = ttnn.get_device_tensors(x_tt)
-        host = ttnn.to_torch(device_tensors[0])  # typically [1, 1, B, H]
+        host0 = ttnn.to_torch(device_tensors[0])  # typically [1, 1, B, H_local]
+        h_local = host0.shape[-1]
+        # WS-A.20 probe: log layouts so we understand sharding for 9B prefill.
+        import os as _os
+        if _os.environ.get("SGLANG_TT_QWEN35_PROBE_HOST", "0") == "1":
+            try:
+                print(
+                    f"[PROBE-HOST] x_tt.shape={tuple(x_tt.shape)} "
+                    f"mc={x_tt.memory_config()} num_dev={len(device_tensors)} "
+                    f"host0.shape={tuple(host0.shape)} hidden_size={self.hidden_size}",
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[PROBE-HOST] err: {_e}", flush=True)
+        # WS-A.20 prefill fix: 9B's attention_norm on PREFILL returns a
+        # DRAM_INTERLEAVED tensor whose per-device last dim is ``hidden /
+        # num_devices`` because the input residual ``x`` is width-sharded and
+        # the all_gather inside attention_norm only fires for DECODE on the
+        # 1D-mesh, dim<=4096 path (``is_distributed_norm`` returns False
+        # there). For decode the all_gather DOES run → per-device hidden ==
+        # full hidden, identity branch.
+        #
+        # Concretely on 2x P150a + 9B + PREFILL we observe per-device
+        # ``host0.shape == [1, 1, 128, 1024]`` despite ``hidden_size=4096``.
+        # That's ``hidden / (num_devices * 2) == 1024`` — width-shard plus
+        # an additional internal sub-mesh fracture (DRAM banks?). We fall
+        # back to ``ttnn.experimental.all_gather`` directly here on the
+        # 4096-wide axis so we materialize the full hidden.
+        if h_local != self.hidden_size:
+            n_dev = len(device_tensors)
+            if n_dev > 1 and h_local * n_dev == self.hidden_size:
+                host_shards = [host0] + [ttnn.to_torch(t) for t in device_tensors[1:]]
+                host = torch.cat(host_shards, dim=-1)
+            else:
+                # Gather everything device-side first, then to_torch.  Works
+                # for ANY internal fracture as long as the logical hidden
+                # equals self.hidden_size. Topology auto-detected.
+                gathered = ttnn.all_gather(
+                    x_tt,
+                    dim=-1,
+                    num_links=1,
+                    memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                    topology=self.args.ccl_topology(),
+                )
+                host = ttnn.to_torch(ttnn.get_device_tensors(gathered)[0])
+                ttnn.deallocate(gathered)
+                if host.shape[-1] != self.hidden_size:
+                    # Last resort: cycle through all device tensors and concat.
+                    host_shards = [ttnn.to_torch(t) for t in device_tensors]
+                    host_cat = torch.cat(host_shards, dim=-1)
+                    # If still wrong, truncate / pad to expected hidden.  Keep
+                    # the assert so the failure mode is loud rather than silent.
+                    assert host_cat.shape[-1] == self.hidden_size, (
+                        f"[WS-A.20] cannot materialize full hidden: "
+                        f"per_dev={h_local} num_dev={n_dev} "
+                        f"after_all_gather={host.shape[-1]} "
+                        f"per_dev_cat={host_cat.shape[-1]} "
+                        f"expected={self.hidden_size}"
+                    )
+                    host = host_cat
+        else:
+            host = host0
         # Reduce to 2D [B, H]; squeeze only true singletons so we don't
         # eat a batch=1 axis.
         if host.dim() == 4 and host.shape[0] == 1 and host.shape[1] == 1:
@@ -1240,7 +1326,31 @@ class LinearAttentionBlock(LightweightModule):
             # For decode we expect a 1-step per-user batch [B, hidden]; reshape if needed
             if host_hidden.dim() == 1:
                 host_hidden = host_hidden.unsqueeze(0)
-            host_out = self._host_delta_net_step(host_hidden)
+            # WS-A.20: PREFILL must process tokens SEQUENTIALLY with a single
+            # shared per-user state — calling _host_delta_net_step with the
+            # full ``[seq_len, hidden]`` tensor allocates a state of shape
+            # ``[seq_len, HV, V, K]`` (~2 GB per layer for 9B @ seq=1024) and
+            # treats each token as an INDEPENDENT batch row, which is both
+            # OOM-prone AND wrong (rows must depend on prior conv/SSM state).
+            # Fix: iterate over the seq dim one token at a time so the per-
+            # user state (B=1) is reused.
+            if _mode_str == "prefill" and host_hidden.shape[0] > 1:
+                S = host_hidden.shape[0]
+                # Reset persistent state to B=1 so the per-token loop runs on
+                # a single user's rolling state.  conv_state and ssm_state are
+                # re-allocated lazily inside _ensure_state when the batch
+                # dimension changes; clearing them here forces that path.
+                self._conv_state = None
+                self._ssm_state = None
+                out_rows = []
+                for t in range(S):
+                    out_t = self._host_delta_net_step(host_hidden[t:t + 1])
+                    out_rows.append(out_t)
+                host_out = torch.cat(out_rows, dim=0)
+                # Leave the per-user state intact at the END of prefill so the
+                # first decode step picks up where we left off.
+            else:
+                host_out = self._host_delta_net_step(host_hidden)
             attn_out = self._from_host_to_device(host_out, ref_tt=x)
             attn_out = ttnn.to_memory_config(attn_out, skip_mem_cfg)
 

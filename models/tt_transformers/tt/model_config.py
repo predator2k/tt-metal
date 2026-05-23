@@ -207,7 +207,7 @@ class ModelOptimizations:
                     },
                 }
             )
-        elif base_model_name in ["Qwen3.5-0.8B"]:
+        elif base_model_name in ["Qwen3.5-0.8B", "Qwen3.5-9B"]:
             # WS-A.13 Wo precision audit (2026-05-22, REVERT — kept as docs).
             # Hypothesis: lifting Wo BFP8 → BF16 + HIFI4 (mirroring the
             # Qwen2.5-7B preset) would close the per-op `12_post_o_proj`
@@ -612,6 +612,14 @@ class ModelArgs:
         # Real kernels TBD by WS-A; config.json is a verbatim copy of the HF release
         # so _set_hf_params/AutoConfig has something to ingest without network.
         "Qwen3.5-0.8B": "models/tt_transformers/model_params/Qwen3.5-0.8B",
+        # WS-A.20 scale-up: Qwen3.5-9B-Base shares the 0.8B hybrid architecture but with
+        # 4x hidden_size, +8 layers, tied=False (lm_head ships separately), and 2x linear
+        # value heads. config.json is a verbatim copy of the HF release (no overrides).
+        # NOTE: ``get_base_model_name`` regex strips ``-Base``, so the dict key here uses
+        # "Qwen3.5-9B-Base" (path-derived ``model_name``) — LOCAL_HF_PARAMS is keyed by
+        # raw model_name, not base_model_name. Chunk-size + precision tables below use
+        # the stripped "Qwen3.5-9B" form.
+        "Qwen3.5-9B-Base": "models/tt_transformers/model_params/Qwen3.5-9B-Base",
         "Qwen2.5-72B-Instruct": "models/tt_transformers/model_params/Qwen2.5-72B-Instruct",
         "Qwen2.5-32B-Instruct": "models/tt_transformers/model_params/Qwen2.5-32B-Instruct",
         "Meta-Llama-3-8B": "models/tt_transformers/model_params/Meta-Llama-3-8B",
@@ -2574,6 +2582,13 @@ class ModelArgs:
                 # WS-B placeholder. 0.8B is small enough to live single-chip; copy Qwen3-1.7B
                 # chunk sizes for the smoke (will get retuned in Stage 3 once Mamba2 cache fits).
                 "Qwen3.5-0.8B": {"N150": 128, "N300": 128, "T3K": 128, "TG": 128, "P150x4": 128, "P300": 128},
+                # WS-A.20 placeholder. 9B-Base is ~18 GB BF16; mirrors Qwen3-8B chunk sizes
+                # as a safer starting point on memory-constrained per-device DRAM. P300 (=2x P150a)
+                # gets 64 like Qwen3-8B; retune once standalone smoke confirms prefill OOM headroom.
+                # Key uses ``Qwen3.5-9B`` because ``get_base_model_name`` strips the ``-Base`` suffix
+                # (regex ``(.*?\d+[bB])-``); the LOCAL_HF_PARAMS entry above keeps the full path-derived
+                # name so HF_MODEL=/.../Qwen3.5-9B-Base resolves to the model_params dir.
+                "Qwen3.5-9B": {"N150": 4, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128, "P300": 64},
                 "Qwen3-Embedding-8B": {"N150": 4, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128},
                 "Phi-4": {"N150": 4, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128},
                 "Mistral-Small-3.1-24B": {"N150": 8, "N300": 128, "T3K": 128, "TG": 128, "P150x4": 128},
