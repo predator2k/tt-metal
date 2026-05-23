@@ -398,6 +398,105 @@ class ModelOptimizations:
                         OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
                     },
                 })
+            elif _qwen3_mode == "wqkv_bf16":
+                # 2026-05-23 prefetcher partial-BF16 ablation: only lift the
+                # WQKV weights (Q+K+V combined matmul input) to BF16, leaving
+                # FF1/FF3 + FF2 + WO + KV-cache on the baseline BFP8/BFP4.
+                # Hypothesis: if BFP8 shared-exponent misalignment in the
+                # prefetcher's GlobalCB hand-off corrupts only ONE class of
+                # weights (e.g. WQKV due to its triple-fused layout), lifting
+                # JUST that class may both fit memory AND restore correctness.
+                # Op fidelity lifted to HIFI4 on the QKV matmul too so the
+                # BF16 weights aren't silently re-quantized at compute time.
+                logger.info(
+                    f"Model {model_name}: WQKV_BF16 partial-lift preset "
+                    f"(WQKV BF16+HIFI4, everything else BFP8/BFP4 default)"
+                )
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.WQKV: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                    },
+                })
+            elif _qwen3_mode == "wo_bf16":
+                # 2026-05-23 prefetcher partial-BF16 ablation: only lift WO
+                # (attention output projection) to BF16. Hypothesis: WO is the
+                # smallest weight in the prefetcher cycle AND has the most
+                # complex DRAM-prefetcher routing (ring-gather, cross-device
+                # traffic). The prior root-cause doc fingered WO specifically:
+                # "wo_sharded_ring DRAM shard layout — possible transposition
+                # vs what dram_prefetcher writes" (suspect #3 in
+                # tt_qwen3_8b_prefetcher_correctness_2026-05-23.md).
+                logger.info(
+                    f"Model {model_name}: WO_BF16 partial-lift preset "
+                    f"(WO BF16+HIFI4, everything else BFP8/BFP4 default)"
+                )
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.WO: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                    },
+                })
+            elif _qwen3_mode == "mlp_bf16":
+                # 2026-05-23 prefetcher partial-BF16 ablation: lift only the
+                # MLP weights (FF1, FF3, FF2) to BF16; leave attention
+                # (WQKV/WO/KV) on BFP8. Hypothesis: MLP weights are by far
+                # the largest in the prefetcher cycle (2× the attention
+                # weights) so if the corruption is dominant in MLP, lifting
+                # only MLP may close the GSM8K gap. Op fidelity HIFI4 on both
+                # FF1/FF3 and FF2 matmuls. Note: this lifts BFP4 default
+                # straight to BF16 (skipping the BFP8 intermediate) because
+                # BFP4 is even more prone to shared-exponent corruption than
+                # BFP8.
+                logger.info(
+                    f"Model {model_name}: MLP_BF16 partial-lift preset "
+                    f"(FF1/FF3 + FF2 BF16+HIFI4, attention BFP8 default)"
+                )
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.FF1_FF3: PrecisionSetting.BF16,
+                        TensorGroup.FF2: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_FF1_FF3: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_FF2: MathFidelitySetting.HIFI4,
+                    },
+                })
+            elif _qwen3_mode == "attn_bf16":
+                # 2026-05-23 prefetcher partial-BF16 ablation: lift the entire
+                # attention surface (WQKV + WO) to BF16; leave MLP
+                # (FF1/FF3/FF2) and KV cache on BFP8/BFP4 default.
+                # This is the complement of mlp_bf16 — if mlp_bf16 fails and
+                # attn_bf16 passes, the corruption lives in attention weights;
+                # vice versa. Note: q_norm/k_norm are NOT in the TensorGroup
+                # enum (RMSNorm weights live on a separate path that doesn't
+                # go through the prefetcher GlobalCB) so this preset CANNOT
+                # touch them — they stay at whatever the RMSNorm default is.
+                logger.info(
+                    f"Model {model_name}: ATTN_BF16 partial-lift preset "
+                    f"(WQKV + WO BF16+HIFI4, MLP BFP8/BFP4 default, "
+                    f"KV-cache BFP8, q_norm/k_norm unaffected)"
+                )
+                inst = cls({
+                    "TensorPrecision": {
+                        TensorGroup.WQKV: PrecisionSetting.BF16,
+                        TensorGroup.WO: PrecisionSetting.BF16,
+                    },
+                    "OpFidelity": {
+                        OpGroup.LI_QKV_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_QKV_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.SDPA_PREFILL: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_DECODE: MathFidelitySetting.HIFI4,
+                        OpGroup.LI_O_PREFILL: MathFidelitySetting.HIFI4,
+                    },
+                })
             else:
                 logger.info(f"Model {model_name}: BFP4 MLP + HIFI2 fidelity (balanced)")
                 inst = cls({

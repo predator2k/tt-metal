@@ -731,7 +731,21 @@ class Prefetcher(LightweightModule):
         h_tiles_padded = math.ceil(h_tiles / self.ring_size) * self.ring_size
         w_tiles_padded = math.ceil(w_tiles / self.ring_size) * self.ring_size
         max_tensor_tiles = (h_tiles_padded * w_tiles_padded) // self.ring_size
-        self.max_tensor_block_size = max(max_tensor_tiles * bytes_in_tile[tensor.dtype], self.max_tensor_block_size)
+        # 2026-05-23 partial-BF16 fix: the C++ check at
+        # dram_prefetcher_program_factory.cpp:108 computes
+        #   max_tensor_size = max(tile_size_across_tensors) * max(block_tiles_across_tensors)
+        # i.e. it takes the cross-product of the LARGEST tile size and the
+        # LARGEST block-tile count, which may come from DIFFERENT tensors. The
+        # original Python computed only the per-tensor product max, which
+        # under-sizes the GlobalCB when partial-BF16 modes mix BF16 (large
+        # tile) with BFP8 (large block-tile count). Track both maxes
+        # separately and use the cross product to match the C++ sizing.
+        self._max_tile_bytes = max(getattr(self, "_max_tile_bytes", 0), bytes_in_tile[tensor.dtype])
+        self._max_block_tiles = max(getattr(self, "_max_block_tiles", 0), max_tensor_tiles)
+        self.max_tensor_block_size = max(
+            self._max_tile_bytes * self._max_block_tiles,
+            self.max_tensor_block_size,
+        )
         self.prefetched_tensors.append(tensor)
         self.prefetched_tensor_addr.append(tensor.buffer_address())
         logger.info(
