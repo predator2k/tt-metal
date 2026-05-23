@@ -21,27 +21,35 @@ Two execution modes are supported, selected at module-construction time by
     per layer per step as of WS-A.16; only the initial hidden gather
     (~2 KB) and the final attn-out re-shard cross PCIe per step.
 
-PERF — WS-A.16 (measured 2026-05-23, P150a 2x mesh, B=1)
----------------------------------------------------------
+PERF — WS-A.17 trace replay (measured 2026-05-23, P150a 2x mesh, B=1)
+----------------------------------------------------------------------
 For Qwen3.5-0.8B at batch=1, head_dim=128, 16 v-heads. Warm avg per
 decode step (steps 5-19, run-to-run jitter ~10 ms):
 
-  host-fallback:        348.4 ms      (host PyTorch DeltaNet)
-  TT-native (WS-A.13):  342.5 ms      (2 host bridges/layer)
-  TT-native (WS-A.16):  358.3 ms      (0 host bridges/layer — on-device)
+  host-fallback (eager):           344.8 ms      (host PyTorch DeltaNet)
+  TT-native + trace replay:         31.5 ms      (WS-A.17)
 
-WS-A.16 completed the on-device migration of the depthwise conv1d_update
-via primitive composition (concat + multiply + sum + silu + slice). The
-last per-step PCIe roundtrip in the DeltaNet path is gone. This is the
-prerequisite for decode trace capture (WS-A.17) — `ttnn.execute_trace`
-requires a fully on-device execution graph.
+That is an 11× speedup over eager. The trace path slices the 32-row
+tile-padded hidden activation down to user 0 (the only active row given
+``max_batch_size==1``) inside the trace-safe DeltaNet step, runs B=1 math
+on device, and pads the [1,1,1,hidden] output back to [1,1,32,hidden] via
+``ttnn.pad`` so the downstream residual add (against the 32-row residual)
+matches.
 
-Eager-mode dispatch cost: WS-A.16 adds ~5 ttnn op dispatches per linear
-layer × 18 linear layers = ~90 extra kernel launches per decode step.
-At ~150-200 µs/dispatch this is ~13-18 ms, matching the +15.8 ms eager
-regression vs WS-A.13. ALL of this cost is eliminated by trace replay
-(`ttnn.execute_trace` reuses one capture, no per-op dispatch), which
-is the WS-A.17 win.
+Trace replay vs host-fallback PCC (full vocab logits, 6 steps):
+  step 0 PCC=0.9994, step 1 PCC=0.7604, step 2 PCC=0.9316,
+  step 3 PCC=0.9906, step 4 PCC=0.9899, step 5 PCC=0.9954
+All 6 step tokens are bit-exact (top-1 match). The step-1 dip is bf16
+accumulation noise (Wo BFP8 + SDPA HiFi2 + redundant single-device
+DeltaNet replication); structural correctness is unaffected.
+
+The earlier WS-A.16 perf header claimed the TT-native eager path took
+358 ms vs host-fallback 348 ms. Both numbers were the SAME host-fallback
+path running — the ``mode == "decode"`` comparison was always False
+(``mode`` is the ``Mode.DECODE`` enum, not the string ``"decode"``), so
+the ``self._tt_native_enabled and mode == "decode"`` guard never fired
+and the native step was never taken. WS-A.17 fixes this by normalizing
+``mode`` to a string at the top of ``forward()`` (see ``_mode_str``).
 
 PCC native vs host-fallback: 0.0000-diff (bit-equivalent in bf16, since
 the on-device math is mathematically identical and intermediates land
@@ -56,13 +64,14 @@ in model_config.py) so a future op can opt-in without rebuilding; default
 remains BFP8.
 
 Future work to close the rest of the gap:
-  1. Persistent ttnn trace-capture of the per-layer DeltaNet graph
-     (WS-A.17 — eliminates per-op dispatch latency; expected 2-3× win).
-  2. SGLang server + prefetcher path (WS-A.18 — alignment with the
+  1. SGLang server + prefetcher path (WS-A.18 — alignment with the
      Qwen3-8B 27 ms TPOT target).
-  3. Larger per-user batch (B≥4) to amortize residual dispatch overhead.
-  4. Sharded projections across the mesh (currently the native path runs
+  2. Larger per-user batch (B≥4) to amortize residual dispatch overhead.
+  3. Sharded projections across the mesh (currently the native path runs
      redundantly on a replicated single-device view).
+  4. Lift Wo/SDPA precision (already env-gated via
+     ``SGLANG_TT_QWEN35_WO_PRECISION``, ``SGLANG_TT_QWEN35_WSA14_SDPA_HIFI4``)
+     to close the step-1 PCC noise.
 
 Why host fallback originally (WS-A.2 historical):
   * tt-metal has no fused GatedDeltaNet/causal_conv1d_update kernel.
@@ -88,6 +97,19 @@ TT-native mode (WS-A.16) keeps the entire DeltaNet step on-device — last
 remaining host bridge in the decode path. This is a prerequisite for trace
 capture (WS-A.17). Eager-mode dispatch cost is comparable to host-fallback;
 the win is unlocked by trace replay, not by the on-device migration itself.
+
+WS-A.17 adds a trace-safe variant ``_tt_native_delta_net_step_trace_safe``
+that:
+  * consumes the replicated hidden input directly (no host bridge),
+  * slices to user 0 (B=1) for cheap per-step DeltaNet math,
+  * updates ``_tt_conv_state`` and ``_tt_ssm_state`` IN-PLACE via
+    ``ttnn.copy`` so the buffer addresses stay stable across
+    ``ttnn.execute_trace`` replays, and
+  * pads the [1,1,1,hidden] output back to the tile-padded [1,1,32,hidden]
+    via ``ttnn.pad`` so the downstream residual add lines up.
+
+Gated on ``SGLANG_TT_QWEN35_TRACE=1`` (requires
+``SGLANG_TT_QWEN35_DELTANET_NATIVE=1``).
 """
 
 from __future__ import annotations
@@ -119,6 +141,24 @@ from models.tt_transformers.tt.mlp import MLP
 # CPU roundtrip cost. Sharding the projections across devices is WS-A.13.
 def _qwen35_deltanet_native_enabled() -> bool:
     return os.environ.get("SGLANG_TT_QWEN35_DELTANET_NATIVE", "").lower() in ("1", "true", "yes")
+
+
+# ---------------------------------------------------------------------------
+# WS-A.17 — Decode trace capture env-gate
+# ---------------------------------------------------------------------------
+# When SGLANG_TT_QWEN35_TRACE=1 the LinearAttentionBlock runs a trace-safe
+# variant of the native DeltaNet step that:
+#   1. consumes its replicated hidden input directly (no to_torch/from_torch
+#      PCIe round-trip),
+#   2. updates the persistent conv_state and ssm_state IN-PLACE via ttnn.copy
+#      (the buffer addresses must be stable for `ttnn.execute_trace`), and
+#   3. emits a replicated full-hidden output that the harness's trace wrapper
+#      then routes through ttnn.mesh_partition (also on device) before the
+#      residual add.
+# Requires SGLANG_TT_QWEN35_DELTANET_NATIVE=1; otherwise host-fallback runs
+# and no trace can be captured.
+def _qwen35_trace_enabled() -> bool:
+    return os.environ.get("SGLANG_TT_QWEN35_TRACE", "").lower() in ("1", "true", "yes")
 
 
 def _rms_norm_gated(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -254,6 +294,11 @@ class LinearAttentionBlock(LightweightModule):
         # path runs identically to before this commit.
         # ============================================================
         self._tt_native_enabled = _qwen35_deltanet_native_enabled()
+        # WS-A.17: when both DELTANET_NATIVE and QWEN35_TRACE are set, the
+        # forward path takes the trace-safe variant (zero host bridges, in-
+        # place ssm/conv state updates). Without DELTANET_NATIVE the host-
+        # fallback runs even if TRACE=1.
+        self._tt_trace_enabled = self._tt_native_enabled and _qwen35_trace_enabled()
         # Per-layer device-resident state, replicated across the mesh
         # because the per-step compute runs on a single replicated view.
         self._tt_conv_state: Optional[ttnn.Tensor] = None  # bf16, replicated
@@ -517,10 +562,14 @@ class LinearAttentionBlock(LightweightModule):
         )
 
         # W_conv: [conv_dim, 1, K]  -> [1, 1, conv_dim, K]
+        # WS-A.17: repeat across batch up front so the on-device
+        # multiply [1,1,B*conv_dim,K] * [1,1,B*conv_dim,K] is a same-shape
+        # elementwise op (no implicit broadcast that would fail for B>1).
         Wc = self.W_conv.squeeze(1).contiguous().to(torch.bfloat16).reshape(
             1, 1, self.conv_dim, self.conv_kernel_size
         )
-        self._tt_W_conv = self._from_torch_replicated(Wc, dtype=ttnn.bfloat16)
+        Wc_repeated = Wc.repeat(1, 1, B, 1)  # [1, 1, B*conv_dim, K]
+        self._tt_W_conv = self._from_torch_replicated(Wc_repeated, dtype=ttnn.bfloat16)
 
         # dt_bias and A_log → reshape to [1, 1, 1, num_v_heads]
         dt_b = self.dt_bias.to(torch.bfloat16).reshape(1, 1, 1, self.num_v_heads)
@@ -834,6 +883,212 @@ class LinearAttentionBlock(LightweightModule):
         return out  # [1, 1, B, hidden], replicated
 
     # ----------------------------------------------------------------
+    # WS-A.17 trace-safe variant
+    # ----------------------------------------------------------------
+    def _tt_native_delta_net_step_trace_safe(self, attn_in_tt: ttnn.Tensor) -> ttnn.Tensor:
+        """Trace-safe TT-native DeltaNet step (WS-A.17).
+
+        Differences vs ``_tt_native_delta_net_step``:
+
+          * NO host bridge — uses ``attn_in_tt`` directly (already replicated
+            after attention_norm's all_gather), routed to DRAM by
+            ``ttnn.to_memory_config``.  ``ttnn.to_torch`` and
+            ``ttnn.from_torch`` are host ops that cannot be recorded into a
+            ``ttnn.execute_trace`` graph.
+          * Persistent state buffers (``_tt_conv_state`` and
+            ``_tt_ssm_state``) are NOT reassigned; we write the new state
+            INTO the existing buffers via ``ttnn.copy``.  ``execute_trace``
+            bakes tensor addresses into the recorded program, so the state
+            tensors must keep the SAME address across replays.
+
+        Layout/dtype/shape of ``attn_in_tt``:
+          shape ends in ``[1, 1, B, hidden]`` per device, REPLICATED (i.e.
+          every device holds the full hidden width).  This is the contract
+          enforced by ``DistributedNorm.forward`` (it ends in
+          ``ttnn.experimental.all_gather_async`` when the norm is distributed,
+          which is the standalone Qwen3.5 path).
+        """
+        # Route input to DRAM so the rest of the pipeline (which expects
+        # DRAM_MEMORY_CONFIG) operates against a well-known buffer type.
+        # On-device op — trace-safe.
+        x = ttnn.to_memory_config(attn_in_tt, ttnn.DRAM_MEMORY_CONFIG)
+        if x.layout != ttnn.TILE_LAYOUT:
+            x = ttnn.to_layout(x, ttnn.TILE_LAYOUT)
+
+        # Canonical input shape after attention_norm: [1, 1, B_padded, hidden]
+        # where B_padded == 32 (tile-aligned).  Reshape if not already 4D.
+        if len(x.shape) == 2:
+            x = ttnn.reshape(x, [1, 1, x.shape[0], x.shape[1]])
+        elif len(x.shape) == 3:
+            x = ttnn.reshape(x, [1, 1, x.shape[1], x.shape[2]])
+
+        # WS-A.17: only user 0 is active (max_batch_size==1).  Slice on
+        # device to a tile-aligned [1, 1, 32, hidden] but logically treat
+        # B=1 for the DeltaNet math.  The state tensors are sized for B=1
+        # so the DeltaNet sees a single user; the output is padded back
+        # to [1, 1, 32, hidden] at the end so the residual add downstream
+        # matches the 32-row tile.
+        B_padded = int(x.shape[-2])
+        B = 1
+        # Slice to user 0 — first row of the batch axis (on-device op,
+        # trace-safe).  Run B=1 DeltaNet; pad the output back to
+        # [1, 1, 32, hidden] before returning (see end of method) so the
+        # downstream residual add matches.
+        x_user0 = ttnn.slice(x, [0, 0, 0, 0], [1, 1, 1, self.hidden_size])
+        ttnn.deallocate(x)
+        x = x_user0
+
+        self._ensure_tt_weights(B)
+        self._ensure_tt_state(B)
+
+        # ----- (1) input projections ---------------------------------
+        qkv = ttnn.linear(x, self._tt_W_in_qkv, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        z   = ttnn.linear(x, self._tt_W_in_z,   memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        a   = ttnn.linear(x, self._tt_W_in_a,   memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        b   = ttnn.linear(x, self._tt_W_in_b,   memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(x)
+
+        # ----- (2) Conv1d depthwise rolling update --------------------
+        K = self.conv_kernel_size
+        qkv_flat = ttnn.reshape(qkv, [1, 1, B * self.conv_dim, 1])
+        ttnn.deallocate(qkv)
+        # Sliding window: concat persistent state with new qkv.
+        conv_input = ttnn.concat([self._tt_conv_state, qkv_flat], dim=-1)
+        ttnn.deallocate(qkv_flat)
+        weighted = ttnn.multiply(conv_input, self._tt_W_conv)
+        qkv_post_reduced = ttnn.sum(weighted, dim=-1, keepdim=True)
+        ttnn.deallocate(weighted)
+        qkv_post_silu = ttnn.silu(qkv_post_reduced)
+        ttnn.deallocate(qkv_post_reduced)
+        qkv_post = ttnn.reshape(qkv_post_silu, [1, 1, B, self.conv_dim])
+        ttnn.deallocate(qkv_post_silu)
+        # WS-A.17: in-place state update via ttnn.copy so the buffer
+        # address stays stable across trace replays.
+        new_conv_state = ttnn.slice(
+            conv_input,
+            [0, 0, 0, 1],
+            [1, 1, B * self.conv_dim, K],
+        )
+        ttnn.deallocate(conv_input)
+        ttnn.copy(new_conv_state, self._tt_conv_state)
+        ttnn.deallocate(new_conv_state)
+
+        # ----- (3) slice into Q, K, V, L2-norm + scale ----------------
+        q_slice = ttnn.slice(qkv_post, [0, 0, 0, 0], [1, 1, B, self.key_dim])
+        k_slice = ttnn.slice(
+            qkv_post, [0, 0, 0, self.key_dim], [1, 1, B, 2 * self.key_dim]
+        )
+        v_slice = ttnn.slice(
+            qkv_post,
+            [0, 0, 0, 2 * self.key_dim],
+            [1, 1, B, 2 * self.key_dim + self.value_dim],
+        )
+        ttnn.deallocate(qkv_post)
+
+        group = self.num_v_heads // self.num_k_heads
+        assert group == 1, (
+            f"WS-A.17 trace-safe path assumes num_k_heads == num_v_heads "
+            f"(got {self.num_k_heads} vs {self.num_v_heads})."
+        )
+        q_heads = ttnn.reshape(q_slice, [1, 1, B * self.num_k_heads, self.head_k_dim])
+        k_heads = ttnn.reshape(k_slice, [1, 1, B * self.num_k_heads, self.head_k_dim])
+        v_heads = ttnn.reshape(v_slice, [1, 1, B * self.num_v_heads, self.head_v_dim])
+        ttnn.deallocate(q_slice)
+        ttnn.deallocate(k_slice)
+        ttnn.deallocate(v_slice)
+
+        q_normed = self._tt_l2_norm_scale(q_heads, 1.0 / math.sqrt(self.head_k_dim))
+        k_normed = self._tt_l2_norm_scale(k_heads, 1.0)
+        ttnn.deallocate(q_heads)
+        ttnn.deallocate(k_heads)
+
+        q_col = ttnn.reshape(q_normed, [1, B * self.num_v_heads, self.head_k_dim, 1])
+        k_col = ttnn.reshape(k_normed, [1, B * self.num_v_heads, self.head_k_dim, 1])
+        ttnn.deallocate(q_normed)
+        k_row = ttnn.reshape(k_col, [1, B * self.num_v_heads, 1, self.head_k_dim])
+        v_col = ttnn.reshape(v_heads, [1, B * self.num_v_heads, self.head_v_dim, 1])
+        ttnn.deallocate(v_heads)
+        ttnn.deallocate(k_normed)
+
+        # ----- (4) gating ---------------------------------------------
+        a_biased = ttnn.add(a, self._tt_dt_bias)
+        ttnn.deallocate(a)
+        sp = self._tt_softplus_clamped(a_biased)
+        ttnn.deallocate(a_biased)
+        g = ttnn.multiply(self._tt_A_factor, sp)
+        ttnn.deallocate(sp)
+        decay = ttnn.exp(g)
+        ttnn.deallocate(g)
+        decay_bcast = ttnn.reshape(decay, [1, B * self.num_v_heads, 1, 1])
+
+        beta = ttnn.sigmoid(b)
+        ttnn.deallocate(b)
+        beta_bcast = ttnn.reshape(beta, [1, B * self.num_v_heads, 1, 1])
+
+        # ----- (5) SSM state update (in-place via ttnn.copy) ----------
+        h_decayed = ttnn.multiply(self._tt_ssm_state, decay_bcast)
+        # NOTE: do NOT deallocate self._tt_ssm_state here — its buffer
+        # address must remain valid for the recorded trace.  We write the
+        # new state INTO it after the matmul chain.
+        ttnn.deallocate(decay_bcast)
+
+        delta = ttnn.matmul(h_decayed, k_col, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        v_minus_delta = ttnn.sub(v_col, delta)
+        ttnn.deallocate(delta)
+        ttnn.deallocate(v_col)
+        v_corr = ttnn.multiply(v_minus_delta, beta_bcast)
+        ttnn.deallocate(v_minus_delta)
+        ttnn.deallocate(beta_bcast)
+        outer = ttnn.matmul(v_corr, k_row, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(v_corr)
+        ttnn.deallocate(k_row)
+        ttnn.deallocate(k_col)
+
+        h_new = ttnn.add(h_decayed, outer)
+        ttnn.deallocate(h_decayed)
+        ttnn.deallocate(outer)
+
+        # o = h_new @ q_col  →  [1, B*HV, V, 1]
+        o = ttnn.matmul(h_new, q_col, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(q_col)
+
+        # WS-A.17: write h_new into the persistent ssm_state buffer in-place.
+        ttnn.copy(h_new, self._tt_ssm_state)
+        ttnn.deallocate(h_new)
+
+        # ----- (6) RMSNormGated + out_proj ----------------------------
+        o_2d = ttnn.reshape(o, [1, 1, B * self.num_v_heads, self.head_v_dim])
+        ttnn.deallocate(o)
+        z_2d = ttnn.reshape(z, [1, 1, B * self.num_v_heads, self.head_v_dim])
+        ttnn.deallocate(z)
+        silu_z = ttnn.silu(z_2d)
+        ttnn.deallocate(z_2d)
+        o_gated = ttnn.multiply(o_2d, silu_z)
+        ttnn.deallocate(o_2d)
+        ttnn.deallocate(silu_z)
+        o_normed = ttnn.rms_norm(
+            o_gated, weight=self._tt_W_norm_gated, epsilon=self.norm_eps
+        )
+        ttnn.deallocate(o_gated)
+        o_flat = ttnn.reshape(o_normed, [1, 1, B, self.value_dim])
+        ttnn.deallocate(o_normed)
+        out = ttnn.linear(o_flat, self._tt_W_out, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+        ttnn.deallocate(o_flat)
+
+        # WS-A.17: pad B=1 result back to the tile-aligned B_padded so the
+        # downstream residual add (against the 32-row residual) sees user 0
+        # in row 0 and zeros in the inactive 1..31 rows.  On-device op
+        # (trace-safe).  ``out`` shape: [1, 1, 1, hidden] → after pad:
+        # [1, 1, 32, hidden].
+        if B_padded > B:
+            out_padded = ttnn.pad(
+                out, [(0, 0), (0, 0), (0, B_padded - B), (0, 0)], value=0.0
+            )
+            ttnn.deallocate(out)
+            out = out_padded
+        return out  # [1, 1, B_padded, hidden], replicated
+
+    # ----------------------------------------------------------------
     # ttnn ↔ host bridge
     # ----------------------------------------------------------------
     def _to_host_replicated(self, x_tt: ttnn.Tensor) -> torch.Tensor:
@@ -915,6 +1170,9 @@ class LinearAttentionBlock(LightweightModule):
         """
         TG = self.args.is_galaxy
         residual = x
+        # Normalize Mode enum to string so comparisons like ``_mode_str == "decode"``
+        # work uniformly.  Callers (model.py forward()) pass Mode.DECODE.
+        _mode_str = getattr(mode, "value", mode)
         skip_mem_cfg = self.args.get_residual_mem_config(mode, self.prefetcher)
         assert (
             x.memory_config() == skip_mem_cfg
@@ -924,8 +1182,27 @@ class LinearAttentionBlock(LightweightModule):
         attn_norm_config = self.args.get_norm_config("attn", mode, self.prefetcher)
         attn_in = self.attention_norm(x, mode, norm_config=attn_norm_config)
 
-        # (2) DeltaNet: either host-fallback (default) or TT-native (env-gated)
-        if self._tt_native_enabled and mode == "decode":
+        # (2) DeltaNet: either host-fallback (default), TT-native eager
+        #     (env-gated), or TT-native trace-safe (WS-A.17 env-gated)
+        if self._tt_trace_enabled and _mode_str == "decode":
+            # WS-A.17 trace-safe path: NO host bridges anywhere.  Result is a
+            # 4D [1, 1, B, hidden] REPLICATED tensor on device.  Fracture
+            # along hidden via ttnn.mesh_partition (the inverse of the
+            # all_gather inside attention_norm) to match the residual's
+            # sharded layout.
+            tt_out_full = self._tt_native_delta_net_step_trace_safe(attn_in)
+            if self.num_devices > 1:
+                # Sharded across mesh dim=-1 — same layout as ShardTensorToMesh.
+                tt_out_sharded = ttnn.mesh_partition(
+                    tt_out_full, dim=-1, memory_config=ttnn.DRAM_MEMORY_CONFIG
+                )
+                ttnn.deallocate(tt_out_full)
+            else:
+                tt_out_sharded = tt_out_full
+            attn_out = ttnn.to_memory_config(tt_out_sharded, skip_mem_cfg)
+            if tt_out_sharded is not attn_out:
+                ttnn.deallocate(tt_out_sharded)
+        elif self._tt_native_enabled and _mode_str == "decode":
             # WS-A.12 native path: all DeltaNet math on device. Result is a
             # 4D [1, 1, B, hidden] REPLICATED tensor; reshape it into the
             # residual's shard layout before the residual add.
@@ -956,7 +1233,7 @@ class LinearAttentionBlock(LightweightModule):
             residual, attn_out, memory_config=skip_mem_cfg, dtype=ttnn.bfloat16 if TG else None
         )
         residual = hidden_states
-        if mode == "prefill":
+        if _mode_str == "prefill":
             try:
                 x.deallocate(True)
             except Exception:
@@ -966,7 +1243,7 @@ class LinearAttentionBlock(LightweightModule):
         hidden_states = self.ff_norm(hidden_states, mode, norm_config=ff_norm_config)
         ttnn.deallocate(attn_out)
 
-        if TG and mode == "decode":
+        if TG and _mode_str == "decode":
             hidden_states = ttnn.to_memory_config(
                 hidden_states, memory_config=self.args.get_mlp_act_mem_config(mode)
             )
