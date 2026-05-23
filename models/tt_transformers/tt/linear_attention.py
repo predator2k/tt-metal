@@ -1184,6 +1184,22 @@ class LinearAttentionBlock(LightweightModule):
 
         # (2) DeltaNet: either host-fallback (default), TT-native eager
         #     (env-gated), or TT-native trace-safe (WS-A.17 env-gated)
+        # WS-A.19 one-shot log: tag which path actually fires per layer.
+        if os.environ.get("SGLANG_TT_WSA19_TIMING", "0") == "1" and not getattr(self, "_wsa19_path_logged", False):
+            if self._tt_trace_enabled and _mode_str == "decode":
+                _path_tag = "trace_safe"
+            elif self._tt_native_enabled and _mode_str == "decode":
+                _path_tag = "native_eager"
+            elif _mode_str == "decode":
+                _path_tag = "HOST_FALLBACK"
+            else:
+                _path_tag = f"non_decode({_mode_str})"
+            from loguru import logger as _wsa19_logger
+            _wsa19_logger.info(
+                f"[WSA19] LinearAttention layer={self.layer_num} mode={_mode_str} "
+                f"path={_path_tag} tt_trace={self._tt_trace_enabled} "
+                f"tt_native={self._tt_native_enabled}")
+            self._wsa19_path_logged = True
         if self._tt_trace_enabled and _mode_str == "decode":
             # WS-A.17 trace-safe path: NO host bridges anywhere.  Result is a
             # 4D [1, 1, B, hidden] REPLICATED tensor on device.  Fracture

@@ -1607,6 +1607,14 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
 
         # The trace is different depending on whether we are doing device sampling or not
         if not self.trace_ids_decode[sampling_on_device]:
+            # WS-A.19: count decode-trace captures across the server's lifetime.
+            # Expect 1 (or 2 if sampling_on_device flips). A monotonically-rising
+            # counter would indicate per-request re-capture (suspect #3).
+            self._wsa19_capture_ct = getattr(self, "_wsa19_capture_ct", 0) + 1
+            if os.environ.get("SGLANG_TT_WSA19_TIMING", "0") == "1":
+                logger.info(f"[WSA19] decode trace capture #{self._wsa19_capture_ct} "
+                            f"(sampling_on_device={sampling_on_device}, "
+                            f"reset_batch={reset_batch})")
             trace_ids, tt_out_trace, *device_inputs = self._capture_decode_trace_text(
                 tokens, current_pos, page_table=page_table, kv_cache=kv_cache, sampling_on_device=sampling_on_device
             )
