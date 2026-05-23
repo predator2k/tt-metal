@@ -1510,6 +1510,37 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             kv_cache=kv_cache,
             sampling_on_device=sampling_on_device,
         )
+        # Tenstorrent-p1 (Prefetcher warmup, 2026-05-23): optional second eager
+        # forward pass BEFORE trace capture.  Hypothesis: on the first decode call
+        # with the DRAM prefetcher active, the producer kernel (ttnn.dram_prefetcher
+        # launched inside forward via prefetcher.run()) is async with respect to
+        # consumer matmul dispatch; the consumer reads from the GlobalCB while the
+        # producer is still loading its first page set, producing routed-but-wrong
+        # data (observed as NaN logits and mode-collapsed outputs under
+        # SGLANG_TT_USE_PREFETCHER=1).  Adding one extra eager forward call here,
+        # with a sync after, gives the producer one full prime cycle before
+        # trace capture freezes the producer/consumer handshake.  Default OFF —
+        # opt in via SGLANG_TT_PREFETCHER_WARMUP=1.
+        _any_prefetcher = any(getattr(m, "prefetcher", None) is not None for m in self.model)
+        _warmup_n = int(os.environ.get("SGLANG_TT_PREFETCHER_WARMUP", "0"))
+        if _any_prefetcher and _warmup_n > 0:
+            logger.info(
+                f"[PREFETCHER-WARMUP] SGLANG_TT_PREFETCHER_WARMUP={_warmup_n}: running "
+                f"{_warmup_n} extra eager decode forward(s) to prime GlobalCB before trace capture"
+            )
+            for _w in range(_warmup_n):
+                for i in range(self.data_parallel):
+                    ttnn.synchronize_device(self.model_args[i].mesh_device)
+                self._decode_forward_no_trace_text(
+                    tokens,
+                    current_pos,
+                    page_table=page_table,
+                    kv_cache=kv_cache,
+                    sampling_on_device=sampling_on_device,
+                )
+                for i in range(self.data_parallel):
+                    ttnn.synchronize_device(self.model_args[i].mesh_device)
+            logger.info(f"[PREFETCHER-WARMUP] {_warmup_n} extra eager decode(s) complete and synced")
         # Tenstorrent-p1 (Layer 15): synchronize before trace capture.
         # With the DRAM prefetcher active (3-sub-device DECODE manager), the compile
         # run dispatches sender (sub_device_0) + compute workers (sub_device_2) programs
