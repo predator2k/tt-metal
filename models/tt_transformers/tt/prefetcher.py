@@ -776,6 +776,21 @@ class Prefetcher(LightweightModule):
         Start prefetching weights into global CB with dram_prefetcher op
         """
         assert self.init_decode_done, "Prefetcher has not been initialized for decode mode. Cannot run prefetcher"
+        # B.7 control test: when ALL SGLANG_TT_PREFETCHER_SKIP_* flags are set,
+        # num_tensors==0 and the prefetcher has nothing to do. Skip both
+        # GlobalCB creation and the dram_prefetcher op so callers' downstream
+        # `stop()` is also a no-op (guarded below). All matmuls in this mode
+        # use the `prefetch=False, num_global_cb_receivers=1` ring config
+        # (SKIP_* fallback path), so neither global_cb nor sub_device_id is
+        # actually read by the matmul kernels.
+        if self.num_tensors == 0:
+            if not getattr(self, "_zero_tensor_logged", False):
+                logger.warning(
+                    "[Prefetcher] run(): num_tensors==0 (all SKIP_* flags set); "
+                    "skipping GlobalCB creation and dram_prefetcher op (B.7 control)"
+                )
+                self._zero_tensor_logged = True
+            return
         # Create global cb buffer if it was not yet created.
         if self.global_cb is None:
             self.global_cb_size = self.max_tensor_block_size
@@ -825,6 +840,9 @@ class Prefetcher(LightweightModule):
 
     def stop(self):
         assert self.init_decode_done, "Prefetcher has not been initialized for decode mode. Cannot stop prefetcher"
+        # B.7 control: num_tensors==0 means run() was a no-op; nothing to deallocate.
+        if self.num_tensors == 0:
+            return
         assert self.garbage is not None, "Prefetcher has not been run. Cannot stop prefetcher"
         ttnn.deallocate(self.garbage)
         self.garbage = None
