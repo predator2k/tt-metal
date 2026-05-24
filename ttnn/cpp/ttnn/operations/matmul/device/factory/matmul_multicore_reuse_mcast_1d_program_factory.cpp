@@ -2363,6 +2363,17 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (gcb_advance_env != nullptr && std::string(gcb_advance_env) == "1") {
             mm_kernel_defines["SGLANG_TT_PREFETCHER_BYPASS_GCB_ADVANCE"] = "1";
         }
+        // U12 (LLK srcA/srcB/DST single-shot probe under ENABLE_GLOBAL_CB):
+        // discriminate between "UNPACK reads stale bytes" (srcA/srcB nonzero
+        // despite cb_in1 holding zeros) and "MATH writes garbage from zero
+        // inputs" (DST nonzero after matmul of zeros).  Single-shot, on the
+        // first batch/block/subblock/inner-dim iteration only.  Only applied
+        // on the gathered (use_global_cb) path so canonical matmuls are
+        // untouched.
+        const char* llk_probe_env = std::getenv("SGLANG_TT_PREFETCHER_LLK_PROBE");
+        if (llk_probe_env != nullptr && std::string(llk_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_LLK_PROBE"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {

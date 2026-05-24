@@ -14,6 +14,31 @@
 #include "bmm_fused_activation.hpp"
 #endif
 
+#ifdef SGLANG_TT_PREFETCHER_LLK_PROBE
+// U12: LLK srcA/srcB/DST single-shot probe.  Loaded only when the env-gated
+// SGLANG_TT_PREFETCHER_LLK_PROBE compile-time define is propagated by the
+// program factory (gated by the SGLANG_TT_PREFETCHER_LLK_PROBE environment
+// variable, only on the gathered/use_global_cb path so canonical builds are
+// untouched).
+//
+// The probe is designed to discriminate between:
+//   (a) UNPACK reading non-zero bytes into srcA/srcB despite cb_in1 holding
+//       zeros (per S10 / Lead 3 byte-level verification + U11 zero-weight
+//       injection); and
+//   (b) MATH/FPU producing non-zero DST values from zero srcA/srcB inputs
+//       (i.e. MOP-buffer / FPU-register contamination).
+//
+// All probe statements are wrapped in MATH(...) / UNPACK(...) so each thread
+// only sees the statements meant for it.  A static gate ensures the probe
+// fires at most once per kernel ELF launch.  After printing, an infinite
+// busy-wait keeps the kernel halted so the dprint server flushes the log
+// before the device gets cleaned up.
+#include "api/debug/dprint.h"
+#include "api/debug/dprint_tensix.h"
+#include "api/debug/dprint_tensix_unpack.h"
+#include "api/debug/dprint_tensix_pack.h"
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -424,6 +449,52 @@ void kernel_main() {
                             out_subblock_w,
                             out_subblock_h,
                             in0_block_w);
+#ifdef SGLANG_TT_PREFETCHER_LLK_PROBE
+                        // U12 v2 less-intrusive probe:
+                        //
+                        // v1 (first run) confirmed: on the FIRST iteration of the FIRST
+                        // gathered ELF, srcA = srcB = DST = 0 (zero weights work correctly
+                        // through MATH).  But U11 still shows 2e19 logits, so the bug must
+                        // be in: a LATER iteration of the same ELF; a DIFFERENT ELF; or
+                        // downstream of the matmul (PACK / mm_out_cb).  This v2 probe widens
+                        // the gate to capture more iterations / blocks / subblocks and only
+                        // prints the FIRST 4 BF16 words of DST face 0 row 0 (no full tile
+                        // dump, no srcA/srcB destructive read).  Each core fires a fixed
+                        // budget per ELF (u12_v2_budget) so the log stays small.  Probe
+                        // checks all `block` values to find which block first produces a
+                        // non-zero DST under zero inputs.
+                        {
+                            static uint32_t u12_v2_budget = 8;
+                            if (u12_v2_budget > 0 &&
+                                in0_subblock == 0 && in1_subblock == 0 &&
+                                inner_dim_idx == 0) {
+                                u12_v2_budget--;
+                                // Read DST face 0 row 0 (8 dwords = 16 BF16 in Wormhole/BH
+                                // FP16 mode; or 16 floats × packed mantissa in FP32 mode).
+                                // We use dbg_read_dest_acc_row directly, which on Blackhole
+                                // reads from 0xFFBD8000 + (row<<4) via the dest debug bus.
+                                // This does NOT clobber any registers (unlike SRCA read).
+                                MATH((
+                                    {
+                                        uint32_t dst_rd[8];
+                                        ckernel::dbg_get_array_row(
+                                            ckernel::dbg_array_id::DEST, 0, dst_rd);
+                                        DPRINT << "[U12v2 ring=" << ring_idx
+                                               << " b=" << b
+                                               << " blk=" << block
+                                               << " r0=";
+                                        bool any_nonzero = false;
+                                        for (int i = 0; i < 8; ++i) {
+                                            DPRINT << "0x" << HEX() << dst_rd[i] << " ";
+                                            if (dst_rd[i] != 0) any_nonzero = true;
+                                        }
+                                        DPRINT << (any_nonzero ? "NONZERO" : "zero")
+                                               << "]" << ENDL();
+                                    }
+                                ));
+                            }
+                        }
+#endif
                         in0_index++;                  // stride right by 1
                         in1_index += in1_per_core_w;  // to stride down by 1 need to stride by in_per_core_w (should be
                                                       // called in1_block_w)
