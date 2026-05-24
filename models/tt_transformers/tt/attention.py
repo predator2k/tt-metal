@@ -601,6 +601,20 @@ class Attention(LightweightModule):
             import os as _os_pref
             self._skip_wo_prefetcher = _os_pref.environ.get("SGLANG_TT_PREFETCHER_SKIP_WO", "0") == "1"
             self._skip_wqkv_prefetcher = _os_pref.environ.get("SGLANG_TT_PREFETCHER_SKIP_WQKV", "0") == "1"
+            # U3 (2026-05-23): SGLANG_TT_PREFETCHER_PERMUTED_DRAM_GRID=1 places
+            # prefetcher-registered weights on the permuted prefetcher.dram_banks()
+            # grid instead of the contiguous dram_weight_grid. Mirrors the
+            # lm_head `prefetch=False, num_global_cb_receivers=1` placement
+            # (lm_head.py:121). Hypothesis: even though the prefetcher reader
+            # uses bank_id = sender_index (not the worker_y_to_dram_bank
+            # mapping used by the prefetch=False path), the actual placement
+            # of shard i on bank dram_banks()[i] may be what makes the
+            # downstream matmul's ring topology resolve correctly. Empirical
+            # test only — code analysis indicates this should BREAK, not fix,
+            # the contiguous-grid path; hardware will decide.
+            self._permuted_dram_grid = _os_pref.environ.get(
+                "SGLANG_TT_PREFETCHER_PERMUTED_DRAM_GRID", "0"
+            ) == "1"
 
             # Phase-B.8 reroute fix: build SKIP-only ring-layout variants of
             # WQKV / WO. The `prefetch=False, num_global_cb_receivers=1`
@@ -660,18 +674,70 @@ class Attention(LightweightModule):
             else:
                 self.wo_skip_ring = None
 
+            # U3 permuted-DRAM-grid variants for prefetcher path
+            if self._permuted_dram_grid and not self.TG:
+                _wqkv_pdg_mem_config = configuration.create_dram_sharded_mem_config(
+                    configuration.dim,
+                    configuration.qkv_size // configuration.num_devices,
+                    dram_grid=_ring_grid,
+                )
+                self.wqkv_pdg = ttnn.as_tensor(
+                    qkv_cat,
+                    dtype=self.wqkv_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                    memory_config=_wqkv_pdg_mem_config,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(
+                        self.mesh_device,
+                        dims=(3, 2) if self.TG else (2, 3),
+                        mesh_shape=configuration.cluster_shape,
+                    ),
+                    cache_file_name=cache_name("wqkv_pdg") if not configuration.dummy_weights else None,
+                )
+                _wo_shape_pdg = (
+                    self.args.dim // self.args.cluster_shape[0],
+                    self.args.dim // self.args.cluster_shape[1],
+                )
+                _wo_pdg_mem_config = configuration.create_dram_sharded_mem_config(
+                    k=_wo_shape_pdg[0],
+                    n=_wo_shape_pdg[1],
+                    dram_grid=_ring_grid,
+                )
+                self.wo_sharded_ring_pdg = ttnn.as_tensor(
+                    pt_wo,
+                    dtype=self.wo_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                    memory_config=_wo_pdg_mem_config,
+                    mesh_mapper=get_wo_mesh_mapper(),
+                    cache_file_name=cache_name("wo_sharded_ring_pdg") if not configuration.dummy_weights else None,
+                )
+            else:
+                self.wqkv_pdg = None
+                self.wo_sharded_ring_pdg = None
+
             def register_weights():
                 if not self._skip_wqkv_prefetcher:
-                    self.prefetcher.insert_tensor(self.wqkv)
+                    # U3: register the permuted-DRAM-grid variant when enabled
+                    self.prefetcher.insert_tensor(
+                        self.wqkv_pdg if self._permuted_dram_grid and self.wqkv_pdg is not None else self.wqkv
+                    )
                 if not self._skip_wo_prefetcher:
-                    self.prefetcher.insert_tensor(self.wo_sharded_ring)
+                    self.prefetcher.insert_tensor(
+                        self.wo_sharded_ring_pdg
+                        if self._permuted_dram_grid and self.wo_sharded_ring_pdg is not None
+                        else self.wo_sharded_ring
+                    )
 
             self.prefetcher.register_callback(register_weights)
         else:
             self._skip_wo_prefetcher = False
             self._skip_wqkv_prefetcher = False
+            self._permuted_dram_grid = False
             self.wqkv_skip_ring = None
             self.wo_skip_ring = None
+            self.wqkv_pdg = None
+            self.wo_sharded_ring_pdg = None
 
     def init_kv_cache(self, configuration, weight_cache_path):
         """
@@ -918,9 +984,20 @@ class Attention(LightweightModule):
                 sub_device_id=self.prefetcher.receiver_sub_device_id,
             )
         else:
+            # U3: when permuted-DRAM-grid prefetcher path is active, pass the
+            # permuted-grid weight so its buffer_address matches the one the
+            # prefetcher registered (otherwise matmul reads shape from the
+            # contiguous-grid wqkv but the GlobalCB contents reflect the
+            # permuted-grid weights' bytes).
+            _wqkv_for_mm = (
+                self.wqkv_pdg
+                if (self.prefetcher is not None and getattr(self, "_permuted_dram_grid", False)
+                    and getattr(self, "wqkv_pdg", None) is not None)
+                else self.wqkv
+            )
             xqkv_fused_sharded = ttnn.linear(
                 x,
-                self.wqkv,
+                _wqkv_for_mm,
                 memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
                 program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
                 compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
@@ -1332,9 +1409,17 @@ class Attention(LightweightModule):
                         sub_device_id=self.prefetcher.receiver_sub_device_id,
                     )
                 else:
+                    # U3: prefer the permuted-DRAM-grid WO variant when active
+                    _wo_for_mm = (
+                        self.wo_sharded_ring_pdg
+                        if (self.prefetcher is not None
+                            and getattr(self, "_permuted_dram_grid", False)
+                            and getattr(self, "wo_sharded_ring_pdg", None) is not None)
+                        else (self.wo_sharded_ring if self.prefetcher is not None else self.wo)
+                    )
                     dense_out_sharded = ttnn.linear(
                         all_gather_output,
-                        self.wo_sharded_ring if self.prefetcher is not None else self.wo,
+                        _wo_for_mm,
                         memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
                         program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
                         compute_kernel_config=_wo_kernel_cfg,

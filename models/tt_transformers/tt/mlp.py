@@ -115,6 +115,10 @@ class MLP(LightweightModule):
             self._skip_w1 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W1", "0") == "1"
             self._skip_w3 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W3", "0") == "1"
             self._skip_w2 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W2", "0") == "1"
+            # U3 (2026-05-23): permuted-DRAM-grid prefetcher experiment
+            self._permuted_dram_grid = _os_mlp.environ.get(
+                "SGLANG_TT_PREFETCHER_PERMUTED_DRAM_GRID", "0"
+            ) == "1"
 
             # Phase-B.8 reroute fix: the canonical `w1_w3_mem_config` /
             # `w2_mem_config` lay weights out on `dram_weight_grid`
@@ -145,6 +149,28 @@ class MLP(LightweightModule):
                 padded_weight = pad_hidden_dim(raw_weight, dims[0] if args.is_galaxy else dims[-1])
                 torch_tensor = padded_weight.unsqueeze(0).unsqueeze(0)
                 cache = cache_name(f"{name}_skip_ring")
+                return ttnn.as_tensor(
+                    torch_tensor,
+                    dtype=dtype,
+                    device=self.mesh_device,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(
+                        self.mesh_device, dims=dims, mesh_shape=args.cluster_shape
+                    ),
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=_ring_mem_config(k, n),
+                    cache_file_name=cache,
+                )
+
+            def _make_pdg_weight(name, dtype, dims, k, n):
+                # U3: same as _make_skip_ring_weight but with _pdg suffix for
+                # cache separation. The permuted-DRAM-grid placement is the
+                # SAME as the skip_ring path; only the use site differs (we
+                # register THIS for the prefetcher GlobalCB path, not the
+                # SKIP fallback).
+                raw_weight = torch_weight(name[:2])
+                padded_weight = pad_hidden_dim(raw_weight, dims[0] if args.is_galaxy else dims[-1])
+                torch_tensor = padded_weight.unsqueeze(0).unsqueeze(0)
+                cache = cache_name(f"{name}_pdg")
                 return ttnn.as_tensor(
                     torch_tensor,
                     dtype=dtype,
@@ -195,22 +221,51 @@ class MLP(LightweightModule):
                 self.w3_skip_ring = None
                 self.w2_skip_ring = None
 
+            # U3 permuted-DRAM-grid variants (non-galaxy only)
+            if self._permuted_dram_grid and not args.is_galaxy:
+                self.w1_pdg = _make_pdg_weight(
+                    "w1_sharded", ff1_3_dtype, w1_dims,
+                    args.dim, args.hidden_dim // args.num_devices,
+                )
+                self.w3_pdg = _make_pdg_weight(
+                    "w3_sharded", ff1_3_dtype, w1_dims,
+                    args.dim, args.hidden_dim // args.num_devices,
+                )
+                self.w2_pdg = _make_pdg_weight(
+                    "w2_sharded", ff2_dtype, w2_dims,
+                    args.hidden_dim // args.num_devices, args.dim,
+                )
+            else:
+                self.w1_pdg = None
+                self.w3_pdg = None
+                self.w2_pdg = None
+
             def register_weights():
                 if not self._skip_w1:
-                    self.prefetcher.insert_tensor(self.w1)
+                    self.prefetcher.insert_tensor(
+                        self.w1_pdg if self._permuted_dram_grid and self.w1_pdg is not None else self.w1
+                    )
                 if not self._skip_w3:
-                    self.prefetcher.insert_tensor(self.w3)
+                    self.prefetcher.insert_tensor(
+                        self.w3_pdg if self._permuted_dram_grid and self.w3_pdg is not None else self.w3
+                    )
                 if not self._skip_w2:
-                    self.prefetcher.insert_tensor(self.w2)
+                    self.prefetcher.insert_tensor(
+                        self.w2_pdg if self._permuted_dram_grid and self.w2_pdg is not None else self.w2
+                    )
 
             self.prefetcher.register_callback(register_weights)
         else:
             self._skip_w1 = False
             self._skip_w3 = False
             self._skip_w2 = False
+            self._permuted_dram_grid = False
             self.w1_skip_ring = None
             self.w3_skip_ring = None
             self.w2_skip_ring = None
+            self.w1_pdg = None
+            self.w3_pdg = None
+            self.w2_pdg = None
 
     def forward(self, x: ttnn.Tensor, mode: Mode) -> ttnn.Tensor:
         """
@@ -260,10 +315,30 @@ class MLP(LightweightModule):
 
         _w1_use_skip = self.prefetcher is not None and mode == Mode.DECODE and getattr(self, "_skip_w1", False)
         _w3_use_skip = self.prefetcher is not None and mode == Mode.DECODE and getattr(self, "_skip_w3", False)
+        # U3: when permuted-DRAM-grid prefetcher path is active, use the pdg
+        # weight variant for the prefetcher (full-prefetcher GlobalCB) path.
+        _use_pdg = (
+            self.prefetcher is not None and mode == Mode.DECODE
+            and getattr(self, "_permuted_dram_grid", False)
+        )
+
+        def _w1_weight():
+            if _w1_use_skip and getattr(self, "w1_skip_ring", None) is not None:
+                return self.w1_skip_ring
+            if _use_pdg and getattr(self, "w1_pdg", None) is not None:
+                return self.w1_pdg
+            return self.w1
+
+        def _w3_weight():
+            if _w3_use_skip and getattr(self, "w3_skip_ring", None) is not None:
+                return self.w3_skip_ring
+            if _use_pdg and getattr(self, "w3_pdg", None) is not None:
+                return self.w3_pdg
+            return self.w3
 
         w1_out = ttnn.linear(
             x,
-            (self.w1_skip_ring if _w1_use_skip and getattr(self, "w1_skip_ring", None) is not None else self.w1),
+            _w1_weight(),
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
@@ -276,7 +351,7 @@ class MLP(LightweightModule):
         )
         w3_out = ttnn.linear(
             x,
-            (self.w3_skip_ring if _w3_use_skip and getattr(self, "w3_skip_ring", None) is not None else self.w3),
+            _w3_weight(),
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
@@ -412,9 +487,18 @@ class MLP(LightweightModule):
                 )
             else:
                 _pc_w2_skip = None
+            def _w2_weight():
+                if _w2_use_skip and getattr(self, "w2_skip_ring", None) is not None:
+                    return self.w2_skip_ring
+                if (self.prefetcher is not None and mode == Mode.DECODE
+                        and getattr(self, "_permuted_dram_grid", False)
+                        and getattr(self, "w2_pdg", None) is not None):
+                    return self.w2_pdg
+                return self.w2
+
             w2_out = ttnn.linear(
                 w2_in,
-                (self.w2_skip_ring if _w2_use_skip and getattr(self, "w2_skip_ring", None) is not None else self.w2),
+                _w2_weight(),
                 compute_kernel_config=li_ff2_compute_kernel_cfg,
                 dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
                 program_config=_pc_w2_skip if _w2_use_skip else pc_2,
