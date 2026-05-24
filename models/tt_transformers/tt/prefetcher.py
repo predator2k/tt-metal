@@ -71,6 +71,174 @@ def generate_sender_receiver_mapping(num_receivers_per_sender: int = 8) -> dict:
     return mapping
 
 
+def generate_2subdev_safe_sender_receiver_mapping(
+    num_receivers_per_sender: int = 4,
+    max_row: int = 7,
+) -> dict:
+    """
+    U6 — Galaxy-parity 2-sub-device receiver mapping for Blackhole MUX-clamped grid.
+
+    Differs from `generate_mux_safe_sender_receiver_mapping` in one important way:
+    RIGHT-side senders' receivers come exclusively from cols 8-11 (the
+    yaml-declared `receiver_cols.right`) instead of borrowing col 0 to make up
+    `num_receivers_per_sender`. This is the key requirement for the U1 Attack 1
+    galaxy-style 2-sub-device + dummy_receivers fix because:
+
+      - Worker sub-device is constructed as 2 RECTANGLES, one per side
+        (e.g. `(1,0)-(6,7)` left, `(8,0)-(11,7)` right). The matmul factory
+        bbox-rounds each rect's intersection with receivers (`a.shard_spec.grid`)
+        and creates the GlobalCB-attached CB on that bbox; GlobalCB must
+        contain those bbox cores (else `CreateCircularBuffer` TT_FATALs at
+        circular_buffer.cpp:172).
+
+      - If right-side receivers live in col 0 (the previous mapping's hack),
+        they fall OUTSIDE BOTH worker rects, so the worker rect's bbox cannot
+        include them — they can't be reached from either rect's matmul cores
+        without expanding the worker into col 0, which would have to step
+        around the col-0 LEFT-sender rows (i.e. break rectangularity).
+
+    Active sender layout is unchanged (left col 0 / right col 7). Receivers
+    for nrc=4: left {1,2,3,4} at sender rows, right {8,9,10,11} at sender rows.
+
+    Args:
+        num_receivers_per_sender: Number of receiver cores per sender (must be
+            <= 4 for safe right-side col 8-11 placement). Default 4 matches
+            Qwen3-8B / Qwen3-32B prefetcher ring config.
+        max_row: Maximum y coord on the MUX-clamped runtime grid (default 7).
+
+    Returns:
+        dict {(sender_x, sender_y): [(rx, ry), ...]} matching the
+        signature of `generate_mux_safe_sender_receiver_mapping`.
+
+    Constraints (asserted):
+        - num_receivers_per_sender <= 4 (cols 8-11 give exactly 4 right slots)
+        - resulting receiver set must not overlap `dynamic_worker_core_grid`
+          cols {5, 6} (no left/right receivers placed there). Holds by
+          construction for nrc=4: left uses {1,2,3,4}, right uses {8,9,10,11}.
+    """
+    assert num_receivers_per_sender <= 4, (
+        f"2-subdev mapping requires nrc <= 4 (got {num_receivers_per_sender}); "
+        f"right-side cols 8-11 only give 4 slots without leaking into col 5-6 "
+        f"(dynamic_worker_core_grid) or col 0/7 (sender columns)."
+    )
+    cfg = ARCH_CONFIG["blackhole"]
+    left_y = cfg["bank_ordered_y_coords"]["left"]
+    right_y = cfg["bank_ordered_y_coords"]["right"]
+    left_sender_col = cfg["sender_cols"]["left"]
+    right_sender_col = cfg["sender_cols"]["right"]
+
+    valid_left_y = [y for y in left_y if y <= max_row]
+    valid_right_y = [y for y in right_y if y <= max_row]
+    used_y = set(valid_left_y) | set(valid_right_y)
+    available_y = sorted(set(range(max_row + 1)) - used_y)
+
+    remapped_left_y = []
+    for y in left_y:
+        if y <= max_row:
+            remapped_left_y.append(y)
+        elif available_y:
+            replacement = available_y.pop(0)
+            logger.info(
+                f"[Prefetcher 2-subdev] remapping left sender row {y} → {replacement} "
+                f"(grid max row {max_row})"
+            )
+            remapped_left_y.append(replacement)
+        else:
+            logger.warning(
+                f"[Prefetcher 2-subdev] dropping left sender at row {y} (no rows available)"
+            )
+
+    left_senders = [(left_sender_col, r) for r in remapped_left_y]
+    right_senders = [(right_sender_col, r) for r in valid_right_y]
+
+    mapping = {}
+    # Left receivers: cols 1..nrc at sender row
+    for sx, sy in left_senders:
+        mapping[(sx, sy)] = [(x, sy) for x in range(1, num_receivers_per_sender + 1)]
+    # Right receivers: cols 8..(8+nrc-1) at sender row — strictly in the right
+    # worker rect (8,0)-(11,7). No col-0 borrowing => no need for col-0
+    # receivers and the right worker rect is genuinely rectangular.
+    for sx, sy in right_senders:
+        mapping[(sx, sy)] = [(8 + i, sy) for i in range(num_receivers_per_sender)]
+    return mapping
+
+
+def compute_2subdev_dummy_receivers(
+    worker_rect_list,
+    real_receivers_set,
+    real_senders_set,
+):
+    """
+    U6 — Compute galaxy-style dummy_receivers for the 2-sub-device + bbox-shortcut path.
+
+    The matmul factory at `matmul_multicore_reuse_mcast_1d_program_factory.cpp:2024-2038`
+    iterates over `subdevice_cores.ranges()` (= worker_sub_device.ranges()) and, for
+    each rectangular range, takes the BOUNDING BOX of the intersection with
+    `non_idle_cores` (= `a.shard_spec().grid` = active receivers). The resulting
+    `all_cores` (line 2038) is passed to `CreateCircularBuffer(program, all_cores,
+    remote_cb_config, *global_cb)` (line 2157), which TT_FATALs if `all_cores`
+    is not a subset of `global_cb->all_cores()` (circular_buffer.cpp:172).
+
+    To make the bbox-rounded `all_cores` valid, the GlobalCB's `all_cores()` must
+    include every bbox core. This function computes the set difference:
+        dummy_receivers = (bbox(rect ∩ real_receivers) for rect in worker_rects)
+                            - real_receivers
+                            - real_senders
+
+    These dummy cores are added to the GlobalCB's `sender_receiver_mapping` so
+    the membership check passes. They run the matmul reader/writer kernels
+    (kernel launches on `all_cores`), but with empty shards they perform no
+    actual work — same pattern as galaxy.
+
+    Args:
+        worker_rect_list: list[ttnn.CoreRange] — the rectangular pieces of
+            worker_sub_device (each one is bbox-shortcut-eligible if non-1D).
+        real_receivers_set: set[(x, y)] — actual receiver coords (1:1 with
+            tensor shards via sender_receiver_mapping).
+        real_senders_set: set[(x, y)] — actual sender coords (must not be
+            re-registered as dummy receivers; the GlobalCB enforces
+            sender/receiver disjointness at all_cores assembly).
+
+    Returns:
+        list[(x, y)] — dummy receiver coords sorted by (x, y), suitable for
+        wrapping into one or more CoreRangeSets in the GlobalCB mapping.
+    """
+    dummies = set()
+    for rect in worker_rect_list:
+        # Intersect rect with real_receivers
+        rect_recv = set()
+        for x in range(rect.start.x, rect.end.x + 1):
+            for y in range(rect.start.y, rect.end.y + 1):
+                if (x, y) in real_receivers_set:
+                    rect_recv.add((x, y))
+        if not rect_recv:
+            # Empty intersection — bbox-shortcut path is not triggered (the
+            # factory `continue`s on empty intersection, line 2027). No dummies
+            # needed for this rect.
+            continue
+        # bbox of intersection
+        xs = [x for x, _ in rect_recv]
+        ys = [y for _, y in rect_recv]
+        bb_x_min, bb_x_max = min(xs), max(xs)
+        bb_y_min, bb_y_max = min(ys), max(ys)
+        for x in range(bb_x_min, bb_x_max + 1):
+            for y in range(bb_y_min, bb_y_max + 1):
+                c = (x, y)
+                if c in real_receivers_set:
+                    continue
+                if c in real_senders_set:
+                    # Should never happen since senders are in sender_cols
+                    # (0, 7) and the worker rects exclude those cols by
+                    # construction; assert in case of misconfig.
+                    raise AssertionError(
+                        f"dummy_receivers bbox {c} overlaps a real sender — "
+                        f"worker rect {rect.start}-{rect.end} should exclude "
+                        f"sender columns."
+                    )
+                dummies.add(c)
+    return sorted(dummies)
+
+
 def generate_mux_safe_sender_receiver_mapping(
     num_receivers_per_sender: int = 8,
     max_row: int = 7,
@@ -336,7 +504,22 @@ class Prefetcher(LightweightModule):
                 f"(max_row={_mux_max_row}, hw grid {grid.x}x{grid.y})"
             )
 
+        # U6 — env-gated galaxy-parity 2-sub-device path.
+        # SGLANG_TT_PREFETCHER_REAL_2SUBDEV=1 switches the sender/receiver
+        # mapping AND the init() sub-device layout to galaxy's pattern:
+        # rectangular worker_sub_device + dummy_receivers padding the
+        # GlobalCB to cover the matmul bbox. See `init(Mode.DECODE)` and
+        # `run()` below for the matched changes.
+        self._real_2subdev = os.environ.get("SGLANG_TT_PREFETCHER_REAL_2SUBDEV", "0") == "1"
+        if self._real_2subdev:
+            logger.info(
+                "[Prefetcher] U6: SGLANG_TT_PREFETCHER_REAL_2SUBDEV=1 — "
+                "using galaxy-parity 2-sub-device + dummy_receivers layout"
+            )
+
         def _make_mapping(n_recv):
+            if self._real_2subdev and self._mux_clamped:
+                return generate_2subdev_safe_sender_receiver_mapping(n_recv, max_row=_mux_max_row)
             if self._mux_clamped:
                 return generate_mux_safe_sender_receiver_mapping(n_recv, max_row=_mux_max_row)
             return generate_sender_receiver_mapping(n_recv) if n_recv > 3 else None
@@ -554,12 +737,83 @@ class Prefetcher(LightweightModule):
         match mode:
             case Mode.DECODE:
                 self.prefetcher_sub_device = PrefetcherSubDevice(self.mesh_device)
-                sender_set = self.to_core_range_set(self.sender_cores(active=True))
+                # U6: in galaxy-parity 2-sub-device mode we include the
+                # dummy-sender cores (otherwise idle col 0/7 rows) in the
+                # sender_sub_device so the union of (sender ∪ worker)
+                # equals the full compute grid. Without this, ops that
+                # auto-determine sub-device IDs based on a kernel grid
+                # covering compute_with_storage_grid_size (e.g. unsharded
+                # ttnn.rms_norm) TT_FATAL at program.cpp:1808
+                # `num_intersections == num_cores` because the kernel
+                # group spans cores belonging to NO sub-device.
+                # The existing 3-sub-device path covered the full grid via
+                # (sender ∪ receiver ∪ compute_only).
+                sender_cores_list = list(self.sender_cores(active=True))
+                if self._real_2subdev and self.receiver_mapping_override:
+                    # Compute dummy sender candidates = unused col 0/7 rows.
+                    _real_senders_set = {(s.x, s.y) for s in sender_cores_list}
+                    _max_y = max(
+                        (r.end.y for r in self.all_core_range_set.ranges()),
+                        default=7,
+                    )
+                    for col in (0, 7):
+                        for row in range(_max_y + 1):
+                            if (col, row) not in _real_senders_set:
+                                sender_cores_list.append(ttnn.CoreCoord(col, row))
+                sender_set = self.to_core_range_set(sender_cores_list)
                 self.prefetcher_sub_device.add_sub_device(sender_set)
-                # 3-sub-device layout: separate receivers from workers so the
-                # prefetcher CB on receiver cores doesn't clash with model op
-                # L1 allocations (RMSNorm etc.) on compute cores.
-                if self.receiver_mapping_override:
+                # U6 — Galaxy-parity 2-sub-device path with rectangular worker
+                # + dummy_receivers padding the GlobalCB. Bypasses the 3-subdev
+                # carve-out so matmul + downstream CCL both auto-determine
+                # `worker_sub_device_id` (since worker now includes receivers),
+                # eliminating the U1 cross-sub-device dispatch sync gap.
+                if self._real_2subdev and self.receiver_mapping_override:
+                    # Compute real sender/receiver sets (for dummy enumeration).
+                    real_senders_set = {(s.x, s.y) for s in self.sender_cores(active=True)}
+                    real_receivers_set = set()
+                    for r_set in self.receiver_cores(sender_active=None, receiver_active=True):
+                        for cr in r_set.ranges():
+                            for x in range(cr.start.x, cr.end.x + 1):
+                                for y in range(cr.start.y, cr.end.y + 1):
+                                    real_receivers_set.add((x, y))
+                    # Build worker_sub_device as 2 RECTANGLES (galaxy parity).
+                    # Senders live in cols 0 (left) and 7 (right); exclude
+                    # those columns entirely from worker → 2 clean rects.
+                    # _grid_max_y was computed at __init__ as _mux_max_row.
+                    _max_y = max(
+                        (r.end.y for r in self.all_core_range_set.ranges()),
+                        default=7,
+                    )
+                    _max_x = max(
+                        (r.end.x for r in self.all_core_range_set.ranges()),
+                        default=11,
+                    )
+                    left_rect = ttnn.CoreRange(
+                        ttnn.CoreCoord(1, 0), ttnn.CoreCoord(6, _max_y)
+                    )
+                    right_rect = ttnn.CoreRange(
+                        ttnn.CoreCoord(8, 0), ttnn.CoreCoord(_max_x, _max_y)
+                    )
+                    worker_rects = [left_rect, right_rect]
+                    worker_set = ttnn.CoreRangeSet(worker_rects)
+                    # Compute dummy_receivers to pad GlobalCB.
+                    self._dummy_receiver_coords = compute_2subdev_dummy_receivers(
+                        worker_rects, real_receivers_set, real_senders_set,
+                    )
+                    self.prefetcher_sub_device.add_sub_device(worker_set)
+                    # In 2-sub-device layout the worker INCLUDES receivers; so
+                    # receiver_sub_device_id should resolve to worker_sub_device_id.
+                    self._receiver_sub_device_idx = None
+                    # Track for downstream all_worker_cores_range_set queries
+                    # (used by lm_head / distributed_norm etc).
+                    self.all_worker_cores_range_set = worker_set
+                    logger.info(
+                        f"[Prefetcher] U6 2-sub-device layout: "
+                        f"worker_rects={[(r.start, r.end) for r in worker_rects]}, "
+                        f"real_receivers={len(real_receivers_set)}, "
+                        f"dummy_receivers={len(self._dummy_receiver_coords)}"
+                    )
+                elif self.receiver_mapping_override:
                     all_receivers = set()
                     for r_set in self.receiver_cores(sender_active=None, receiver_active=True):
                         for cr in r_set.ranges():
@@ -795,9 +1049,30 @@ class Prefetcher(LightweightModule):
         if self.global_cb is None:
             self.global_cb_size = self.max_tensor_block_size
             logger.info(f"[DRAM Prefetcher] Creating global CB with size: {self.global_cb_size}")
+            # U6 — Galaxy-parity: augment sender_receiver_mapping with
+            # (dummy_sender, dummy_receiver_set) pairs so the GlobalCB's
+            # `all_cores()` covers the matmul factory's bbox-rounded
+            # `all_cores` (line 2038 of matmul_multicore_reuse_mcast_1d_program_factory.cpp).
+            # Dummy senders occupy otherwise-unused rows in the sender
+            # columns; dummy receiver groups partition the per-rect bbox
+            # gaps. Galaxy uses the exact same trick.
+            _mapping = self.sender_receiver_mapping
+            if (
+                self._real_2subdev
+                and getattr(self, "_dummy_receiver_coords", None)
+            ):
+                _dummy_mapping = self._build_dummy_sender_receiver_pairs()
+                if _dummy_mapping:
+                    _mapping = list(self.sender_receiver_mapping) + _dummy_mapping
+                    logger.info(
+                        f"[Prefetcher] U6 GlobalCB augmented with "
+                        f"{len(_dummy_mapping)} dummy senders covering "
+                        f"{sum(s.num_cores() for _, s in _dummy_mapping)} "
+                        f"dummy receiver cores"
+                    )
             self.global_cb = ttnn.create_global_circular_buffer(
                 self.mesh_device,
-                self.sender_receiver_mapping,
+                _mapping,
                 self.global_cb_size,
             )
 
@@ -837,6 +1112,73 @@ class Prefetcher(LightweightModule):
         # Set worker sub device stall group
         self.mesh_device.set_sub_device_stall_group([self.prefetcher_sub_device.sub_devices_id[-1]])
         return
+
+    def _build_dummy_sender_receiver_pairs(self):
+        """
+        U6 — Build (dummy_sender CoreCoord, dummy_receivers CoreRangeSet) pairs
+        to augment the GlobalCB so its `all_cores()` covers the matmul factory
+        bbox.
+
+        Dummy senders occupy otherwise-unused rows in the active sender
+        columns (cols 0 and 7 on Blackhole). They are NOT registered in the
+        active sender mapping → the dram_prefetcher op never assigns them
+        work, but the GlobalCB metadata writer treats them as zero-page
+        senders that simply hold CB config buffer entries.
+
+        Dummy receivers are partitioned into per-sender groups so the
+        zip(dummy_senders, dummy_receiver_groups) gives a valid mapping
+        with no duplicate cores (CB invariant at
+        global_circular_buffer.cpp:56).
+        """
+        if not getattr(self, "_dummy_receiver_coords", None):
+            return []
+        # Real sender cores (in active mapping); never use these as dummies.
+        real_senders_set = {(s.x, s.y) for s in self.sender_cores(active=True)}
+        # Enumerate dummy sender candidates: unused rows in cols 0 and 7,
+        # clamped to the MUX grid (rows 0-7). These cores are NOT receivers
+        # (we constructed the mapping so receivers live in cols 1-4 ∪ 8-11
+        # under SGLANG_TT_PREFETCHER_REAL_2SUBDEV=1).
+        candidates = []
+        _max_y = max(
+            (r.end.y for r in self.all_core_range_set.ranges()),
+            default=7,
+        )
+        for col in (0, 7):
+            for row in range(_max_y + 1):
+                if (col, row) in real_senders_set:
+                    continue
+                # Sanity: must also not be a real receiver. Skip if so.
+                # (Should never trip with the 2-subdev mapping; defensive.)
+                _is_real_receiver = False
+                for r_set in self.receiver_cores(sender_active=None, receiver_active=True):
+                    for cr in r_set.ranges():
+                        if cr.start.x <= col <= cr.end.x and cr.start.y <= row <= cr.end.y:
+                            _is_real_receiver = True
+                            break
+                    if _is_real_receiver:
+                        break
+                if _is_real_receiver:
+                    continue
+                candidates.append(ttnn.CoreCoord(col, row))
+        if not candidates:
+            logger.warning(
+                "[Prefetcher] U6 _build_dummy_sender_receiver_pairs: "
+                "no dummy sender candidates available"
+            )
+            return []
+        # Partition dummy receivers across candidates round-robin (1:N).
+        dummy_groups = [[] for _ in candidates]
+        for i, (x, y) in enumerate(self._dummy_receiver_coords):
+            dummy_groups[i % len(candidates)].append(ttnn.CoreCoord(x, y))
+        pairs = []
+        for sender, recvs in zip(candidates, dummy_groups):
+            if not recvs:
+                continue
+            recv_set = ttnn.CoreRangeSet(
+                [ttnn.CoreRange(c, c) for c in recvs]
+            )
+            pairs.append((sender, recv_set))
+        return pairs
 
     def stop(self):
         assert self.init_decode_done, "Prefetcher has not been initialized for decode mode. Cannot stop prefetcher"
