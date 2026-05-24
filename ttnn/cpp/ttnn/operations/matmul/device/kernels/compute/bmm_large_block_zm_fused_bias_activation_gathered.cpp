@@ -277,11 +277,32 @@ void kernel_main() {
         uint32_t next_in1_block_index;
         uint32_t next_in1_rd_ptr_addr;
 
+    #ifndef SGLANG_TT_PREFETCHER_BYPASS_GCB_INIT
+        // U10 Block A: top-of-batch init — captures the START of THIS matmul's
+        // view into GlobalCB, the ring index, the tensor_split path, and
+        // advances rd_ptr to this core's ring-slot. Bypassing this leaves
+        // rd_ptr wherever the previous matmul's Block D left it; the locals
+        // (in1_rd_ptr_start_addr/in1_tensor_split) stay 0 so Block D's
+        // restore-and-advance will land on the start of CB instead of the
+        // saved start. This bypass intentionally produces wrong outputs IF
+        // the kernel still runs; the key signal is whether the garbage
+        // signature changes class.
         UNPACK((in1_cb_start_addr = get_local_cb_start_addr(in1_cb_id)));
         UNPACK((in1_rd_ptr_start_addr = get_local_cb_rd_ptr(in1_cb_id)));
         UNPACK((curr_in1_block_index = ring_idx));
         UNPACK((in1_tensor_split = is_tensor_split(in1_cb_id, in1_tensor_size_bytes)));
         UNPACK((update_rd_ptr_to_ring_index(in1_cb_id, in1_block_size_bytes, ring_idx, in1_tensor_split)));
+    #else
+        // Even when bypassed, init the locals so Block D doesn't read uninit.
+        // Re-capture start addr but skip the ring-index advance and tensor_split
+        // probe — i.e. force the kernel to assume contiguous (no-split) layout
+        // and to start reading from wherever the CB rd_ptr currently sits.
+        UNPACK((in1_cb_start_addr = get_local_cb_start_addr(in1_cb_id)));
+        UNPACK((in1_rd_ptr_start_addr = get_local_cb_rd_ptr(in1_cb_id)));
+        UNPACK((curr_in1_block_index = ring_idx));
+        // in1_tensor_split stays false (constant) — disables wrap-around in
+        // calculate_next_block_index_and_update_rd_ptr / update_rd_ptr_to_ring_index.
+    #endif
 #endif
         const uint32_t mm_out_cb_id = mm_out_cb_ids[b];
         const uint32_t mm_partials_cb_id = mm_partials_cb_ids[b];
@@ -334,6 +355,11 @@ void kernel_main() {
             input0_cb.wait_front(in0_block_num_tiles);
 
 #ifdef ENABLE_GLOBAL_CB
+    #ifndef SGLANG_TT_PREFETCHER_BYPASS_GCB_BLOCK
+            // U10 Block B: per-block-start — computes next_in1_block_index and
+            // next_in1_rd_ptr_addr that Block C consumes at end of this block.
+            // Bypassing Block B alone would leave the next_* locals uninitialized
+            // for Block C to write — so we also bypass Block C in lockstep.
             UNPACK((calculate_next_block_index_and_update_rd_ptr(
                 in1_cb_id,
                 num_blocks,
@@ -344,6 +370,16 @@ void kernel_main() {
                 in1_tensor_split,
                 &next_in1_block_index,
                 &next_in1_rd_ptr_addr)));
+    #else
+            // Force a trivial linear advance: next = curr + 1; next_rd_ptr = curr + block_size.
+            // No tensor_split wrap, no num_blocks check. Reads only consecutive
+            // blocks starting at the current rd_ptr. This will read past valid
+            // L1 if num_blocks > 1, but isolates whether the wrap arithmetic
+            // is the bug source.
+            UNPACK((next_in1_block_index = curr_in1_block_index + 1));
+            UNPACK((next_in1_rd_ptr_addr =
+                        get_local_cb_rd_ptr(in1_cb_id) + in1_block_size_bytes / L1_ALIGNMENT));
+    #endif
 #endif
 
             int in0_index_subblock_offset = 0;
@@ -482,8 +518,17 @@ void kernel_main() {
                 in1_cb.pop_front(in1_block_num_tiles);
             }
 #ifdef ENABLE_GLOBAL_CB
+    #ifndef SGLANG_TT_PREFETCHER_BYPASS_GCB_BLOCK
+            // U10 Block C: per-block-end — applies the next-block pointer that
+            // Block B calculated. Bypassed in lockstep with Block B (they're a
+            // unit). When bypassed, the CB rd_ptr stays at its current value
+            // for all blocks: the loop will read block 0 repeatedly. Output
+            // will be wrong but in a DIFFERENT class than the baseline garbage
+            // — if THAT signature matches the baseline garbage, the wrap
+            // arithmetic is the source.
             curr_in1_block_index = next_in1_block_index;
             UNPACK((update_local_cb_rd_ptr(in1_cb_id, next_in1_rd_ptr_addr)));
+    #endif
 #endif
         }
 
@@ -491,9 +536,19 @@ void kernel_main() {
         // Release in1
         sync_buf.reserve_back(1);
         sync_buf.push_back(1);
+    #ifndef SGLANG_TT_PREFETCHER_BYPASS_GCB_ADVANCE
+        // U10 Block D: end-of-batch — resets rd_ptr to the saved start of
+        // THIS matmul's view, then advances by ring_size blocks to land on
+        // the NEXT matmul's data in GlobalCB. This is THE inter-matmul
+        // handoff. If bypassed, the next matmul's Block A will capture the
+        // current rd_ptr (which after the inner loop is somewhere mid-tensor
+        // depending on how Block B/C ran) instead of the proper "next tensor"
+        // address. The sync_buf push is NOT bypassed — the next matmul
+        // depends on this sync handshake regardless of rd_ptr semantics.
         UNPACK((update_local_cb_rd_ptr(in1_cb_id, in1_rd_ptr_start_addr)));  // reset rd_ptr back to the initial addr
         UNPACK((update_rd_ptr_to_ring_index(
             in1_cb_id, in1_block_size_bytes, ring_size, in1_tensor_split)));  // update to next tensor addr
+    #endif
 #endif
     }
 }

@@ -2346,6 +2346,23 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (dst_zero_env != nullptr && std::string(dst_zero_env) == "1") {
             mm_kernel_defines["SGLANG_TT_PREFETCHER_DST_ZERO"] = "1";
         }
+        // U10 (prefetcher GlobalCB block-bisect attack): three env-gated defines
+        // that surgically skip each of the 3 GlobalCB-gated code regions in the
+        // gathered compute kernel (Block A init, Block B/C per-block update,
+        // Block D end-of-batch advance). Only applied on the gathered
+        // (use_global_cb) path so canonical matmuls are untouched.
+        const char* gcb_init_env = std::getenv("SGLANG_TT_PREFETCHER_BYPASS_GCB_INIT");
+        if (gcb_init_env != nullptr && std::string(gcb_init_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_BYPASS_GCB_INIT"] = "1";
+        }
+        const char* gcb_block_env = std::getenv("SGLANG_TT_PREFETCHER_BYPASS_GCB_BLOCK");
+        if (gcb_block_env != nullptr && std::string(gcb_block_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_BYPASS_GCB_BLOCK"] = "1";
+        }
+        const char* gcb_advance_env = std::getenv("SGLANG_TT_PREFETCHER_BYPASS_GCB_ADVANCE");
+        if (gcb_advance_env != nullptr && std::string(gcb_advance_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_BYPASS_GCB_ADVANCE"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {
