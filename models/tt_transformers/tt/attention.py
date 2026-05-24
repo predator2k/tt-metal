@@ -602,6 +602,64 @@ class Attention(LightweightModule):
             self._skip_wo_prefetcher = _os_pref.environ.get("SGLANG_TT_PREFETCHER_SKIP_WO", "0") == "1"
             self._skip_wqkv_prefetcher = _os_pref.environ.get("SGLANG_TT_PREFETCHER_SKIP_WQKV", "0") == "1"
 
+            # Phase-B.8 reroute fix: build SKIP-only ring-layout variants of
+            # WQKV / WO. The `prefetch=False, num_global_cb_receivers=1`
+            # ring matmul kernel reads DRAM-sharded weights via the
+            # optimal-DRAM-bank-to-worker mapping (see
+            # matmul_multicore_reuse_mcast_1d_program_factory.cpp:2466+),
+            # expecting shard i on bank `prefetcher.dram_banks()[i]` (a
+            # permuted order, [1,3,2,0,5,7,6,4] on Blackhole). The default
+            # `wqkv_mem_config` / `get_sharded_wo_ring_mem_config` use the
+            # contiguous `dram_weight_grid` — placing shards at the wrong
+            # banks for this kernel, which is what makes the SKIP_* reroute
+            # produce garbage (per Phase B.7 control test).
+            _ring_grid = self.prefetcher.to_core_range_set(self.prefetcher.dram_banks())
+
+            if self._skip_wqkv_prefetcher and not self.TG:
+                _wqkv_skip_mem_config = configuration.create_dram_sharded_mem_config(
+                    configuration.dim,
+                    configuration.qkv_size // configuration.num_devices,
+                    dram_grid=_ring_grid,
+                )
+                self.wqkv_skip_ring = ttnn.as_tensor(
+                    qkv_cat,
+                    dtype=self.wqkv_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                    memory_config=_wqkv_skip_mem_config,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(
+                        self.mesh_device,
+                        dims=(3, 2) if self.TG else (2, 3),
+                        mesh_shape=configuration.cluster_shape,
+                    ),
+                    cache_file_name=cache_name("wqkv_skip_ring") if not configuration.dummy_weights else None,
+                )
+            else:
+                self.wqkv_skip_ring = None
+
+            if self._skip_wo_prefetcher:
+                # Reuse the same pt_wo / get_wo_mesh_mapper from above.
+                _wo_shape_ring = (
+                    self.args.dim // self.args.cluster_shape[0],
+                    self.args.dim // self.args.cluster_shape[1],
+                )
+                _wo_skip_mem_config = configuration.create_dram_sharded_mem_config(
+                    k=_wo_shape_ring[0],
+                    n=_wo_shape_ring[1],
+                    dram_grid=_ring_grid,
+                )
+                self.wo_skip_ring = ttnn.as_tensor(
+                    pt_wo,
+                    dtype=self.wo_dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                    memory_config=_wo_skip_mem_config,
+                    mesh_mapper=get_wo_mesh_mapper(),
+                    cache_file_name=cache_name("wo_skip_ring") if not configuration.dummy_weights else None,
+                )
+            else:
+                self.wo_skip_ring = None
+
             def register_weights():
                 if not self._skip_wqkv_prefetcher:
                     self.prefetcher.insert_tensor(self.wqkv)
@@ -612,6 +670,8 @@ class Attention(LightweightModule):
         else:
             self._skip_wo_prefetcher = False
             self._skip_wqkv_prefetcher = False
+            self.wqkv_skip_ring = None
+            self.wo_skip_ring = None
 
     def init_kv_cache(self, configuration, weight_cache_path):
         """
@@ -849,7 +909,7 @@ class Attention(LightweightModule):
             )
             xqkv_fused_sharded = ttnn.linear(
                 x,
-                self.wqkv,
+                (self.wqkv_skip_ring if getattr(self, "wqkv_skip_ring", None) is not None else self.wqkv),
                 memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
                 program_config=_qkv_skip_pc,
                 compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
@@ -1264,7 +1324,7 @@ class Attention(LightweightModule):
                     )
                     dense_out_sharded = ttnn.linear(
                         all_gather_output,
-                        self.wo_sharded_ring,
+                        (self.wo_skip_ring if getattr(self, "wo_skip_ring", None) is not None else self.wo_sharded_ring),
                         memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
                         program_config=_wo_skip_pc,
                         compute_kernel_config=_wo_kernel_cfg,

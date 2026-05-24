@@ -116,6 +116,85 @@ class MLP(LightweightModule):
             self._skip_w3 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W3", "0") == "1"
             self._skip_w2 = _os_mlp.environ.get("SGLANG_TT_PREFETCHER_SKIP_W2", "0") == "1"
 
+            # Phase-B.8 reroute fix: the canonical `w1_w3_mem_config` /
+            # `w2_mem_config` lay weights out on `dram_weight_grid`
+            # (a contiguous (0,0)-(N-1,0) range). The `prefetch=False,
+            # num_global_cb_receivers=1` ring matmul kernel reads weights via
+            # the optimal-DRAM-bank-to-worker mapping (see
+            # matmul_multicore_reuse_mcast_1d_program_factory.cpp:2466+),
+            # which expects shard i to live on DRAM bank
+            # `prefetcher.dram_banks()[i]` (a permuted order, e.g.
+            # [1,3,2,0,5,7,6,4] on Blackhole). When the SKIP_* fallback
+            # routes a canonical-grid weight through this kernel, shard
+            # ordering is scrambled — producing the "0/10 garbage" we
+            # observed in Phase A/B.1/B.7. Build SKIP-only ring-layout
+            # variants of any SKIP'd weight that mirror lm_head's pattern
+            # (`dram_grid=prefetcher.to_core_range_set(prefetcher.dram_banks())`).
+            # The canonical full-prefetcher path is untouched.
+            def _ring_mem_config(k, n):
+                return args.create_dram_sharded_mem_config(
+                    k=k,
+                    n=n,
+                    dram_grid=self.prefetcher.to_core_range_set(self.prefetcher.dram_banks()),
+                )
+
+            def _make_skip_ring_weight(name, dtype, dims, k, n):
+                # Re-load + transpose like as_sharded_tensor, but with the
+                # prefetcher-bank DRAM grid.
+                raw_weight = torch_weight(name[:2])
+                padded_weight = pad_hidden_dim(raw_weight, dims[0] if args.is_galaxy else dims[-1])
+                torch_tensor = padded_weight.unsqueeze(0).unsqueeze(0)
+                cache = cache_name(f"{name}_skip_ring")
+                return ttnn.as_tensor(
+                    torch_tensor,
+                    dtype=dtype,
+                    device=self.mesh_device,
+                    mesh_mapper=ttnn.ShardTensor2dMesh(
+                        self.mesh_device, dims=dims, mesh_shape=args.cluster_shape
+                    ),
+                    layout=ttnn.TILE_LAYOUT,
+                    memory_config=_ring_mem_config(k, n),
+                    cache_file_name=cache,
+                )
+
+            if not args.is_galaxy:
+                if self._skip_w1:
+                    self.w1_skip_ring = _make_skip_ring_weight(
+                        "w1_sharded",
+                        ff1_3_dtype,
+                        w1_dims,
+                        args.dim,
+                        args.hidden_dim // args.num_devices,
+                    )
+                else:
+                    self.w1_skip_ring = None
+                if self._skip_w3:
+                    self.w3_skip_ring = _make_skip_ring_weight(
+                        "w3_sharded",
+                        ff1_3_dtype,
+                        w1_dims,
+                        args.dim,
+                        args.hidden_dim // args.num_devices,
+                    )
+                else:
+                    self.w3_skip_ring = None
+                if self._skip_w2:
+                    self.w2_skip_ring = _make_skip_ring_weight(
+                        "w2_sharded",
+                        ff2_dtype,
+                        w2_dims,
+                        args.hidden_dim // args.num_devices,
+                        args.dim,
+                    )
+                else:
+                    self.w2_skip_ring = None
+            else:
+                # Galaxy path: existing default keeps working since SKIP_*
+                # is not validated for Galaxy in Phase B.
+                self.w1_skip_ring = None
+                self.w3_skip_ring = None
+                self.w2_skip_ring = None
+
             def register_weights():
                 if not self._skip_w1:
                     self.prefetcher.insert_tensor(self.w1)
@@ -129,6 +208,9 @@ class MLP(LightweightModule):
             self._skip_w1 = False
             self._skip_w3 = False
             self._skip_w2 = False
+            self.w1_skip_ring = None
+            self.w3_skip_ring = None
+            self.w2_skip_ring = None
 
     def forward(self, x: ttnn.Tensor, mode: Mode) -> ttnn.Tensor:
         """
@@ -181,7 +263,7 @@ class MLP(LightweightModule):
 
         w1_out = ttnn.linear(
             x,
-            self.w1,
+            (self.w1_skip_ring if _w1_use_skip and getattr(self, "w1_skip_ring", None) is not None else self.w1),
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
@@ -194,7 +276,7 @@ class MLP(LightweightModule):
         )
         w3_out = ttnn.linear(
             x,
-            self.w3,
+            (self.w3_skip_ring if _w3_use_skip and getattr(self, "w3_skip_ring", None) is not None else self.w3),
             dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
             core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
             compute_kernel_config=li_ff1_3_compute_kernel_cfg,
@@ -332,7 +414,7 @@ class MLP(LightweightModule):
                 _pc_w2_skip = None
             w2_out = ttnn.linear(
                 w2_in,
-                self.w2,
+                (self.w2_skip_ring if _w2_use_skip and getattr(self, "w2_skip_ring", None) is not None else self.w2),
                 compute_kernel_config=li_ff2_compute_kernel_cfg,
                 dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
                 program_config=_pc_w2_skip if _w2_use_skip else pc_2,
