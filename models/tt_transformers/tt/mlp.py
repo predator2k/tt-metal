@@ -7,6 +7,18 @@ import torch
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.tt_transformers.tt.ccl import tt_all_reduce
+
+
+# U5 — Prefetcher cross-sub-device output barrier (2026-05-24).
+# See attention.py:_u5_pref_subdev for full rationale. Inlined here to avoid
+# inter-module import-order coupling between mlp.py and attention.py.
+def _u5_pref_subdev(prefetcher):
+    import os as _os
+    if prefetcher is None:
+        return None
+    if _os.environ.get("SGLANG_TT_PREFETCHER_OUTPUT_BARRIER", "0") == "1":
+        return prefetcher.receiver_sub_device_id
+    return prefetcher.worker_sub_device_id
 from models.tt_transformers.tt.common import Mode, pad_to_size
 from models.tt_transformers.tt.model_config import OpGroup, TensorGroup
 
@@ -406,6 +418,20 @@ class MLP(LightweightModule):
             else:
                 # NOTE: In MLP All-reduce hard codes to 2 links, so we do not get the dynamic link count from the CCL class
                 # to avoid any performance regressions.
+                # U5: when env-gated (SGLANG_TT_PREFETCHER_OUTPUT_BARRIER=1),
+                # inject prefetcher receiver_sub_device_id so the all_reduce
+                # dispatches on the same stream as the w1/w3 matmul
+                # (eliminates the cross-sub-device dispatch sync gap). When
+                # env is unset OR prefetcher is None, pass nothing — preserves
+                # the canonical sync `ttnn.reduce_scatter` path.
+                import os as _u5_os
+                _u5_kwargs = {}
+                if (
+                    self.prefetcher is not None
+                    and mode == Mode.DECODE
+                    and _u5_os.environ.get("SGLANG_TT_PREFETCHER_OUTPUT_BARRIER", "0") == "1"
+                ):
+                    _u5_kwargs["subdevice_id"] = self.prefetcher.receiver_sub_device_id
                 w1_out = tt_all_reduce(
                     w1_out,
                     self.mesh_device,
@@ -415,6 +441,7 @@ class MLP(LightweightModule):
                     sharded=True if mode == Mode.DECODE else False,
                     topology=self.args.ccl_topology(),
                     memory_config=self.model_config["FF1_OUT_GATHERED_MEMCFG"] if mode == Mode.DECODE else None,
+                    **_u5_kwargs,
                 )
                 w3_out = tt_all_reduce(
                     w3_out,
@@ -425,6 +452,7 @@ class MLP(LightweightModule):
                     sharded=True if mode == Mode.DECODE else False,
                     topology=self.args.ccl_topology(),
                     memory_config=self.model_config["FF1_OUT_GATHERED_MEMCFG"] if mode == Mode.DECODE else None,
+                    **_u5_kwargs,
                 )
 
         w2_in = ttnn.mul(
@@ -529,8 +557,8 @@ class MLP(LightweightModule):
             num_workers_per_link=self.model_config["MLP_RS_CONFIG"]["num_workers_per_link"]
             if mode == Mode.DECODE
             else 2,
-            subdevice_id=self.prefetcher.worker_sub_device_id
-            if mode == Mode.DECODE and self.prefetcher is not None
+            subdevice_id=_u5_pref_subdev(self.prefetcher)
+            if mode == Mode.DECODE
             else None,
         )
         # Ensure dim 0 and 1 are 1

@@ -28,6 +28,34 @@ def _ws_a7_dump_enabled(layer_num: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# U5 — Prefetcher cross-sub-device output barrier (2026-05-24).
+# When SGLANG_TT_PREFETCHER_OUTPUT_BARRIER=1, route every prefetcher-fed CCL
+# op's `subdevice_id` kwarg to `receiver_sub_device_id` instead of
+# `worker_sub_device_id`. The prefetcher matmul (output sharded on receiver
+# cores) dispatches on `receiver_sub_device`; the downstream CCL op normally
+# uses `worker_sub_device`, leaving a WAIT_STREAM cross-sub-device gap
+# (`tt_metal/impl/program/dispatch.cpp:431` `insert_stall_cmds`) under cached
+# dispatch. Routing the CCL op to `receiver_sub_device` forces same-stream
+# serialization, eliminating the data-visibility race. Env-gated so canonical
+# (no prefetcher) is unaffected and the prefetcher path can A/B-test the fix.
+# ---------------------------------------------------------------------------
+def _u5_pref_subdev(prefetcher):
+    """Return prefetcher subdev id for downstream CCL ops.
+
+    Default: worker_sub_device_id (existing behavior; U1 cross-sub-device gap).
+    With SGLANG_TT_PREFETCHER_OUTPUT_BARRIER=1: receiver_sub_device_id
+    (matches the producing matmul; same dispatch stream → automatic
+    in-stream WAIT_STREAM serialization, no cross-sub-device gap).
+    """
+    import os as _os
+    if prefetcher is None:
+        return None
+    if _os.environ.get("SGLANG_TT_PREFETCHER_OUTPUT_BARRIER", "0") == "1":
+        return prefetcher.receiver_sub_device_id
+    return prefetcher.worker_sub_device_id
+
+
+# ---------------------------------------------------------------------------
 # WS-A.8 Bug 2 workaround (SUPERSEDED by WS-A.10 load-time KV-head replicate):
 # Runtime ttnn.concat replication of K and V along the kv-head axis after
 # nlp_create_qkv_heads_decode. The motivation was the same SDPA decode kernel
@@ -1031,7 +1059,7 @@ class Attention(LightweightModule):
             sharded=True,
             dtype=self.ccl_dtype,
             topology=self.ccl_topology,
-            subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+            subdevice_id=_u5_pref_subdev(self.prefetcher),
         )
         if self.TG:
             # TODO: Slice the fused_query_key_value tensor get batch=8
@@ -1349,7 +1377,7 @@ class Attention(LightweightModule):
                     chunks_per_sync=self.model_config["ATTN_AGMM_CONFIG"]["chunks_per_sync"],
                     num_workers_per_link=self.model_config["ATTN_AGMM_CONFIG"]["num_workers_per_link"],
                     num_buffers_per_channel=2,
-                    subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                    subdevice_id=_u5_pref_subdev(self.prefetcher),
                 )
             else:
                 if self.prefetcher is not None:
@@ -1365,7 +1393,7 @@ class Attention(LightweightModule):
                         chunks_per_sync=10,
                         num_workers_per_link=2,
                         num_buffers_per_channel=2,
-                        subdevice_id=self.prefetcher.worker_sub_device_id,
+                        subdevice_id=_u5_pref_subdev(self.prefetcher),
                     )
                 else:
                     # Standalone no-prefetcher path: use synchronous all_gather to avoid
@@ -1455,7 +1483,7 @@ class Attention(LightweightModule):
                     Mode.DECODE, list(self.mesh_device.shape)[1], self.prefetcher
                 ),
                 sharded=True,
-                subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                subdevice_id=_u5_pref_subdev(self.prefetcher),
                 # dtype=self.ccl_dtype,  # Running bf16 until we have SDPA output bfp8 df; otherwise we have two sharded to interleaved/interleaved to sharded conversions
             )
             if self.TG:
@@ -1519,7 +1547,7 @@ class Attention(LightweightModule):
                 sharded=True,
                 dtype=_ccl_dt,
                 use_composite=True if self.hidden_size == 8192 else False,
-                subdevice_id=self.prefetcher.worker_sub_device_id if self.prefetcher is not None else None,
+                subdevice_id=_u5_pref_subdev(self.prefetcher),
             )
 
             if not self.TG:
