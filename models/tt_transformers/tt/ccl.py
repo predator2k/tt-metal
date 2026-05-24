@@ -175,6 +175,58 @@ def tt_all_reduce(
         # subdevice_id is None iff prefetcher is None (callers pass
         # prefetcher.worker_sub_device_id or None), so we use that as the proxy.
         if subdevice_id is not None:
+            # U15 Probe E: env-gated. Print input_tensor.buffer_address right
+            # before reduce_scatter_minimal_async — this is the address the
+            # consumer's reader kernel sees as `input_tensor_address`.
+            import os as _u15e_os
+            _u15e_call_ct_attr = "_u15_rs_call_ct"
+            _u15e_global = globals()
+            _u15e_global.setdefault(_u15e_call_ct_attr, 0)
+            _u15e_global[_u15e_call_ct_attr] += 1
+            _u15e_idx = _u15e_global[_u15e_call_ct_attr]
+            if _u15e_os.environ.get("SGLANG_TT_U15_PROBE_RS", "0") == "1" and _u15e_idx <= 8:
+                try:
+                    _u15e_ba = input_tensor.buffer_address()
+                    _u15e_mc = input_tensor.memory_config()
+                    _u15e_ss = _u15e_mc.shard_spec
+                    # Caller stack frame: where in the model is RS#k coming from?
+                    import traceback as _u15e_tb
+                    _u15e_stack = _u15e_tb.extract_stack(limit=6)[:-1]
+                    _u15e_callers = " <- ".join(
+                        f"{_f.name}@{_f.filename.split('/')[-1]}:{_f.lineno}"
+                        for _f in _u15e_stack[::-1]
+                    )
+                    print(
+                        f"[U15_PROBE_E] RS#{_u15e_idx} input_tensor.buffer_address=0x{_u15e_ba:x} "
+                        f"shape={tuple(input_tensor.shape)} "
+                        f"memory_layout={_u15e_mc.memory_layout} "
+                        f"dim={dim} cluster_axis={cluster_axis}",
+                        flush=True,
+                    )
+                    print(f"[U15_PROBE_E] RS#{_u15e_idx} stack: {_u15e_callers}", flush=True)
+                    # Probe E2: PRE-RS to_torch. If nonzero, corruption is
+                    # BEFORE the RS dispatch. If zero, RS's reader is wrong.
+                    if _u15e_os.environ.get("SGLANG_TT_U15_PROBE_RS_TOTORCH", "0") == "1":
+                        try:
+                            _u15e_shards = ttnn.get_device_tensors(input_tensor)
+                            for _i, _sh in enumerate(_u15e_shards):
+                                _u15e_t = ttnn.to_torch(_sh).float().cpu()
+                                _u15e_flat = _u15e_t.flatten()
+                                print(
+                                    f"[U15_PROBE_E2_TOTORCH] RS#{_u15e_idx} PRE-RS "
+                                    f"shard={_i} shape={tuple(_u15e_t.shape)} "
+                                    f"max_abs={_u15e_flat.abs().max().item():.6e} "
+                                    f"nnz={int((_u15e_flat != 0).sum().item())}/{_u15e_flat.numel()}",
+                                    flush=True,
+                                )
+                        except Exception as _u15e_ex:
+                            print(
+                                f"[U15_PROBE_E2_TOTORCH] RS#{_u15e_idx} ERROR: "
+                                f"{type(_u15e_ex).__name__}: {_u15e_ex}",
+                                flush=True,
+                            )
+                except Exception as _u15e_ex:
+                    print(f"[U15_PROBE_E] ERROR: {type(_u15e_ex).__name__}: {_u15e_ex}", flush=True)
             # Prefetcher / trace-replay path: use async reduce_scatter.
             reduced = ttnn.experimental.reduce_scatter_minimal_async(
                 input_tensor,
@@ -191,6 +243,45 @@ def tt_all_reduce(
                 num_buffers_per_channel=2,
                 subdevice_id=subdevice_id,
             )
+            # Probe E (post): also dump the produced reduced tensor's address
+            # AND its bytes (to_torch).  If reduced has nonzero data with zero
+            # inputs, the reduce_scatter's reader read nonzero from L1 0xa6700.
+            if _u15e_os.environ.get("SGLANG_TT_U15_PROBE_RS", "0") == "1" and _u15e_idx <= 8:
+                try:
+                    _u15e_ra = reduced.buffer_address()
+                    _u15e_rmc = reduced.memory_config()
+                    print(
+                        f"[U15_PROBE_E] RS#{_u15e_idx} reduced.buffer_address=0x{_u15e_ra:x} "
+                        f"shape={tuple(reduced.shape)} "
+                        f"memory_layout={_u15e_rmc.memory_layout}",
+                        flush=True,
+                    )
+                except Exception as _u15e_ex:
+                    print(f"[U15_PROBE_E] post ERROR: {type(_u15e_ex).__name__}: {_u15e_ex}", flush=True)
+                if _u15e_os.environ.get("SGLANG_TT_U15_PROBE_RS_TOTORCH", "0") == "1":
+                    try:
+                        _u15e_rshards = ttnn.get_device_tensors(reduced)
+                        for _i, _sh in enumerate(_u15e_rshards):
+                            _u15e_rt = ttnn.to_torch(_sh).float().cpu()
+                            _u15e_rflat = _u15e_rt.flatten()
+                            _u15e_first_nonzero_idx = None
+                            if int((_u15e_rflat != 0).sum().item()) > 0:
+                                _u15e_first_nonzero_idx = int((_u15e_rflat != 0).nonzero(as_tuple=True)[0][0].item())
+                            print(
+                                f"[U15_PROBE_E2_TOTORCH] RS#{_u15e_idx} POST-RS "
+                                f"shard={_i} shape={tuple(_u15e_rt.shape)} "
+                                f"max_abs={_u15e_rflat.abs().max().item():.6e} "
+                                f"nnz={int((_u15e_rflat != 0).sum().item())}/{_u15e_rflat.numel()} "
+                                f"first_nonzero_idx={_u15e_first_nonzero_idx} "
+                                f"first16={_u15e_rflat[:16].tolist()}",
+                                flush=True,
+                            )
+                    except Exception as _u15e_ex:
+                        print(
+                            f"[U15_PROBE_E2_TOTORCH] RS#{_u15e_idx} POST ERROR: "
+                            f"{type(_u15e_ex).__name__}: {_u15e_ex}",
+                            flush=True,
+                        )
         else:
             # Standalone no-prefetcher path: use synchronous reduce_scatter to avoid
             # CCL semaphore slot reuse issue (see distributed_norm.py).

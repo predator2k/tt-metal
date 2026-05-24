@@ -1065,12 +1065,275 @@ class Attention(LightweightModule):
                 # intersecting x.shard_spec().grid with subdevice_cores.
                 sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
             )
+        # ------------------------------------------------------------------
+        # U15 probes (env-gated, default-OFF): isolate matmul output L1
+        # producer vs. reduce_scatter consumer disagreement at L1 0xa6700.
+        # See docs/platforms/tt_qwen3_8b_prefetcher_U14_*.
+        # ------------------------------------------------------------------
+        import os as _u15_os
+        _u15_layer_gate = (
+            (int(self.layer_num) == 0) if hasattr(self, "layer_num") else True
+        )
+        if _u15_layer_gate and _u15_os.environ.get("SGLANG_TT_U15_PROBE_TOTORCH", "0") == "1":
+            # Probe A: pull producer's L1 back to host (per-device shard 0).
+            # With zero weights, all bytes should be 0.0.
+            # Non-zero ⇒ producer-side L1 stomp (H2).
+            # Zero ⇒ producer is clean; consumer reads wrong (core,off) (H1).
+            # Note: only fires on the COMPILE run (before begin_trace_capture).
+            # After trace capture, the device queue rejects synchronous reads
+            # with `!trace_id_.has_value()` — that's expected and benign.
+            try:
+                _u15_shards = ttnn.get_device_tensors(xqkv_fused_sharded)
+                _u15_per_shard = []
+                for _i, _sh in enumerate(_u15_shards):
+                    _u15_t = ttnn.to_torch(_sh).float().cpu()
+                    _u15_flat = _u15_t.flatten()
+                    _u15_per_shard.append({
+                        "i": _i,
+                        "shape": tuple(_u15_t.shape),
+                        "max_abs": _u15_flat.abs().max().item(),
+                        "sum": _u15_flat.sum().item(),
+                        "nnz": int((_u15_flat != 0).sum().item()),
+                        "n": int(_u15_flat.numel()),
+                        "first8": _u15_flat[:8].tolist(),
+                    })
+                for _r in _u15_per_shard:
+                    print(
+                        f"[U15_PROBE_A] xqkv shard={_r['i']} shape={_r['shape']} "
+                        f"max_abs={_r['max_abs']:.6e} sum={_r['sum']:.6e} "
+                        f"nnz={_r['nnz']}/{_r['n']} first8={_r['first8']}",
+                        flush=True,
+                    )
+            except Exception as _u15_e:
+                print(f"[U15_PROBE_A] ERROR: {type(_u15_e).__name__}: {_u15_e}", flush=True)
+        if _u15_layer_gate and _u15_os.environ.get("SGLANG_TT_U15_PROBE_SHARD", "0") == "1":
+            # Probe B: dump shard_spec.grid + shape + buffer_address so we can
+            # compare against what the reduce_scatter reader believes.
+            try:
+                _u15_mc = xqkv_fused_sharded.memory_config()
+                _u15_ss = _u15_mc.shard_spec
+                # buffer_address is the L1 base recorded for the tensor's
+                # buffer (the address an addrgen feeds into get_noc_addr).
+                try:
+                    _u15_baddr = xqkv_fused_sharded.buffer_address()
+                except Exception as _e:
+                    _u15_baddr = None
+                if _u15_ss is None:
+                    print(
+                        f"[U15_PROBE_B] xqkv_fused_sharded NOT sharded; "
+                        f"memory_layout={_u15_mc.memory_layout} buffer_type={_u15_mc.buffer_type} "
+                        f"buffer_address={('0x%x' % _u15_baddr) if _u15_baddr is not None else 'N/A'}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[U15_PROBE_B] xqkv_fused_sharded.shard_spec grid={_u15_ss.grid} "
+                        f"shape={_u15_ss.shape} orientation={_u15_ss.orientation} "
+                        f"num_cores={_u15_ss.num_cores()} "
+                        f"memory_layout={_u15_mc.memory_layout} "
+                        f"buffer_type={_u15_mc.buffer_type} "
+                        f"buffer_address={('0x%x' % _u15_baddr) if _u15_baddr is not None else 'N/A'}",
+                        flush=True,
+                    )
+                # Also dump input x's shard + buffer addr for cross-reference.
+                try:
+                    _u15_xmc = x.memory_config()
+                    _u15_xss = _u15_xmc.shard_spec
+                    try:
+                        _u15_xbaddr = x.buffer_address()
+                    except Exception:
+                        _u15_xbaddr = None
+                    if _u15_xss is not None:
+                        print(
+                            f"[U15_PROBE_B] x.shard_spec grid={_u15_xss.grid} "
+                            f"shape={_u15_xss.shape} num_cores={_u15_xss.num_cores()} "
+                            f"buffer_address={('0x%x' % _u15_xbaddr) if _u15_xbaddr is not None else 'N/A'}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
+                # Dump weight (wqkv) buffer_address for cross-reference too.
+                try:
+                    _u15_wqkv_t = _wqkv_for_mm if "_wqkv_for_mm" in dir() else self.wqkv
+                    _u15_wbaddr = _u15_wqkv_t.buffer_address()
+                    print(
+                        f"[U15_PROBE_B] wqkv buffer_address=0x{_u15_wbaddr:x} "
+                        f"memory_config={_u15_wqkv_t.memory_config()}",
+                        flush=True,
+                    )
+                except Exception as _e:
+                    print(f"[U15_PROBE_B] wqkv addr fetch failed: {_e}", flush=True)
+            except Exception as _u15_e:
+                print(f"[U15_PROBE_B] ERROR: {type(_u15_e).__name__}: {_u15_e}", flush=True)
+        if _u15_layer_gate and _u15_os.environ.get("SGLANG_TT_U15_PROBE_L1DUMP", "0") == "1":
+            # Probe C: enumerate L1 buffers/pages and find ALL entries at
+            # L1 byte address 0xa6700 (or page_address falling at 0xa6700).
+            # Two distinct buffer.address values at 0xa6700 on same (chip, core)
+            # ⇒ allocator overlap (H2 confirmed).
+            try:
+                _u15_target = 0xa6700
+                _u15_devices = (
+                    self.mesh_device.get_devices()
+                    if hasattr(self.mesh_device, "get_devices")
+                    else [self.mesh_device]
+                )
+                _u15_bufs = ttnn._ttnn.reports.get_buffers(list(_u15_devices))
+                _u15_hits = []
+                for _b in _u15_bufs:
+                    try:
+                        if int(_b.address) == _u15_target:
+                            _u15_hits.append(
+                                f"buf addr=0x{_b.address:x} dev={_b.device_id} "
+                                f"bt={_b.buffer_type} bl={_b.buffer_layout} "
+                                f"sz_per_bank={_b.max_size_per_bank}"
+                            )
+                    except Exception:
+                        pass
+                print(
+                    f"[U15_PROBE_C] total_bufs={len(_u15_bufs)} "
+                    f"hits_at_0x{_u15_target:x}={len(_u15_hits)}",
+                    flush=True,
+                )
+                for _h in _u15_hits[:32]:
+                    print(f"[U15_PROBE_C]   {_h}", flush=True)
+                # Adjacent buffers in [target-0x10000, target+0x10000].
+                _u15_near = []
+                for _b in _u15_bufs:
+                    try:
+                        if _u15_target - 0x10000 <= int(_b.address) <= _u15_target + 0x10000:
+                            _u15_near.append(
+                                f"buf addr=0x{_b.address:x} dev={_b.device_id} "
+                                f"bt={_b.buffer_type} bl={_b.buffer_layout} "
+                                f"sz_per_bank={_b.max_size_per_bank}"
+                            )
+                    except Exception:
+                        pass
+                print(
+                    f"[U15_PROBE_C] near_bufs_in_+/-0x10000_of_0x{_u15_target:x}="
+                    f"{len(_u15_near)}",
+                    flush=True,
+                )
+                for _h in _u15_near[:32]:
+                    print(f"[U15_PROBE_C]   {_h}", flush=True)
+                # Per-core page-level enumeration: list unique (dev, x, y, addr)
+                # where page_address == 0xa6700. Multiple distinct page_address
+                # collisions on same (dev,x,y) = overlap.
+                _u15_pages = ttnn._ttnn.reports.get_buffer_pages(list(_u15_devices))
+                _u15_page_hits = []
+                for _p in _u15_pages:
+                    try:
+                        if int(_p.page_address) == _u15_target:
+                            _u15_page_hits.append(
+                                (int(_p.device_id), int(_p.core_x), int(_p.core_y),
+                                 int(_p.address), int(_p.bank_id),
+                                 int(_p.page_index), int(_p.page_size),
+                                 _p.buffer_type)
+                            )
+                    except Exception:
+                        pass
+                print(
+                    f"[U15_PROBE_C] total_pages={len(_u15_pages)} "
+                    f"page_hits_at_0x{_u15_target:x}={len(_u15_page_hits)}",
+                    flush=True,
+                )
+                # Group by (dev, x, y); list unique buffer.address per group.
+                _u15_groups = {}
+                for _t in _u15_page_hits:
+                    _k = (_t[0], _t[1], _t[2])
+                    _u15_groups.setdefault(_k, set()).add(_t[3])
+                for _k, _addrs in list(_u15_groups.items())[:64]:
+                    print(
+                        f"[U15_PROBE_C]   page@0x{_u15_target:x} "
+                        f"dev={_k[0]} core=({_k[1]},{_k[2]}) "
+                        f"distinct_buf_addrs={sorted(hex(a) for a in _addrs)}",
+                        flush=True,
+                    )
+                # Extended: list ALL pages on the cores the reduce_scatter
+                # reader is hitting per U14: (2,3)(4,3)(11,2)(13,2)(2,5)(4,5)
+                # (11,4)(13,4)(2,7)(4,7)(11,6)(13,6)(2,9)(4,9)(11,8)(13,8).
+                # Print: distinct (buffer.address, page_address) per (dev,x,y).
+                _u15_rs_cores = {
+                    (2,3),(4,3),(11,2),(13,2),(2,5),(4,5),(11,4),(13,4),
+                    (2,7),(4,7),(11,6),(13,6),(2,9),(4,9),(11,8),(13,8),
+                }
+                _u15_rs_pages = {}
+                for _p in _u15_pages:
+                    try:
+                        _ck = (int(_p.core_x), int(_p.core_y))
+                        if _ck in _u15_rs_cores:
+                            _k = (int(_p.device_id), _ck[0], _ck[1])
+                            _u15_rs_pages.setdefault(_k, set()).add(
+                                (int(_p.address), int(_p.page_address),
+                                 int(_p.page_size))
+                            )
+                    except Exception:
+                        pass
+                print(
+                    f"[U15_PROBE_C] EXT: pages on RS-reader cores "
+                    f"groups={len(_u15_rs_pages)}",
+                    flush=True,
+                )
+                for _k, _bag in sorted(_u15_rs_pages.items())[:64]:
+                    _sorted = sorted(_bag)
+                    _summary = ', '.join(
+                        f"buf=0x{a:x}+page=0x{pa:x}(sz=0x{ps:x})"
+                        for (a, pa, ps) in _sorted[:8]
+                    )
+                    print(
+                        f"[U15_PROBE_C]   dev={_k[0]} core=({_k[1]},{_k[2]}) "
+                        f"n_pages={len(_sorted)} sample=[{_summary}]",
+                        flush=True,
+                    )
+            except Exception as _u15_e:
+                print(
+                    f"[U15_PROBE_C] ERROR: {type(_u15_e).__name__}: {_u15_e}",
+                    flush=True,
+                )
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
             # select the bias tensor based on the number of tiles in the rows
             # WARNING: must not change the batch size between compiling and executing a trace
             num_tiles = int(math.ceil(xqkv_fused_sharded.shape[-2] / self.tile_size))
             xqkv_fused_sharded = xqkv_fused_sharded + self.wqkv_bias_decode[num_tiles - 1]
+            # U15 Probe D: post-bias-add buffer address. If different from
+            # pre-bias 0xaaf00 (and matches U14's 0xa6700), the bias-add op
+            # silently relocates the matmul output. This is the address the
+            # reduce_scatter reader actually sees.
+            if _u15_layer_gate and _u15_os.environ.get("SGLANG_TT_U15_PROBE_SHARD", "0") == "1":
+                try:
+                    _u15_post_bias_addr = xqkv_fused_sharded.buffer_address()
+                    _u15_post_bias_mc = xqkv_fused_sharded.memory_config()
+                    _u15_post_bias_ss = _u15_post_bias_mc.shard_spec
+                    print(
+                        f"[U15_PROBE_D] POST-BIAS xqkv_fused_sharded "
+                        f"buffer_address=0x{_u15_post_bias_addr:x} "
+                        f"memory_layout={_u15_post_bias_mc.memory_layout} "
+                        f"shard_grid={_u15_post_bias_ss.grid if _u15_post_bias_ss else 'None'} "
+                        f"shard_shape={_u15_post_bias_ss.shape if _u15_post_bias_ss else 'N/A'}",
+                        flush=True,
+                    )
+                except Exception as _u15_e:
+                    print(f"[U15_PROBE_D] ERROR: {type(_u15_e).__name__}: {_u15_e}", flush=True)
+                # And a to_torch on the POST-BIAS tensor (the actual RS input).
+                if _u15_os.environ.get("SGLANG_TT_U15_PROBE_TOTORCH", "0") == "1":
+                    try:
+                        _u15_pb_shards = ttnn.get_device_tensors(xqkv_fused_sharded)
+                        for _i, _sh in enumerate(_u15_pb_shards):
+                            _u15_pbt = ttnn.to_torch(_sh).float().cpu()
+                            _u15_pbf = _u15_pbt.flatten()
+                            print(
+                                f"[U15_PROBE_D_TOTORCH] post-bias shard={_i} "
+                                f"shape={tuple(_u15_pbt.shape)} "
+                                f"max_abs={_u15_pbf.abs().max().item():.6e} "
+                                f"nnz={int((_u15_pbf != 0).sum().item())}/{_u15_pbf.numel()} "
+                                f"first8={_u15_pbf[:8].tolist()}",
+                                flush=True,
+                            )
+                    except Exception as _u15_e:
+                        print(
+                            f"[U15_PROBE_D_TOTORCH] ERROR: {type(_u15_e).__name__}: {_u15_e}",
+                            flush=True,
+                        )
 
         ttnn.deallocate(x)
         qkv_all_reduce_mem_cfg = self.args.get_attn_qkv_all_reduce_output_mem_config(

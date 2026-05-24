@@ -566,6 +566,89 @@ class MLP(LightweightModule):
             )
         ttnn.deallocate(w2_in)
 
+        # ---- U15 Probe F (env-gated, layer 0 only): pre-AR W2 matmul output ----
+        import os as _u15f_os
+        _u15f_layer = (
+            (int(self.layer_num) == 0) if hasattr(self, "layer_num") else True
+        )
+        # ---- U15 Probe G: L1 buffer enumeration at W2 dispatch time ----
+        if _u15f_layer and _u15f_os.environ.get("SGLANG_TT_U15_PROBE_W2_L1", "0") == "1":
+            try:
+                _u15g_target = 0xa6700
+                _u15g_devs = (
+                    self.mesh_device.get_devices()
+                    if hasattr(self.mesh_device, "get_devices")
+                    else [self.mesh_device]
+                )
+                _u15g_bufs = ttnn._ttnn.reports.get_buffers(list(_u15g_devs))
+                _u15g_near = [
+                    (int(_b.address), _b.buffer_type, _b.buffer_layout,
+                     _b.max_size_per_bank)
+                    for _b in _u15g_bufs
+                    if (_u15g_target - 0x10000) <= int(_b.address) <= (_u15g_target + 0x10000)
+                ]
+                _u15g_near.sort()
+                print(
+                    f"[U15_PROBE_G] W2-time near 0x{_u15g_target:x}: "
+                    f"{len(_u15g_near)} bufs",
+                    flush=True,
+                )
+                for _b in _u15g_near[:32]:
+                    print(
+                        f"[U15_PROBE_G]   addr=0x{_b[0]:x} bt={_b[1]} bl={_b[2]} "
+                        f"sz_per_bank={_b[3]}",
+                        flush=True,
+                    )
+                # Print GlobalCB info if accessible.
+                try:
+                    _u15g_gcb = self.prefetcher.global_cb if self.prefetcher is not None else None
+                    if _u15g_gcb is not None:
+                        _u15g_gcb_addr = _u15g_gcb.buffer_address
+                        _u15g_gcb_size = _u15g_gcb.size
+                        print(
+                            f"[U15_PROBE_G] GlobalCB buffer_address={_u15g_gcb_addr() if callable(_u15g_gcb_addr) else _u15g_gcb_addr} "
+                            f"size={_u15g_gcb_size() if callable(_u15g_gcb_size) else _u15g_gcb_size}",
+                            flush=True,
+                        )
+                except Exception as _u15g_e:
+                    print(f"[U15_PROBE_G] gcb info: {_u15g_e}", flush=True)
+            except Exception as _u15g_e:
+                print(f"[U15_PROBE_G] ERROR: {type(_u15g_e).__name__}: {_u15g_e}", flush=True)
+        if _u15f_layer and _u15f_os.environ.get("SGLANG_TT_U15_PROBE_W2", "0") == "1":
+            try:
+                _u15f_ba = w2_out.buffer_address()
+                _u15f_mc = w2_out.memory_config()
+                _u15f_ss = _u15f_mc.shard_spec
+                print(
+                    f"[U15_PROBE_F] w2_out buffer_address=0x{_u15f_ba:x} "
+                    f"shape={tuple(w2_out.shape)} "
+                    f"memory_layout={_u15f_mc.memory_layout} "
+                    f"shard_grid={_u15f_ss.grid if _u15f_ss else 'None'} "
+                    f"shard_shape={_u15f_ss.shape if _u15f_ss else 'N/A'}",
+                    flush=True,
+                )
+            except Exception as _u15f_e:
+                print(f"[U15_PROBE_F] addr ERROR: {type(_u15f_e).__name__}: {_u15f_e}", flush=True)
+            if _u15f_os.environ.get("SGLANG_TT_U15_PROBE_TOTORCH", "0") == "1":
+                try:
+                    _u15f_shards = ttnn.get_device_tensors(w2_out)
+                    for _i, _sh in enumerate(_u15f_shards):
+                        _u15f_t = ttnn.to_torch(_sh).float().cpu()
+                        _u15f_flat = _u15f_t.flatten()
+                        print(
+                            f"[U15_PROBE_F_TOTORCH] w2_out shard={_i} "
+                            f"shape={tuple(_u15f_t.shape)} "
+                            f"max_abs={_u15f_flat.abs().max().item():.6e} "
+                            f"nnz={int((_u15f_flat != 0).sum().item())}/{_u15f_flat.numel()} "
+                            f"first16={_u15f_flat[:16].tolist()}",
+                            flush=True,
+                        )
+                except Exception as _u15f_e:
+                    print(
+                        f"[U15_PROBE_F_TOTORCH] ERROR: {type(_u15f_e).__name__}: {_u15f_e}",
+                        flush=True,
+                    )
+
         w2_out_reduced = tt_all_reduce(
             w2_out,
             self.mesh_device,
