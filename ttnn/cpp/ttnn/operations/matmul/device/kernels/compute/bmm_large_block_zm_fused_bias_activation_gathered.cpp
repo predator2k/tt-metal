@@ -14,29 +14,17 @@
 #include "bmm_fused_activation.hpp"
 #endif
 
-#ifdef SGLANG_TT_PREFETCHER_LLK_PROBE
-// U12: LLK srcA/srcB/DST single-shot probe.  Loaded only when the env-gated
-// SGLANG_TT_PREFETCHER_LLK_PROBE compile-time define is propagated by the
-// program factory (gated by the SGLANG_TT_PREFETCHER_LLK_PROBE environment
-// variable, only on the gathered/use_global_cb path so canonical builds are
-// untouched).
-//
-// The probe is designed to discriminate between:
-//   (a) UNPACK reading non-zero bytes into srcA/srcB despite cb_in1 holding
-//       zeros (per S10 / Lead 3 byte-level verification + U11 zero-weight
-//       injection); and
-//   (b) MATH/FPU producing non-zero DST values from zero srcA/srcB inputs
-//       (i.e. MOP-buffer / FPU-register contamination).
-//
-// All probe statements are wrapped in MATH(...) / UNPACK(...) so each thread
-// only sees the statements meant for it.  A static gate ensures the probe
-// fires at most once per kernel ELF launch.  After printing, an infinite
-// busy-wait keeps the kernel halted so the dprint server flushes the log
-// before the device gets cleaned up.
+#if defined(SGLANG_TT_PREFETCHER_LLK_PROBE) || defined(SGLANG_TT_PREFETCHER_PACK_PROBE)
+// U12 / U13: LLK / PACK debug probes.  Loaded only when the env-gated
+// SGLANG_TT_PREFETCHER_LLK_PROBE or SGLANG_TT_PREFETCHER_PACK_PROBE
+// compile-time defines are propagated by the program factory (gated by the
+// corresponding environment variables, only on the gathered/use_global_cb
+// path so canonical builds are untouched).
 #include "api/debug/dprint.h"
 #include "api/debug/dprint_tensix.h"
 #include "api/debug/dprint_tensix_unpack.h"
 #include "api/debug/dprint_tensix_pack.h"
+#include "api/debug/dprint_tile.h"  // CB_WR_PTR / cb_addr_shift
 #endif
 
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
@@ -450,38 +438,42 @@ void kernel_main() {
                             out_subblock_h,
                             in0_block_w);
 #ifdef SGLANG_TT_PREFETCHER_LLK_PROBE
-                        // U12 v2 less-intrusive probe:
-                        //
-                        // v1 (first run) confirmed: on the FIRST iteration of the FIRST
-                        // gathered ELF, srcA = srcB = DST = 0 (zero weights work correctly
-                        // through MATH).  But U11 still shows 2e19 logits, so the bug must
-                        // be in: a LATER iteration of the same ELF; a DIFFERENT ELF; or
-                        // downstream of the matmul (PACK / mm_out_cb).  This v2 probe widens
-                        // the gate to capture more iterations / blocks / subblocks and only
-                        // prints the FIRST 4 BF16 words of DST face 0 row 0 (no full tile
-                        // dump, no srcA/srcB destructive read).  Each core fires a fixed
-                        // budget per ELF (u12_v2_budget) so the log stays small.  Probe
-                        // checks all `block` values to find which block first produces a
-                        // non-zero DST under zero inputs.
+                        // U13 Part 2 (widened) — verify U12's probe fired on EVERY
+                        // gathered ELF.  U12 v2's gate
+                        // `in0_subblock==0 && in1_subblock==0 && inner_dim_idx==0`
+                        // could miss an ELF if that ELF only ever passes through
+                        // non-zero subblock indices on the static-cached path.  U13
+                        // widens to fire on the FIRST iteration the kernel sees,
+                        // regardless of subblock/inner indices, then drops the
+                        // remaining budget on first matches per (b, block) so we
+                        // still capture later blocks if budget allows.  Adds the
+                        // matmul-shape "ELF tag" (built from CT args) so we can
+                        // de-duplicate post-hoc by ELF instead of by core.
                         {
-                            static uint32_t u12_v2_budget = 8;
-                            if (u12_v2_budget > 0 &&
-                                in0_subblock == 0 && in1_subblock == 0 &&
-                                inner_dim_idx == 0) {
-                                u12_v2_budget--;
-                                // Read DST face 0 row 0 (8 dwords = 16 BF16 in Wormhole/BH
-                                // FP16 mode; or 16 floats × packed mantissa in FP32 mode).
-                                // We use dbg_read_dest_acc_row directly, which on Blackhole
-                                // reads from 0xFFBD8000 + (row<<4) via the dest debug bus.
-                                // This does NOT clobber any registers (unlike SRCA read).
+                            constexpr uint32_t u13_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u13_budget = 16;
+                            if (u13_budget > 0) {
+                                u13_budget--;
                                 MATH((
                                     {
                                         uint32_t dst_rd[8];
                                         ckernel::dbg_get_array_row(
                                             ckernel::dbg_array_id::DEST, 0, dst_rd);
-                                        DPRINT << "[U12v2 ring=" << ring_idx
+                                        DPRINT << "[U13_DST elf=0x" << HEX()
+                                               << u13_elf_tag
+                                               << DEC() << " ring=" << ring_idx
                                                << " b=" << b
                                                << " blk=" << block
+                                               << " is0=" << in0_subblock
+                                               << " is1=" << in1_subblock
+                                               << " kk=" << inner_dim_idx
                                                << " r0=";
                                         bool any_nonzero = false;
                                         for (int i = 0; i < 8; ++i) {
@@ -530,11 +522,141 @@ void kernel_main() {
 #endif
 
                         uint32_t start_dst_index = 0;
+
+#ifdef SGLANG_TT_PREFETCHER_PACK_PROBE
+                        // U13 Part 1b — SYNC'D DST probe at the pack site (BEFORE
+                        // pack_tile_block).  Uses dprint_tensix_dest_reg<>(0) which
+                        // internally calls dbg_halt() to drain the FPU pipeline and
+                        // ensure DST RAM holds the post-final-matmul snapshot at
+                        // read time.  This is the load-bearing measurement: if DST
+                        // tile 0 row 0 reads as zero here AND the subsequent
+                        // U13_PACK_OUT probe reads NONZERO, PACK is definitively
+                        // writing garbage despite zero DST.
+                        {
+                            constexpr uint32_t u13d_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u13d_budget = 8;
+                            if (u13d_budget > 0) {
+                                u13d_budget--;
+                                DPRINT << "[U13_DST_AT_PACK elf=0x" << HEX()
+                                       << u13d_elf_tag
+                                       << DEC() << " b=" << b
+                                       << " blk=" << block
+                                       << " is0=" << in0_subblock
+                                       << " is1=" << in1_subblock
+                                       << " (next: sync'd DST tile0)]" << ENDL();
+                                MATH((
+                                    {
+                                        uint32_t dst_rd[8];
+                                        // Force-drain pipeline so DST RAM reflects
+                                        // the last matmul_block's write.  Cheaper
+                                        // than dprint_tensix_dest_reg (no full tile
+                                        // print) but uses the same dbg_halt()
+                                        // barrier internally.
+                                        ckernel::tensix_sync();
+                                        ckernel::dbg_get_array_row(
+                                            ckernel::dbg_array_id::DEST, 0, dst_rd);
+                                        DPRINT << "[U13_DST_SYNC elf=0x" << HEX()
+                                               << u13d_elf_tag
+                                               << " b=" << b
+                                               << " blk=" << block
+                                               << " r0=";
+                                        bool any_nonzero = false;
+                                        for (int i = 0; i < 8; ++i) {
+                                            DPRINT << "0x" << HEX() << dst_rd[i] << " ";
+                                            if (dst_rd[i] != 0) any_nonzero = true;
+                                        }
+                                        DPRINT << (any_nonzero ? "NONZERO" : "zero")
+                                               << "]" << ENDL();
+                                    }
+                                ));
+                            }
+                        }
+#endif
+
                         if constexpr (untilize_out) {
                             pack_untilize_dest<out_subblock_num_tiles>(mm_out_cb_id);
                         } else {
                             pack_tile_block(start_dst_index, mm_out_cb_id, out_subblock_num_tiles);
                         }
+
+#ifdef SGLANG_TT_PREFETCHER_PACK_PROBE
+                        // U13 Part 1 — PACK-side L1 probe immediately AFTER
+                        // pack_tile_block writes to mm_out_cb.  Reads the first 16
+                        // bytes (8 BF16 / 4 FP32 words) at the location PACK just
+                        // wrote and prints them.  Combined with U11 zero-weight
+                        // injection + U12's DST=0 confirmation, this discriminates
+                        //   * mm_out_cb == zero  -> PACK is correct; bug is in
+                        //                          mm_partials spill/reload, an
+                        //                          un-probed ELF, or a downstream
+                        //                          consumer reading at a wrong L1
+                        //                          offset.
+                        //   * mm_out_cb != zero  -> PACK is writing garbage despite
+                        //                          DST being zero; bug is in the
+                        //                          PACK pipeline (formatter, wr_ptr,
+                        //                          datum-stride, ...).
+                        //
+                        // The probe runs on the PACK TRISC thread (which issued the
+                        // pack_tile_block writes), then prints up to 8 dwords from
+                        // the L1 address PACK just used.  Per-ELF static budget
+                        // keeps log size bounded; CT ELF tag de-dupes per matmul
+                        // shape.
+                        {
+                            constexpr uint32_t u13p_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u13p_out_budget = 16;
+                            PACK((
+                                {
+                                    if (u13p_out_budget > 0) {
+                                        u13p_out_budget--;
+                                        // CB_WR_PTR: (fifo_wr_ptr << cb_addr_shift)
+                                        // — yields the L1 byte address of the next
+                                        // write slot.  Since cb.push_back has NOT
+                                        // run yet, fifo_wr_ptr still points to the
+                                        // base where PACK just wrote.
+                                        //
+                                        // Force packer write completion to L1 so
+                                        // the subsequent volatile read sees the
+                                        // post-pack bytes (else we may race the
+                                        // packer's L1 NoC write).
+                                        ckernel::tensix_sync();
+                                        uint32_t l1_addr = CB_WR_PTR(mm_out_cb_id);
+                                        volatile tt_l1_ptr uint32_t* p =
+                                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_addr);
+                                        uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+                                        bool any_nonzero =
+                                            v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+                                        DPRINT << "[U13_PACK_OUT elf=0x" << HEX()
+                                               << u13p_elf_tag
+                                               << " l1=0x" << l1_addr
+                                               << DEC() << " b=" << b
+                                               << " blk=" << block
+                                               << " is0=" << in0_subblock
+                                               << " is1=" << in1_subblock
+                                               << " w0=0x" << HEX() << v[0]
+                                               << " w1=0x" << v[1]
+                                               << " w2=0x" << v[2]
+                                               << " w3=0x" << v[3]
+                                               << " "
+                                               << (any_nonzero ? "NONZERO" : "zero")
+                                               << "]" << ENDL();
+                                    }
+                                }
+                            ));
+                        }
+#endif
 
                         tile_regs_release();
                         if constexpr (untilize_out) {
@@ -558,6 +680,51 @@ void kernel_main() {
 
                         uint32_t start_dst_index = 0;
                         pack_tile_block(start_dst_index, mm_partials_cb_id, out_subblock_num_tiles);
+
+#ifdef SGLANG_TT_PREFETCHER_PACK_PROBE
+                        // U13 Part 1 — PACK-side L1 probe for the spill branch
+                        // (writes to mm_partials_cb).  Same shape/structure as the
+                        // mm_out_cb probe above.  Independent budget so we capture
+                        // both code paths.
+                        {
+                            constexpr uint32_t u13p_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u13p_part_budget = 16;
+                            PACK((
+                                {
+                                    if (u13p_part_budget > 0) {
+                                        u13p_part_budget--;
+                                        uint32_t l1_addr = CB_WR_PTR(mm_partials_cb_id);
+                                        volatile tt_l1_ptr uint32_t* p =
+                                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_addr);
+                                        uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+                                        bool any_nonzero =
+                                            v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+                                        DPRINT << "[U13_PACK_PART elf=0x" << HEX()
+                                               << u13p_elf_tag
+                                               << " l1=0x" << l1_addr
+                                               << DEC() << " b=" << b
+                                               << " blk=" << block
+                                               << " is0=" << in0_subblock
+                                               << " is1=" << in1_subblock
+                                               << " w0=0x" << HEX() << v[0]
+                                               << " w1=0x" << v[1]
+                                               << " w2=0x" << v[2]
+                                               << " w3=0x" << v[3]
+                                               << " "
+                                               << (any_nonzero ? "NONZERO" : "zero")
+                                               << "]" << ENDL();
+                                    }
+                                }
+                            ));
+                        }
+#endif
 
                         tile_regs_release();
                         mm_partials_cb.push_back(out_subblock_num_tiles);

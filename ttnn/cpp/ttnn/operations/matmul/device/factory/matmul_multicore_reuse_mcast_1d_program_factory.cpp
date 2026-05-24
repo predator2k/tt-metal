@@ -2374,6 +2374,15 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (llk_probe_env != nullptr && std::string(llk_probe_env) == "1") {
             mm_kernel_defines["SGLANG_TT_PREFETCHER_LLK_PROBE"] = "1";
         }
+        // U13 Part 1 (PACK-side mm_out_cb / mm_partials_cb post-write probe).
+        // Distinct from LLK_PROBE: LLK_PROBE reads from MATH thread (DST);
+        // PACK_PROBE reads L1 bytes from PACK thread AFTER pack_tile_block.
+        // Only applied on the gathered (use_global_cb) path so canonical
+        // matmuls are untouched.
+        const char* pack_probe_env = std::getenv("SGLANG_TT_PREFETCHER_PACK_PROBE");
+        if (pack_probe_env != nullptr && std::string(pack_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_PACK_PROBE"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {
