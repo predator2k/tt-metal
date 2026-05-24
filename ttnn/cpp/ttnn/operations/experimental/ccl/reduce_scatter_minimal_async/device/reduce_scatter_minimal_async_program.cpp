@@ -1205,6 +1205,19 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
         writer_compute_defines["OUTPUT_IS_SHARDED"] = "1";
     }
 
+    // U14 — env-gated consumer probe.  The reduce_scatter reader is the FIRST
+    // consumer of the gathered matmul's output buffer (xqkv_fused_sharded
+    // L1 region).  When SGLANG_TT_PREFETCHER_CONSUMER_PROBE=1, the reader
+    // dumps the first 16 bytes pulled from the input tensor at
+    // noc_async_read_barrier completion.  Combined with U13 (PACK wrote
+    // zero) + U14 end-of-matmul-kernel probe, this discriminates whether
+    // the bytes the consumer pulls match what PACK wrote (zero) or are
+    // stomped between matmul-kernel exit and consumer-read.
+    const char* u14_consumer_probe_env = std::getenv("SGLANG_TT_PREFETCHER_CONSUMER_PROBE");
+    if (u14_consumer_probe_env != nullptr && std::string(u14_consumer_probe_env) == "1") {
+        reader_compute_defines["SGLANG_TT_PREFETCHER_CONSUMER_PROBE"] = "1";
+    }
+
     // KERNEL CREATION
     if (fuse_op) {
         fused_op_signaler->init_reduce_scatter(program, mesh_device, sender_worker_core_range_set);

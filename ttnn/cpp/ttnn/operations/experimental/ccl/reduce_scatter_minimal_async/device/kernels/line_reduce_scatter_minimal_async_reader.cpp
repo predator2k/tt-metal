@@ -10,6 +10,15 @@
 #include <cstdint>
 #include <utility>
 
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+// U14 — CONSUMER probe.  Reads the first 16 bytes pulled from the input
+// tensor (the matmul output's L1 buffer) immediately after
+// noc_async_read_barrier completes the NoC read.  If these bytes are
+// nonzero under zero-weight injection, the L1 region was stomped between
+// the matmul kernel's PACK (which U13 verified writes zero) and this read.
+#include "api/debug/dprint.h"
+#endif
+
 using address_t = uint32_t;
 
 ///////////////////////////////////////////////////
@@ -196,9 +205,18 @@ void kernel_main() {
 
                         cb_reserve_back(cb_in0, tile_granularity);
                         uint32_t l1_write_addr = get_write_ptr(cb_in0);
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+                        uint32_t u14_l1_base = l1_write_addr;
+                        uint64_t u14_first_noc_addr = 0;
+#endif
                         for (uint32_t j = 0; j < num_pages_to_read; ++j) {
                             uint32_t tile_id = input_tile_id_start + input_row_offset + input_pages_read_in_row;
                             uint64_t noc_read_addr = get_noc_addr(tile_id, input_tensor_addrgen);
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+                            if (j == 0) {
+                                u14_first_noc_addr = noc_read_addr;
+                            }
+#endif
                             noc_async_read(noc_read_addr, l1_write_addr, page_size);
                             l1_write_addr += page_size;
 
@@ -211,6 +229,45 @@ void kernel_main() {
                         tiles_read += num_pages_to_read;
 
                         noc_async_read_barrier();
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+                        // U14 — read the first 16 bytes the consumer pulled
+                        // from the matmul output's L1 buffer.  After
+                        // noc_async_read_barrier, l1_write_addr region holds
+                        // the bytes from the matmul output.  We read at
+                        // u14_l1_base (the address the first page was written
+                        // to).  Budget-limited per kernel launch; tagged with
+                        // the input tensor address so we can correlate
+                        // multiple matmul outputs across launches.
+                        {
+                            static uint32_t u14_first_budget = 16;
+                            if (u14_first_budget > 0) {
+                                u14_first_budget--;
+                                volatile tt_l1_ptr uint32_t* p =
+                                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(u14_l1_base);
+                                uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+                                bool any_nonzero =
+                                    v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+                                // NoC address layout (32-bit aliased view):
+                                //   bits[31:24]=x_target_core
+                                //   bits[23:16]=y_target_core
+                                //   bits[15: 0]=l1_offset (low)
+                                uint32_t noc_hi = (uint32_t)((u14_first_noc_addr >> 32) & 0xFFFFFFFFu);
+                                uint32_t noc_lo = (uint32_t)(u14_first_noc_addr & 0xFFFFFFFFu);
+                                DPRINT << "[U14_CONSUMER_FIRST in_addr=0x" << HEX()
+                                       << input_tensor_address
+                                       << " l1=0x" << u14_l1_base
+                                       << " noc_hi=0x" << noc_hi
+                                       << " noc_lo=0x" << noc_lo
+                                       << " w0=0x" << v[0]
+                                       << " w1=0x" << v[1]
+                                       << " w2=0x" << v[2]
+                                       << " w3=0x" << v[3]
+                                       << " "
+                                       << (any_nonzero ? "NONZERO" : "zero")
+                                       << "]" << ENDL();
+                            }
+                        }
+#endif
                         cb_push_back(cb_in0, tile_granularity);
                     }
                     input_tile_id_start += input_channel_num_pages;
@@ -234,9 +291,18 @@ void kernel_main() {
 
                         cb_reserve_back(cb_in0, tile_granularity);
                         uint32_t l1_write_addr = get_write_ptr(cb_in0);
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+                        uint32_t u14_l1_base_in = l1_write_addr;
+                        uint64_t u14_first_noc_addr_in = 0;
+#endif
                         for (uint32_t j = 0; j < num_pages_to_read; ++j) {
                             uint32_t tile_id = input_tile_id_start + input_row_offset + input_pages_read_in_row;
                             uint64_t noc_read_addr = get_noc_addr(tile_id, input_tensor_addrgen);
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+                            if (j == 0) {
+                                u14_first_noc_addr_in = noc_read_addr;
+                            }
+#endif
                             noc_async_read(noc_read_addr, l1_write_addr, page_size);
                             l1_write_addr += page_size;
 
@@ -272,6 +338,34 @@ void kernel_main() {
                         }
 
                         noc_async_read_barrier();
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+                        // U14 — same probe, "not first device" branch.  After
+                        // the barrier both the input and intermediate buffers
+                        // have been populated.  Dump the input-side bytes (the
+                        // matmul output we want to verify).
+                        {
+                            static uint32_t u14_in_budget = 16;
+                            if (u14_in_budget > 0) {
+                                u14_in_budget--;
+                                volatile tt_l1_ptr uint32_t* p =
+                                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(u14_l1_base_in);
+                                uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+                                bool any_nonzero =
+                                    v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+                                DPRINT << "[U14_CONSUMER_IN in_addr=0x" << HEX()
+                                       << input_tensor_address
+                                       << " l1=0x" << u14_l1_base_in
+                                       << " noc=0x" << (uint32_t)(u14_first_noc_addr_in & 0xFFFFFFFF)
+                                       << " w0=0x" << v[0]
+                                       << " w1=0x" << v[1]
+                                       << " w2=0x" << v[2]
+                                       << " w3=0x" << v[3]
+                                       << " "
+                                       << (any_nonzero ? "NONZERO" : "zero")
+                                       << "]" << ENDL();
+                            }
+                        }
+#endif
                         cb_push_back(cb_in0, tile_granularity);
                         cb_push_back(cb_intermediate_id, tile_granularity);
                     }

@@ -2383,6 +2383,17 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (pack_probe_env != nullptr && std::string(pack_probe_env) == "1") {
             mm_kernel_defines["SGLANG_TT_PREFETCHER_PACK_PROBE"] = "1";
         }
+        // U14 (end-of-matmul-kernel mm_out_cb L1 re-read probe).  Reads
+        // mm_out_cb's L1 region AFTER all loops are done and just before
+        // the matmul kernel returns.  If mm_out_cb is still all zero at
+        // kernel exit, the stomper lives OUTSIDE the matmul kernel.
+        // Gated separately so it can be enabled without re-running the
+        // U13 pack-site probes.  Only applied on the gathered
+        // (use_global_cb) path so canonical matmuls are untouched.
+        const char* consumer_probe_env = std::getenv("SGLANG_TT_PREFETCHER_CONSUMER_PROBE");
+        if (consumer_probe_env != nullptr && std::string(consumer_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_CONSUMER_PROBE"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {

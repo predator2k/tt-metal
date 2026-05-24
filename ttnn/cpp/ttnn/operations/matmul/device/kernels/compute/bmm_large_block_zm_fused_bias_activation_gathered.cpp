@@ -14,12 +14,13 @@
 #include "bmm_fused_activation.hpp"
 #endif
 
-#if defined(SGLANG_TT_PREFETCHER_LLK_PROBE) || defined(SGLANG_TT_PREFETCHER_PACK_PROBE)
-// U12 / U13: LLK / PACK debug probes.  Loaded only when the env-gated
-// SGLANG_TT_PREFETCHER_LLK_PROBE or SGLANG_TT_PREFETCHER_PACK_PROBE
-// compile-time defines are propagated by the program factory (gated by the
-// corresponding environment variables, only on the gathered/use_global_cb
-// path so canonical builds are untouched).
+#if defined(SGLANG_TT_PREFETCHER_LLK_PROBE) || defined(SGLANG_TT_PREFETCHER_PACK_PROBE) || \
+    defined(SGLANG_TT_PREFETCHER_CONSUMER_PROBE)
+// U12 / U13 / U14: LLK / PACK / CONSUMER debug probes.  Loaded only when an
+// env-gated SGLANG_TT_PREFETCHER_*_PROBE compile-time define is propagated
+// by the program factory (gated by the corresponding environment variable,
+// only on the gathered/use_global_cb path so canonical builds are
+// untouched).
 #include "api/debug/dprint.h"
 #include "api/debug/dprint_tensix.h"
 #include "api/debug/dprint_tensix_unpack.h"
@@ -787,6 +788,64 @@ void kernel_main() {
         UNPACK((update_rd_ptr_to_ring_index(
             in1_cb_id, in1_block_size_bytes, ring_size, in1_tensor_split)));  // update to next tensor addr
     #endif
+#endif
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+        // U14 — END-OF-BATCH mm_out_cb L1 re-read probe.  By this point all
+        // PACK writes for batch `b` have been issued AND all sync handshakes
+        // have been performed.  We re-read the FIRST 16 bytes of mm_out_cb's
+        // L1 region (its fifo_start_addr) and compare to what U13_PACK_OUT
+        // recorded immediately after PACK.  Because mm_out_cb is allocated
+        // with set_globally_allocated_address(*out_buffer), its L1 base IS
+        // the output tensor's L1 buffer for this core.  If at kernel exit
+        // these bytes are NONZERO under zero-weight injection, something
+        // INSIDE the matmul kernel between PACK and exit stomped them
+        // (most likely PACK reload + accumulation in the spill branch).
+        // If they are STILL ZERO at kernel exit, the stomper lives OUTSIDE
+        // the matmul kernel (consumer reader, intervening CCL kernel, or
+        // an unrelated kernel sharing the same L1 region).  Per-ELF static
+        // budget keeps log size bounded; CT ELF tag de-dupes per matmul
+        // shape; tensix_sync() before the volatile read avoids the U13
+        // race against in-flight L1 writes.
+        {
+            constexpr uint32_t u14_elf_tag =
+                (in0_block_w * 1u) ^
+                (in0_num_subblocks * 131u) ^
+                (in1_num_subblocks * 17u) ^
+                (num_blocks * 7919u) ^
+                (out_subblock_h * 31u) ^
+                (out_subblock_w * 257u) ^
+                (batch * 65537u);
+            static uint32_t u14_end_budget = 16;
+            PACK((
+                {
+                    if (u14_end_budget > 0) {
+                        u14_end_budget--;
+                        ckernel::tensix_sync();
+                        // get_local_cb_start_addr returns the value in SHIFTED
+                        // CB units (matches fifo_wr_ptr / fifo_rd_ptr); convert
+                        // to a byte address by left-shifting by cb_addr_shift,
+                        // same as the CB_WR_PTR macro in dprint_tile.h.
+                        uint32_t l1_start = get_local_cb_start_addr(mm_out_cb_id) << cb_addr_shift;
+                        volatile tt_l1_ptr uint32_t* p =
+                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_start);
+                        uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+                        bool any_nonzero =
+                            v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+                        DPRINT << "[U14_END_OUT elf=0x" << HEX()
+                               << u14_elf_tag
+                               << " l1=0x" << l1_start
+                               << DEC() << " b=" << b
+                               << " w0=0x" << HEX() << v[0]
+                               << " w1=0x" << v[1]
+                               << " w2=0x" << v[2]
+                               << " w3=0x" << v[3]
+                               << " "
+                               << (any_nonzero ? "NONZERO" : "zero")
+                               << "]" << ENDL();
+                    }
+                }
+            ));
+        }
 #endif
     }
 }
