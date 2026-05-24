@@ -5,6 +5,8 @@
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.hpp"
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <string>
 #include <utility>
 
 #include "hostdevcommon/common_values.hpp"
@@ -2335,6 +2337,15 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
     if (use_global_cb) {
         mm_in1_kernel_defines["ENABLE_GLOBAL_CB"] = "1";
         mm_kernel_defines["ENABLE_GLOBAL_CB"] = "1";
+        // U9 (prefetcher DST stale-state attack): if the env var is set, propagate
+        // SGLANG_TT_PREFETCHER_DST_ZERO=1 into the gathered compute kernel defines so
+        // it emits an explicit ckernel::zeroacc() before the first matmul_block. Only
+        // applied on the gathered (use_global_cb) path so canonical matmuls are
+        // untouched.
+        const char* dst_zero_env = std::getenv("SGLANG_TT_PREFETCHER_DST_ZERO");
+        if (dst_zero_env != nullptr && std::string(dst_zero_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_PREFETCHER_DST_ZERO"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {

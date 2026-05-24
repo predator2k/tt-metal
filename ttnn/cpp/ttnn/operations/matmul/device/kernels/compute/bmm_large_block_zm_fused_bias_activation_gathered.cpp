@@ -255,6 +255,19 @@ void kernel_main() {
 
     mm_block_init(
         in0_cb_id, in1_cb_id, mm_partials_cb_ids[0], in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
+
+#ifdef SGLANG_TT_PREFETCHER_DST_ZERO
+    // U9: Explicit DST zero before any matmul accumulation. mm_block_init's
+    // llk_math_pack_sync_init only resets the dest_offset_id / section base
+    // pointers; it does NOT issue a ZEROACC. If DST sections still hold values
+    // from a prior program (e.g., a layout/reshard before this matmul), the
+    // first matmul_block(... idst=0 ...) accumulates onto stale state. The
+    // gathered (prefetcher) path triggers this because the GlobalCB program
+    // layout schedules an earlier program on the same DST without the normal
+    // pack_dest_section_done epilogue running on these cores.
+    MATH((ckernel::zeroacc()));
+#endif
+
     for (uint32_t b = 0; b < batch; b++) {
 #ifdef ENABLE_GLOBAL_CB
         uint32_t in1_cb_start_addr = 0;
