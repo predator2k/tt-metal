@@ -66,24 +66,49 @@ class MLP(LightweightModule):
         # TODO Clean up this code. With sharding, we load the normal weights and then shard them
         # Note: unsqueeze(0).unsqueeze(0) makes weights 4D [1, 1, H, W] to match attention weights
         # This is required for the dram_prefetcher to correctly interpret all weights
-        def as_sharded_tensor(name, type, dims):
+        # U11 (2026-05-24): SGLANG_TT_PREFETCHER_ZERO_WEIGHTS=1 replaces every
+        # MLP / attention weight tensor with all-zeros BEFORE upload to device.
+        # Combined with the matching attention.py injection, this makes the
+        # entire matmul math `out = x @ 0 = 0`. Used by the U11 functional test
+        # to distinguish "math is broken under ENABLE_GLOBAL_CB" (output stays
+        # at ~2^20 even with zero inputs) from "input data flow is wrong"
+        # (output goes to ~0 with zero inputs, proving math itself works).
+        # Cache filename is suffixed to avoid loading prior non-zero cache.
+        import os as _os_u11_mlp
+        _u11_zero_weights = _os_u11_mlp.environ.get("SGLANG_TT_PREFETCHER_ZERO_WEIGHTS", "0") == "1"
+
+        def _maybe_zero(t):
+            if _u11_zero_weights:
+                return torch.zeros_like(t)
+            return t
+
+        def _u11_cache(name):
+            base = cache_name(name)
+            if base is None:
+                return None
+            if _u11_zero_weights:
+                return type(base)(str(base) + "_u11zero")
+            return base
+
+        def as_sharded_tensor(name, ttnn_dtype, dims):
             # First get the raw weight and transpose it
             raw_weight = torch_weight(name[:2])  # This is 2D: [H, W]
             # Pad if needed
             padded_weight = pad_hidden_dim(raw_weight, dims[0] if args.is_galaxy else dims[-1])
             # Make 4D: [1, 1, H, W] - CRITICAL for prefetcher to work correctly
             torch_tensor = padded_weight.unsqueeze(0).unsqueeze(0)
+            torch_tensor = _maybe_zero(torch_tensor)
 
             result = ttnn.as_tensor(
                 torch_tensor,
-                dtype=type,
+                dtype=ttnn_dtype,
                 device=self.mesh_device,
                 mesh_mapper=ttnn.ShardTensor2dMesh(self.mesh_device, dims=dims, mesh_shape=args.cluster_shape),
                 layout=ttnn.TILE_LAYOUT,
                 memory_config=(
                     ttnn.DRAM_MEMORY_CONFIG if args.is_galaxy else w2_mem_config if "w2" in name else w1_w3_mem_config
                 ),
-                cache_file_name=cache_name(name),
+                cache_file_name=_u11_cache(name),
             )
             return result
 
@@ -160,7 +185,8 @@ class MLP(LightweightModule):
                 raw_weight = torch_weight(name[:2])
                 padded_weight = pad_hidden_dim(raw_weight, dims[0] if args.is_galaxy else dims[-1])
                 torch_tensor = padded_weight.unsqueeze(0).unsqueeze(0)
-                cache = cache_name(f"{name}_skip_ring")
+                torch_tensor = _maybe_zero(torch_tensor)
+                cache = _u11_cache(f"{name}_skip_ring")
                 return ttnn.as_tensor(
                     torch_tensor,
                     dtype=dtype,
@@ -182,7 +208,8 @@ class MLP(LightweightModule):
                 raw_weight = torch_weight(name[:2])
                 padded_weight = pad_hidden_dim(raw_weight, dims[0] if args.is_galaxy else dims[-1])
                 torch_tensor = padded_weight.unsqueeze(0).unsqueeze(0)
-                cache = cache_name(f"{name}_pdg")
+                torch_tensor = _maybe_zero(torch_tensor)
+                cache = _u11_cache(f"{name}_pdg")
                 return ttnn.as_tensor(
                     torch_tensor,
                     dtype=dtype,

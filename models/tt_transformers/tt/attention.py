@@ -488,6 +488,32 @@ class Attention(LightweightModule):
 
         qkv_cat = torch.cat(qkv_list, dim=-1).unsqueeze(0).unsqueeze(0)
 
+        # U11 (2026-05-24): SGLANG_TT_PREFETCHER_ZERO_WEIGHTS=1 replaces the
+        # source attention weight tensors with zeros BEFORE upload to device.
+        # All downstream variants (wqkv, wqkv_skip_ring, wqkv_pdg, wo,
+        # wo_sharded_ring, wo_skip_ring, wo_sharded_ring_pdg) derive from
+        # `qkv_cat` and `pt_wo` so are also zero. Functional test to separate
+        # "math wrong under ENABLE_GLOBAL_CB" (out stays huge) vs
+        # "input data flow wrong" (out goes to ~0). Cache filename is
+        # suffixed under the env gate to avoid loading prior non-zero cache.
+        import os as _os_u11_attn
+        _u11_zero_w = _os_u11_attn.environ.get("SGLANG_TT_PREFETCHER_ZERO_WEIGHTS", "0") == "1"
+
+        def _u11_maybe_zero(t):
+            if _u11_zero_w:
+                return torch.zeros_like(t)
+            return t
+
+        def _u11_attn_cache(name_str):
+            base = cache_name(name_str)
+            if base is None:
+                return None
+            if _u11_zero_w:
+                return type(base)(str(base) + "_u11zero")
+            return base
+
+        qkv_cat = _u11_maybe_zero(qkv_cat)
+
         self.wqkv = ttnn.as_tensor(
             qkv_cat,
             dtype=self.wqkv_dtype,
@@ -497,7 +523,7 @@ class Attention(LightweightModule):
             mesh_mapper=ttnn.ShardTensor2dMesh(
                 self.mesh_device, dims=(3, 2) if self.TG else (2, 3), mesh_shape=configuration.cluster_shape
             ),
-            cache_file_name=cache_name("wqkv_sharded_2d"),
+            cache_file_name=_u11_attn_cache("wqkv_sharded_2d"),
         )
 
         def norm_reshard(x, norm, mode, norm_config):
@@ -567,6 +593,8 @@ class Attention(LightweightModule):
         # For ring topology we can use all gather matmul for wo
         self.use_fused_all_gather_matmul = self.args.use_fused_all_gather_matmul
         pt_wo = state_dict[f"{wo_str}.weight"].transpose(-1, -2).unsqueeze(0).unsqueeze(0)
+        # U11: zero wo source tensor under env gate (see qkv_cat block above).
+        pt_wo = _u11_maybe_zero(pt_wo)
 
         wo_mem_config = configuration.create_dram_sharded_mem_config(
             (configuration.n_heads * configuration.head_dim) // configuration.num_devices, configuration.dim
@@ -589,7 +617,7 @@ class Attention(LightweightModule):
                 device=self.mesh_device,
                 memory_config=self.args.get_sharded_wo_ring_mem_config(),
                 mesh_mapper=get_wo_mesh_mapper(),
-                cache_file_name=(cache_name("wo_sharded_ring")),
+                cache_file_name=(_u11_attn_cache("wo_sharded_ring")),
             )
 
         def get_wo_memory_config():
@@ -606,7 +634,7 @@ class Attention(LightweightModule):
             memory_config=get_wo_memory_config(),
             mesh_mapper=get_wo_mesh_mapper(),
             cache_file_name=(
-                cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
+                _u11_attn_cache("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else _u11_attn_cache("wo")
             ),
         )
         if not use_paged_kv_cache:
@@ -674,7 +702,7 @@ class Attention(LightweightModule):
                         dims=(3, 2) if self.TG else (2, 3),
                         mesh_shape=configuration.cluster_shape,
                     ),
-                    cache_file_name=cache_name("wqkv_skip_ring") if not configuration.dummy_weights else None,
+                    cache_file_name=_u11_attn_cache("wqkv_skip_ring") if not configuration.dummy_weights else None,
                 )
             else:
                 self.wqkv_skip_ring = None
@@ -697,7 +725,7 @@ class Attention(LightweightModule):
                     device=self.mesh_device,
                     memory_config=_wo_skip_mem_config,
                     mesh_mapper=get_wo_mesh_mapper(),
-                    cache_file_name=cache_name("wo_skip_ring") if not configuration.dummy_weights else None,
+                    cache_file_name=_u11_attn_cache("wo_skip_ring") if not configuration.dummy_weights else None,
                 )
             else:
                 self.wo_skip_ring = None
@@ -720,7 +748,7 @@ class Attention(LightweightModule):
                         dims=(3, 2) if self.TG else (2, 3),
                         mesh_shape=configuration.cluster_shape,
                     ),
-                    cache_file_name=cache_name("wqkv_pdg") if not configuration.dummy_weights else None,
+                    cache_file_name=_u11_attn_cache("wqkv_pdg") if not configuration.dummy_weights else None,
                 )
                 _wo_shape_pdg = (
                     self.args.dim // self.args.cluster_shape[0],
@@ -738,7 +766,7 @@ class Attention(LightweightModule):
                     device=self.mesh_device,
                     memory_config=_wo_pdg_mem_config,
                     mesh_mapper=get_wo_mesh_mapper(),
-                    cache_file_name=cache_name("wo_sharded_ring_pdg") if not configuration.dummy_weights else None,
+                    cache_file_name=_u11_attn_cache("wo_sharded_ring_pdg") if not configuration.dummy_weights else None,
                 )
             else:
                 self.wqkv_pdg = None
