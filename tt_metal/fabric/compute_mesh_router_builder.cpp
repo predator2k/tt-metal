@@ -849,6 +849,18 @@ void ComputeMeshRouterBuilder::compile_ancillary_kernels(tt::tt_metal::Program& 
 void ComputeMeshRouterBuilder::create_kernel(tt::tt_metal::Program& program, const KernelCreationContext& ctx) {
     // Build defines
     std::map<std::string, std::string> defines = {};
+    // U24 — env-gated propagation of SGLANG_TT_U24_FABRIC_ADDR_PROBE to
+    // the fabric_erisc_router kernel and the headers it pulls in
+    // (notably tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp).
+    // When set, the router logs every incoming packet's tensix-L1
+    // destination address that falls in [0xa6000, 0xa7000].  Default
+    // off; canonical bytewise-equal.
+    {
+        const char* _u24_env = std::getenv("SGLANG_TT_U24_FABRIC_ADDR_PROBE");
+        if (_u24_env != nullptr && _u24_env[0] != '\0' && _u24_env[0] != '0') {
+            defines["SGLANG_TT_U24_FABRIC_ADDR_PROBE"] = "1";
+        }
+    }
     if (ctx.is_2D_routing) {
         defines["FABRIC_2D"] = "";
 

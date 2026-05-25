@@ -560,6 +560,14 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
         writer_defines["USE_WORKER_MUX"] = "1";
     }
 
+    // U24 — env-gated propagation for the ring RS writer path.
+    {
+        const char* _u24_env = std::getenv("SGLANG_TT_U24_FABRIC_ADDR_PROBE");
+        if (_u24_env != nullptr && _u24_env[0] != '\0' && _u24_env[0] != '0') {
+            writer_defines["SGLANG_TT_U24_FABRIC_ADDR_PROBE"] = "1";
+        }
+    }
+
     // KERNEL CREATION
     std::vector<size_t> mux_termination_signal_addresses;
     if (fuse_op) {
@@ -582,6 +590,15 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
         mux_base_l1_address);
     auto mux_kernel_id = 0;
     if (num_mux_cores_per_direction_per_link) {
+        // U24 — env-gated propagation of FABRIC_ADDR_PROBE to the ring
+        // path's fabric mux kernel.
+        std::map<std::string, std::string> ring_mux_defines;
+        {
+            const char* _u24_env = std::getenv("SGLANG_TT_U24_FABRIC_ADDR_PROBE");
+            if (_u24_env != nullptr && _u24_env[0] != '\0' && _u24_env[0] != '0') {
+                ring_mux_defines["SGLANG_TT_U24_FABRIC_ADDR_PROBE"] = "1";
+            }
+        }
         // Fabric mux kernel
         mux_kernel_id = tt::tt_metal::CreateKernel(
             program,
@@ -591,6 +608,7 @@ ReduceScatterProgramArtifacts build_ring_reduce_scatter_minimal_async_program_ar
                 .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
                 .noc = tt::tt_metal::NOC::RISCV_0_default,
                 .compile_args = mux_kernel_config.get_fabric_mux_compile_time_args(),
+                .defines = ring_mux_defines,
                 .opt_level = tt::tt_metal::KernelBuildOptLevel::O3});
     }
 
@@ -1295,6 +1313,20 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
     const char* u19_mp_env = std::getenv("SGLANG_TT_U19_MUX_PROBE");
     if (u19_mp_env != nullptr && std::string(u19_mp_env) == "1") {
         mux_compute_defines["SGLANG_TT_U19_MUX_PROBE"] = "1";
+    }
+
+    // U24 — env-gated propagation of SGLANG_TT_U24_FABRIC_ADDR_PROBE to
+    // the RS writer (and mux) kernels.  These kernels include
+    // tt_metal/fabric/hw/inc/edm_fabric/fabric_edm_packet_transmission.hpp
+    // transitively via the fabric_connection_manager headers.  Logs
+    // fabric-destination L1 addresses in [0xa6000, 0xa7000].
+    {
+        const char* _u24_env = std::getenv("SGLANG_TT_U24_FABRIC_ADDR_PROBE");
+        if (_u24_env != nullptr && _u24_env[0] != '\0' && _u24_env[0] != '0') {
+            writer_compute_defines["SGLANG_TT_U24_FABRIC_ADDR_PROBE"] = "1";
+            reader_compute_defines["SGLANG_TT_U24_FABRIC_ADDR_PROBE"] = "1";
+            mux_compute_defines["SGLANG_TT_U24_FABRIC_ADDR_PROBE"] = "1";
+        }
     }
 
     // mux kernel

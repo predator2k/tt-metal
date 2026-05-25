@@ -12,6 +12,40 @@
 #include <tt-metalium/experimental/fabric/fabric_edm_types.hpp>
 #include "tt_metal/fabric/hw/inc/edm_fabric/fabric_erisc_router_ct_args.hpp"
 
+#ifdef SGLANG_TT_U24_FABRIC_ADDR_PROBE
+// U24 — Fabric/EDM destination-address probe.  Logs any fabric-arrived
+// packet whose tensix-L1 destination falls in the window
+// [0xa6000, 0xa7000].  This window covers the cursed L1 address 0xa6700
+// on receiver core (2,7) identified in U17/U18/U21.  Per-RISC budgeted
+// to avoid log blow-up; expected zero hits unless fabric is the
+// stomper.  The destination noc address packs (NocXY << 32) | l1_addr.
+#include "api/debug/dprint.h"
+namespace tt {
+namespace u24_probe {
+inline uint32_t& fabric_addr_probe_budget() {
+    static uint32_t budget = 4096;
+    return budget;
+}
+}  // namespace u24_probe
+}  // namespace tt
+#define SGLANG_TT_U24_LOG_FABRIC_DST(tag, dst64)                                                 \
+    do {                                                                                         \
+        uint64_t _u24_dst = (uint64_t)(dst64);                                                   \
+        uint32_t _u24_l1 = (uint32_t)(_u24_dst & 0xFFFFFFFFULL);                                 \
+        uint32_t _u24_noc_xy = (uint32_t)((_u24_dst >> 32) & 0xFFFFFFFFULL);                     \
+        if (_u24_l1 >= 0xa6000 && _u24_l1 < 0xa7000) {                                           \
+            auto& _u24_budget = tt::u24_probe::fabric_addr_probe_budget();                       \
+            if (_u24_budget > 0) {                                                               \
+                _u24_budget--;                                                                   \
+                DPRINT << "[U24_FABRIC_WRITE " << tag << " noc_xy=0x" << HEX() << _u24_noc_xy    \
+                       << " l1=0x" << _u24_l1 << DEC() << "]" << ENDL();                         \
+            }                                                                                    \
+        }                                                                                        \
+    } while (0)
+#else
+#define SGLANG_TT_U24_LOG_FABRIC_DST(tag, dst64) ((void)0)
+#endif
+
 // If the hop/distance counter equals to the below value, it indicates that it has
 // arrived at (at least one of) the intended destination(s)
 static constexpr size_t DESTINATION_HOP_COUNT = 1;
@@ -172,6 +206,7 @@ FORCE_INLINE
     switch (noc_send_type) {
         case tt::tt_fabric::NocSendType::NOC_UNICAST_WRITE: {
             const auto dest_address = header.command_fields.unicast_write.noc_address;
+            SGLANG_TT_U24_LOG_FABRIC_DST("unicast_write", dest_address);
             noc_async_write_one_packet_with_trid<update_counter, false>(
                 payload_start_address,
                 dest_address,
@@ -184,6 +219,7 @@ FORCE_INLINE
 
         case tt::tt_fabric::NocSendType::NOC_UNICAST_ATOMIC_INC: {
             const uint64_t dest_address = header.command_fields.unicast_seminc.noc_address;
+            SGLANG_TT_U24_LOG_FABRIC_DST("unicast_seminc", dest_address);
             const auto increment = header.command_fields.unicast_seminc.val;
             if (header.command_fields.unicast_seminc.flush) {
                 flush_write_to_noc_pipeline(rx_channel_id);
@@ -198,6 +234,7 @@ FORCE_INLINE
 
         case tt::tt_fabric::NocSendType::NOC_UNICAST_INLINE_WRITE: {
             const auto dest_address = header.command_fields.unicast_inline_write.noc_address;
+            SGLANG_TT_U24_LOG_FABRIC_DST("unicast_inline_write", dest_address);
             const auto value = header.command_fields.unicast_inline_write.value;
             noc_inline_dw_write<InlineWriteDst::DEFAULT, true>(
                 dest_address,
@@ -209,6 +246,7 @@ FORCE_INLINE
 
         case tt::tt_fabric::NocSendType::NOC_FUSED_UNICAST_ATOMIC_INC: {
             const auto dest_address = header.command_fields.unicast_seminc_fused.noc_address;
+            SGLANG_TT_U24_LOG_FABRIC_DST("fused_seminc_write", dest_address);
             noc_async_write_one_packet_with_trid<update_counter, false>(
                 payload_start_address,
                 dest_address,
@@ -219,6 +257,7 @@ FORCE_INLINE
                 tt::tt_fabric::forward_and_local_write_noc_vc);
 
             const uint64_t semaphore_dest_address = header.command_fields.unicast_seminc_fused.semaphore_noc_address;
+            SGLANG_TT_U24_LOG_FABRIC_DST("fused_seminc_sem", semaphore_dest_address);
             const auto increment = header.command_fields.unicast_seminc_fused.val;
             if (header.command_fields.unicast_seminc_fused.flush) {
                 flush_write_to_noc_pipeline(rx_channel_id);
@@ -247,6 +286,7 @@ FORCE_INLINE
             // 2. 2 unicast writes followed by a semaphore increment
             // First chunk is guaranteed to be a unicast write
             uint16_t chunk_size = scatter.chunk_size[0];
+            SGLANG_TT_U24_LOG_FABRIC_DST("scatter_write_0", scatter.noc_address[0]);
             noc_async_write_one_packet_with_trid<update_counter, false>(
                 payload_start_address + offset,
                 scatter.noc_address[0],
@@ -260,6 +300,7 @@ FORCE_INLINE
             if (chunk_count > 2) {
                 // Second chunk is guaranteed to be a unicast write
                 chunk_size = scatter.chunk_size[1];
+                SGLANG_TT_U24_LOG_FABRIC_DST("scatter_write_1", scatter.noc_address[1]);
                 noc_async_write_one_packet_with_trid<update_counter, false>(
                     payload_start_address + offset,
                     scatter.noc_address[1],
@@ -273,6 +314,7 @@ FORCE_INLINE
                 if (chunk_count == 4) [[likely]] {
                     // If there are 4 chunks, the third chunk is guaranteed to be a unicast write
                     chunk_size = scatter.chunk_size[2];
+                    SGLANG_TT_U24_LOG_FABRIC_DST("scatter_write_2", scatter.noc_address[2]);
                     noc_async_write_one_packet_with_trid<update_counter, false>(
                         payload_start_address + offset,
                         scatter.noc_address[2],
@@ -291,6 +333,7 @@ FORCE_INLINE
             const uint64_t final_destination_noc_address = scatter.noc_address[last_chunk_index];
             if (chunk_encoding == ChunkEncoding::CHUNK_ENCODING_UNICAST_WRITE) {
                 const uint16_t final_chunk_size = static_cast<uint16_t>(payload_size_bytes - offset);
+                SGLANG_TT_U24_LOG_FABRIC_DST("scatter_write_last", final_destination_noc_address);
                 noc_async_write_one_packet_with_trid<update_counter, false>(
                     payload_start_address + offset,
                     final_destination_noc_address,
@@ -302,6 +345,7 @@ FORCE_INLINE
                 if (chunk_encoding == ChunkEncoding::CHUNK_ENCODING_SEMINC_FLUSH) {
                     flush_write_to_noc_pipeline(rx_channel_id);
                 }
+                SGLANG_TT_U24_LOG_FABRIC_DST("scatter_seminc_last", final_destination_noc_address);
                 // If a semaphore increment is being performed, the increment value is fed in in the chunk size, to
                 // reduce payload size
                 noc_semaphore_inc<true>(
