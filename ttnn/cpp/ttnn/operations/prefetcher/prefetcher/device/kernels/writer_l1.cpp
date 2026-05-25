@@ -37,6 +37,12 @@ void kernel_main() {
         (uint32_t*)(get_arg_addr(increment_arg_idx(rt_args_idx, num_tensors)));  // Kt / num_blocks = in_block_h;
 
     uint32_t noc = noc_index;
+#ifdef SGLANG_TT_U18_PREFETCHER_WRITE_PROBE
+    // U18 Phase 3 — log GlobalCB destination addresses written by the
+    // prefetcher writer_l1.  If any destination address lands at
+    // 0xa6700 (the W2 output L1 address), we've found the stomper.
+    static uint32_t u18_pref_write_budget = 256;
+#endif
     for (uint32_t layer = 0; layer < num_layers; layer++) {
         for (uint32_t t = 0; t < num_tensors; t++) {
             uint32_t curr_coalesced_page_size = coalesced_page_sizes[t];
@@ -54,6 +60,27 @@ void kernel_main() {
                     cb_wait_front(local_cb_id, max_block_num_tiles);
                     experimental::remote_cb_reserve_back(remote_cb_id, 1);
                     uint32_t local_cb_addr = get_read_ptr(local_cb_id);
+#ifdef SGLANG_TT_U18_PREFETCHER_WRITE_PROBE
+                    // Read the fifo_wr_ptr that the upcoming write will
+                    // target — same value the kernel uses internally for
+                    // dest_addr.
+                    {
+                        auto& _u18_remote_cb =
+                            get_remote_sender_cb_interface(remote_cb_id);
+                        uint32_t _u18_wr_ptr = _u18_remote_cb.fifo_wr_ptr;
+                        uint32_t _u18_start = _u18_remote_cb.fifo_start_addr;
+                        if (u18_pref_write_budget > 0) {
+                            u18_pref_write_budget--;
+                            DPRINT << "[U18_PREF_WR layer=" << layer
+                                   << " t=" << t
+                                   << " blk=" << block
+                                   << " wr_ptr=0x" << HEX() << _u18_wr_ptr
+                                   << " fifo_start=0x" << _u18_start
+                                   << " local_cb=0x" << local_cb_addr
+                                   << DEC() << "]" << ENDL();
+                        }
+                    }
+#endif
                     experimental::remote_cb_push_back_and_write_pages<skip_ptr_update>(
                         remote_cb_id,
                         local_cb_addr,

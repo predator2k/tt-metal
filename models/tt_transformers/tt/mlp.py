@@ -577,6 +577,34 @@ class MLP(LightweightModule):
             )
         ttnn.deallocate(w2_in)
 
+        # ---- U18 Probe P2 (env-gated): W2 matmul output buffer address ----
+        # Print w2_out.buffer_address() on EVERY layer 0 invocation so we
+        # can compare to U17's RS reader in_addr=0xa6700.  If the address
+        # CHANGES across iterations -> trace replay isn't using the
+        # captured addr -> P2 confirmed.  If it's stable at 0xa6700 ->
+        # the config side is right and the bug is P1 or P3.
+        import os as _u18p_os
+        if _u18p_os.environ.get("SGLANG_TT_U18_ADDR_PROBE", "0") == "1":
+            try:
+                _u18p_layer = (
+                    (int(self.layer_num) == 0) if hasattr(self, "layer_num") else True
+                )
+                if _u18p_layer:
+                    self._u18_forward_count = getattr(self, "_u18_forward_count", 0) + 1
+                    _u18p_ba = w2_out.buffer_address()
+                    _u18p_mc = w2_out.memory_config()
+                    _u18p_ss = _u18p_mc.shard_spec
+                    print(
+                        f"[U18_W2_ADDR] iter={self._u18_forward_count} "
+                        f"layer={getattr(self, 'layer_num', '?')} "
+                        f"w2_out.addr=0x{_u18p_ba:x} "
+                        f"shape={tuple(w2_out.shape)} "
+                        f"shard_grid={_u18p_ss.grid if _u18p_ss else 'None'}",
+                        flush=True,
+                    )
+            except Exception as _u18p_e:
+                print(f"[U18_W2_ADDR] ERROR: {type(_u18p_e).__name__}: {_u18p_e}", flush=True)
+
         # ---- U15 Probe F (env-gated, layer 0 only): pre-AR W2 matmul output ----
         import os as _u15f_os
         _u15f_layer = (

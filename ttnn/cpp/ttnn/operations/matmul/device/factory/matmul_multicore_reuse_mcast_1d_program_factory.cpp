@@ -2383,6 +2383,15 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (pack_probe_env != nullptr && std::string(pack_probe_env) == "1") {
             mm_kernel_defines["SGLANG_TT_PREFETCHER_PACK_PROBE"] = "1";
         }
+        // U18 Phase 1 — large-budget PACK probe under TRACE REPLAY.  Same
+        // kernel-side read pattern as U13's PACK_PROBE but with a budget
+        // sized for many trace replays + a running total counter so we
+        // can verify PACK actually fires under trace.  Distinct env var
+        // so this can be enabled without U13's smaller-budget probe.
+        const char* u18_pack_probe_env = std::getenv("SGLANG_TT_U18_PACK_PROBE");
+        if (u18_pack_probe_env != nullptr && std::string(u18_pack_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U18_PACK_PROBE"] = "1";
+        }
         // U14 (end-of-matmul-kernel mm_out_cb L1 re-read probe).  Reads
         // mm_out_cb's L1 region AFTER all loops are done and just before
         // the matmul kernel returns.  If mm_out_cb is still all zero at

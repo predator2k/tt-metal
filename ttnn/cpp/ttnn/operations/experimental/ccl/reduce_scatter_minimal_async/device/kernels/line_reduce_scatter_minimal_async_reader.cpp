@@ -184,7 +184,12 @@ void kernel_main() {
     // scratch slot (reuse cb_input_id's first reserve).  Per-launch
     // budget keeps log size bounded.
     {
-        static uint32_t u17_pre_budget = 16;
+        // U18 Phase 3 — bumped from 16 to 2048 so we capture trace-replay
+        // state across many decode steps, paired with the bumped U14
+        // CONSUMER_PROBE.
+        static uint32_t u17_pre_budget = 2048;
+        static uint32_t u17_pre_total = 0;
+        u17_pre_total++;
         if (u17_pre_budget > 0) {
             u17_pre_budget--;
             cb_reserve_back(cb_input_id, 1);
@@ -208,7 +213,8 @@ void kernel_main() {
                    << " w1=0x" << v[1]
                    << " w2=0x" << v[2]
                    << " w3=0x" << v[3]
-                   << " " << DEC() << (any_nonzero ? "NONZERO" : "zero")
+                   << " " << DEC() << " tot=" << u17_pre_total
+                   << " " << (any_nonzero ? "NONZERO" : "zero")
                    << "]" << ENDL();
             // Do NOT push_back — leave scratch reserved-but-not-consumed,
             // we'll write over it in the normal flow.  Or rather: we just

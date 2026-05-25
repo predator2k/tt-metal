@@ -15,12 +15,12 @@
 #endif
 
 #if defined(SGLANG_TT_PREFETCHER_LLK_PROBE) || defined(SGLANG_TT_PREFETCHER_PACK_PROBE) || \
-    defined(SGLANG_TT_PREFETCHER_CONSUMER_PROBE)
-// U12 / U13 / U14: LLK / PACK / CONSUMER debug probes.  Loaded only when an
-// env-gated SGLANG_TT_PREFETCHER_*_PROBE compile-time define is propagated
-// by the program factory (gated by the corresponding environment variable,
-// only on the gathered/use_global_cb path so canonical builds are
-// untouched).
+    defined(SGLANG_TT_PREFETCHER_CONSUMER_PROBE) || defined(SGLANG_TT_U18_PACK_PROBE)
+// U12 / U13 / U14 / U18: LLK / PACK / CONSUMER debug probes.  Loaded only
+// when an env-gated SGLANG_TT_PREFETCHER_*_PROBE / SGLANG_TT_U18_PACK_PROBE
+// compile-time define is propagated by the program factory (gated by the
+// corresponding environment variable, only on the gathered/use_global_cb
+// path so canonical builds are untouched).
 #include "api/debug/dprint.h"
 #include "api/debug/dprint_tensix.h"
 #include "api/debug/dprint_tensix_unpack.h"
@@ -659,6 +659,60 @@ void kernel_main() {
                         }
 #endif
 
+#ifdef SGLANG_TT_U18_PACK_PROBE
+                        // U18 Phase 1 — large-budget PACK probe targeted at
+                        // the W2 matmul under TRACE REPLAY.  U13 ran with
+                        // SGLANG_TT_DISABLE_PREFILL_TRACE=1 (eager only).
+                        // This probe runs WITHOUT that, so it observes PACK
+                        // behavior during trace replay launches as well as
+                        // the compile-run launch.  Tag includes ELF hash so
+                        // we can filter to W2 in postprocessing.  Budget
+                        // bumped to 2048 to cover ~64 decode steps * ~32
+                        // subblock launches per launch.
+                        {
+                            constexpr uint32_t u18_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u18_out_budget = 2048;
+                            static uint32_t u18_out_total = 0;
+                            PACK((
+                                {
+                                    u18_out_total++;
+                                    if (u18_out_budget > 0) {
+                                        u18_out_budget--;
+                                        ckernel::tensix_sync();
+                                        uint32_t l1_addr = CB_WR_PTR(mm_out_cb_id);
+                                        volatile tt_l1_ptr uint32_t* p =
+                                            reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_addr);
+                                        uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+                                        bool any_nonzero =
+                                            v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+                                        DPRINT << "[U18_PACK elf=0x" << HEX()
+                                               << u18_elf_tag
+                                               << " l1=0x" << l1_addr
+                                               << DEC() << " tot=" << u18_out_total
+                                               << " b=" << b
+                                               << " blk=" << block
+                                               << " is0=" << in0_subblock
+                                               << " is1=" << in1_subblock
+                                               << " w0=0x" << HEX() << v[0]
+                                               << " w1=0x" << v[1]
+                                               << " w2=0x" << v[2]
+                                               << " w3=0x" << v[3]
+                                               << " "
+                                               << (any_nonzero ? "NONZERO" : "zero")
+                                               << "]" << ENDL();
+                                    }
+                                }
+                            ));
+                        }
+#endif
+
                         tile_regs_release();
                         if constexpr (untilize_out) {
                             pack_untilize_uninit(mm_out_cb_id);
@@ -815,9 +869,15 @@ void kernel_main() {
                 (out_subblock_h * 31u) ^
                 (out_subblock_w * 257u) ^
                 (batch * 65537u);
-            static uint32_t u14_end_budget = 16;
+            // U18 Phase 3 — bumped from 16 to 2048 so we capture trace-replay
+            // state, not just the compile-run state.  Combined with U17_PRE_RS,
+            // this lets us see whether L1 at kernel exit (zero) becomes
+            // NONZERO before RS reader runs (= P3 confirmed).
+            static uint32_t u14_end_budget = 2048;
+            static uint32_t u14_end_total = 0;
             PACK((
                 {
+                    u14_end_total++;
                     if (u14_end_budget > 0) {
                         u14_end_budget--;
                         ckernel::tensix_sync();
@@ -834,7 +894,8 @@ void kernel_main() {
                         DPRINT << "[U14_END_OUT elf=0x" << HEX()
                                << u14_elf_tag
                                << " l1=0x" << l1_start
-                               << DEC() << " b=" << b
+                               << DEC() << " tot=" << u14_end_total
+                               << " b=" << b
                                << " w0=0x" << HEX() << v[0]
                                << " w1=0x" << v[1]
                                << " w2=0x" << v[2]

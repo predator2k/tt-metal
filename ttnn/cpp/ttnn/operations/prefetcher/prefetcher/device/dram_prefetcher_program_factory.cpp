@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
+#include <cstdlib>
+#include <map>
+#include <string>
 
 #include <tt-metalium/work_split.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -208,6 +211,16 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
     // Configs to enable for performance mode
     writer_ct_args.push_back((uint32_t)enable_performance_mode /* skip_ptr_update */);
 
+    // U18 Phase 3 — env-gated propagation of SGLANG_TT_U18_PREFETCHER_WRITE_PROBE
+    // to the prefetcher writer_l1 kernel so it can DPRINT fifo_wr_ptr per
+    // remote write.  Default-off; canonical bytewise-equal.
+    std::map<std::string, std::string> writer_defines;
+    {
+        const char* env = std::getenv("SGLANG_TT_U18_PREFETCHER_WRITE_PROBE");
+        if (env != nullptr && std::string(env) == "1") {
+            writer_defines["SGLANG_TT_U18_PREFETCHER_WRITE_PROBE"] = "1";
+        }
+    }
     auto writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/prefetcher/prefetcher/device/kernels/writer_l1.cpp",
@@ -216,7 +229,8 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
             .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
             .noc = tt::tt_metal::NOC::RISCV_0_default,
             .noc_mode = tt::tt_metal::NOC_MODE::DM_DEDICATED_NOC,
-            .compile_args = writer_ct_args});
+            .compile_args = writer_ct_args,
+            .defines = writer_defines});
 
     /* Runtime args */
     std::vector<uint32_t> page_sizes;
