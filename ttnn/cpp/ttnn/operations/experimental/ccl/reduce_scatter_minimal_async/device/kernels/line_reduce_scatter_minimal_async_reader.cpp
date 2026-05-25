@@ -259,6 +259,23 @@ void kernel_main() {
                    << " " << DEC() << " tot=" << u17_pre_total
                    << " " << (any_nonzero ? "NONZERO" : "zero")
                    << "]" << ENDL();
+#ifdef SGLANG_TT_U25_BYTE_HUNT
+            // U25 Path B — byte-pattern identity tracing on device.
+            // When the U17 probe sees NONZERO bytes at the cursed L1
+            // 0xa6700, hunt for the source by:
+            //   (1) scanning the SAME NoC core's L1 [0x10000, 0x1c0000]
+            //       at 0x40 stride for matching 16-byte windows;
+            //   (2) probing the SAME L1 address (0xa6700) on multiple
+            //       OTHER tensix cores on chip 0 to see who else holds
+            //       these bytes (mcast destinations?).
+            // Per-RISC budget caps log size.
+            // U25 v4 — disabled, was hanging.  Same-core L1 scan
+            // already proved bytes don't exist anywhere else in
+            // (2,7)'s L1 [0x10000, 0x1c0000].  Path B exhausted
+            // for device-side hunting; pivoting to host-side
+            // analysis.
+            (void)any_nonzero;
+#endif
 #ifdef SGLANG_TT_U19_ADDR_DUMP
             // U19 — also dump intermediate & output addresses so we can
             // correlate every RS dispatch's full tensor-address triple

@@ -231,6 +231,16 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
             writer_defines["SGLANG_TT_U21_PREFETCHER_ADDR_PROBE"] = "1";
         }
     }
+    // U25 Path A — env-gated probe of update_remote_cb_config_in_l1 call
+    // site in writer_l1.cpp.  Logs dest = config_ptr + offsetof(fifo_rd_ptr)
+    // and flags any write target landing in [0xa6000, 0xa7000] (the
+    // L1 0xa6700 stomp window).  Default-off; canonical bytewise-equal.
+    {
+        const char* env = std::getenv("SGLANG_TT_U25_RCB_PROBE");
+        if (env != nullptr && std::string(env) == "1") {
+            writer_defines["SGLANG_TT_U25_RCB_PROBE"] = "1";
+        }
+    }
     auto writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/prefetcher/prefetcher/device/kernels/writer_l1.cpp",

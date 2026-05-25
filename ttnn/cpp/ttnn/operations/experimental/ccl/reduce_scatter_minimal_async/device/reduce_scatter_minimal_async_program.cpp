@@ -1281,6 +1281,16 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
         reader_compute_defines["SGLANG_TT_U19_FORCE_PRODUCER_ZERO"] = "1";
     }
 
+    // U25 Path B — BYTE HUNT: scan candidate L1 base addresses on
+    // the probe's source core for the same 16-byte pattern as
+    // observed at L1 0xa6700.  Identifies which L1 buffer contains
+    // the source bytes => identifies the source tensor.  Requires
+    // SGLANG_TT_U17_PROBE_RS_PRE=1 to be set as well.
+    const char* u25_bh_env = std::getenv("SGLANG_TT_U25_BYTE_HUNT");
+    if (u25_bh_env != nullptr && std::string(u25_bh_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U25_BYTE_HUNT"] = "1";
+    }
+
     // KERNEL CREATION
     if (fuse_op) {
         fused_op_signaler->init_reduce_scatter(program, mesh_device, sender_worker_core_range_set);

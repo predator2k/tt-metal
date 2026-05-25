@@ -139,6 +139,42 @@ void kernel_main() {
         }
     }
 
+#ifdef SGLANG_TT_U25_RCB_PROBE
+    // U25 Path A — log the prefetcher's call to
+    // update_remote_cb_config_in_l1.  Writes
+    // remote_cb_interface.fifo_rd_ptr (== fifo_wr_ptr for sender — both
+    // structs alias) to LOCAL L1 at
+    // `config_ptr + offsetof(RemoteReceiverCBInterface, fifo_rd_ptr)`.
+    // Note: U21 already showed prefetcher's config_ptr = 0x17f640;
+    // re-verify under U25 to confirm the destination.
+    {
+        auto& _u25_rcb = get_remote_sender_cb_interface(remote_cb_id);
+        uint32_t _u25_config_ptr = _u25_rcb.config_ptr;
+        uint32_t _u25_dest_addr =
+            _u25_config_ptr + offsetof(RemoteReceiverCBInterface, fifo_rd_ptr);
+        uint32_t _u25_value = _u25_rcb.fifo_wr_ptr;
+        bool _u25_hits_stomp =
+            (_u25_dest_addr >= 0xa6000 && _u25_dest_addr < 0xa7000);
+        static uint32_t _u25_pref_budget = 256;
+        if (_u25_pref_budget > 0) {
+            _u25_pref_budget--;
+            DPRINT << "[U25_RCB_PREF cb=" << remote_cb_id
+                   << " config_ptr=0x" << HEX() << _u25_config_ptr
+                   << " dest=0x" << _u25_dest_addr
+                   << " value=0x" << _u25_value
+                   << DEC()
+                   << " hits_stomp=" << (uint32_t)_u25_hits_stomp
+                   << "]" << ENDL();
+        }
+        if (_u25_hits_stomp) {
+            DPRINT << "[U25_RCB_PREF_STOMP_HIT cb=" << remote_cb_id
+                   << " config_ptr=0x" << HEX() << _u25_config_ptr
+                   << " dest=0x" << _u25_dest_addr
+                   << " value=0x" << _u25_value
+                   << "]" << ENDL();
+        }
+    }
+#endif
     experimental::update_remote_cb_config_in_l1(remote_cb_id);
     noc_async_atomic_barrier();
     // reset noc counters here because we didn't properly update ptrs for better perf.

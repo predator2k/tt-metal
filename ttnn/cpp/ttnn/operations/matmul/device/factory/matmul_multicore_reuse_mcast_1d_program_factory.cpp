@@ -2431,6 +2431,17 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
             mm_in0_kernel_defines["SGLANG_TT_U20_DATAFLOW_PROBE"] = "1";
             mm_in1_kernel_defines["SGLANG_TT_U20_DATAFLOW_PROBE"] = "1";
         }
+        // U25 Path A — env-gated probe of in1 reader's call to
+        // update_remote_cb_config_in_l1 (the last un-probed write-to-L1
+        // path on the receiver core).  Logs config_ptr + dest =
+        // config_ptr + offsetof(fifo_rd_ptr) (== 16 on tensix) and
+        // flags any dest in [0xa6000, 0xa7000].  Default-off; canonical
+        // bytewise-equal.  Only fires under ENABLE_GLOBAL_CB (gathered
+        // matmul path).
+        const char* u25_rcb_probe_env = std::getenv("SGLANG_TT_U25_RCB_PROBE");
+        if (u25_rcb_probe_env != nullptr && std::string(u25_rcb_probe_env) == "1") {
+            mm_in1_kernel_defines["SGLANG_TT_U25_RCB_PROBE"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {

@@ -250,6 +250,42 @@ void kernel_main() {
     }
 
 #ifdef ENABLE_GLOBAL_CB
+#ifdef SGLANG_TT_U25_RCB_PROBE
+    // U25 Path A — instrument the in1 reader's call to
+    // update_remote_cb_config_in_l1.  This writes
+    // `fifo_rd_ptr` to local L1 at
+    // `config_ptr + offsetof(RemoteReceiverCBInterface, fifo_rd_ptr)`
+    // (offsetof = 16 on tensix).  If config_ptr happens to be
+    // 0xa66f0 on this receiver core, the write lands at 0xa6700
+    // — the cursed stomp address.
+    {
+        auto& _u25_rcb = get_remote_receiver_cb_interface(remote_cb_id);
+        uint32_t _u25_config_ptr = _u25_rcb.config_ptr;
+        uint32_t _u25_dest_addr =
+            _u25_config_ptr + offsetof(RemoteReceiverCBInterface, fifo_rd_ptr);
+        uint32_t _u25_value = _u25_rcb.fifo_rd_ptr;
+        bool _u25_hits_stomp =
+            (_u25_dest_addr >= 0xa6000 && _u25_dest_addr < 0xa7000);
+        static uint32_t _u25_in1_budget = 256;
+        if (_u25_in1_budget > 0) {
+            _u25_in1_budget--;
+            DPRINT << "[U25_RCB_IN1 cb=" << remote_cb_id
+                   << " config_ptr=0x" << HEX() << _u25_config_ptr
+                   << " dest=0x" << _u25_dest_addr
+                   << " value=0x" << _u25_value
+                   << DEC()
+                   << " hits_stomp=" << (uint32_t)_u25_hits_stomp
+                   << "]" << ENDL();
+        }
+        if (_u25_hits_stomp) {
+            DPRINT << "[U25_RCB_IN1_STOMP_HIT cb=" << remote_cb_id
+                   << " config_ptr=0x" << HEX() << _u25_config_ptr
+                   << " dest=0x" << _u25_dest_addr
+                   << " value=0x" << _u25_value
+                   << "]" << ENDL();
+        }
+    }
+#endif
     experimental::update_remote_cb_config_in_l1(remote_cb_id);
     noc.async_atomic_barrier();
 #endif
