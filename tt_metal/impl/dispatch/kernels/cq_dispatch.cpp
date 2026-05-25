@@ -506,6 +506,13 @@ void process_write_linear(uint32_t num_mcast_dests) {
     uint32_t write_offset_index = cmd->write_linear.write_offset_index;
     uint64_t dst_addr = cmd->write_linear.addr + write_offset[write_offset_index];
     uint64_t length = cmd->write_linear.length;
+#ifdef SGLANG_TT_U22_DISP_TRACE
+    // Path A — filter only the cursed L1 range [0xa6000, 0xa7000].
+    if (dst_addr >= 0xa6000 && dst_addr < 0xa7000) {
+        DPRINT << "[U22_DISP wl] noc=0x" << HEX() << dst_noc << " a=0x" << dst_addr
+               << " len=" << DEC() << (uint32_t)length << " mc=" << num_mcast_dests << ENDL();
+    }
+#endif
     uint32_t data_ptr = cmd_ptr + sizeof(CQDispatchCmdLarge);
     // DPRINT << "process_write_linear noc_xy:0x" << HEX() << dst_noc << ", write_offset:" << write_offset_index << ",
     // dst_addr:0x" << dst_addr << ", length:0x" << length << ", data_ptr:0x" << data_ptr << DEC() << ENDL();
@@ -634,6 +641,17 @@ void process_write_packed(uint32_t flags, uint32_t* l1_cache) {
     uint32_t dst_addr = cmd->write_packed.addr + write_offset[write_offset_index];
 
     ASSERT(xfer_size <= dispatch_cb_page_size);
+#ifdef SGLANG_TT_U22_DISP_TRACE
+    if (dst_addr >= 0xa6000 && dst_addr < 0xa7000) {
+        DPRINT << "[U22_DISP wp] a=0x" << HEX() << dst_addr
+               << " xs=" << DEC() << xfer_size << " ct=" << count
+               << " mcast=" << (uint32_t)mcast << ENDL();
+    } else if (dst_addr >= 0xa0000 && dst_addr < 0xb0000) {
+        DPRINT << "[U22_DISP wp_near] a=0x" << HEX() << dst_addr
+               << " xs=" << DEC() << xfer_size << " ct=" << count
+               << " mcast=" << (uint32_t)mcast << ENDL();
+    }
+#endif
 
     uint32_t data_ptr = cmd_ptr + sizeof(CQDispatchCmd) + count * sizeof(WritePackedSubCmd);
     data_ptr = round_up_pow2(data_ptr, L1_ALIGNMENT);
@@ -774,6 +792,13 @@ void process_write_packed_large(uint32_t* l1_cache) {
         // This avoids the need to handle the special case where 65536 bytes overflows to 0
         uint32_t length = sub_cmd_ptr->length_minus1 + 1;
         uint32_t num_dests = sub_cmd_ptr->num_mcast_dests;
+#ifdef SGLANG_TT_U22_DISP_TRACE
+        if (dst_addr >= 0xa6000 && dst_addr < 0xa7000) {
+            DPRINT << "[U22_DISP wpl] noc=0x" << HEX() << (uint32_t)sub_cmd_ptr->noc_xy_addr
+                   << " a=0x" << dst_addr << " len=" << DEC() << length
+                   << " mc=" << num_dests << ENDL();
+        }
+#endif
         uint32_t pad_size = align_power_of_2(length, alignment) - length;
         uint32_t unlink = sub_cmd_ptr->flags & CQ_DISPATCH_CMD_PACKED_WRITE_LARGE_FLAG_UNLINK;
         auto wait_for_barrier = [&]() {

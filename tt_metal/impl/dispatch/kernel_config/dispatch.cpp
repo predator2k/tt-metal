@@ -567,6 +567,21 @@ void DispatchKernel::CreateKernel() {
     if (device_->sysmem_manager().is_dram_backed()) {
         defines["DRAM_BACKED_CQ_BANK_ID"] = std::to_string(device_->sysmem_manager().get_dram_region_bank_id());
     }
+    // U22 Path A — env-gated dispatcher write probe.  When
+    // SGLANG_TT_U22_DISP_TRACE is set in the env at host (build)
+    // time, instrument process_write_linear / process_write_packed
+    // / process_write_packed_large to DPRINT any dst_addr in
+    // [0xa6000, 0xa7000].  Used to find the unknown stomper at
+    // L1 0xa6700 on receiver core (2,7).
+    {
+        const char* _u22_disp = std::getenv("SGLANG_TT_U22_DISP_TRACE");
+        log_info(tt::LogMetal, "[U22] DispatchKernel build: env SGLANG_TT_U22_DISP_TRACE='{}'",
+                 _u22_disp ? _u22_disp : "(unset)");
+        if (_u22_disp && _u22_disp[0] == '1') {
+            defines["SGLANG_TT_U22_DISP_TRACE"] = "1";
+            log_info(tt::LogMetal, "[U22] DispatchKernel: enabling dispatcher write probe");
+        }
+    }
     // Runtime args offsets
     defines["OFFSETOF_MY_DEV_ID"] = std::to_string(static_config_.offsetof_my_dev_id.value_or(0));
     defines["OFFSETOF_TO_DEV_ID"] = std::to_string(static_config_.offsetof_to_dev_id.value_or(0));

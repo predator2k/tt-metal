@@ -738,6 +738,116 @@ class MLP(LightweightModule):
                 print(f"[U19_COPY_W2] ERROR: {type(_u19cp_e).__name__}: {_u19cp_e}",
                       flush=True)
 
+        # U22 — Path B: sharding-preserving address relocation.
+        # CLONE_W2 (U19) reallocates but `ttnn.clone` may perturb the
+        # shard map.  These three variants attempt to move w2_out off
+        # the cursed L1 0xa6700 slot while PRESERVING the original
+        # sharding spec exactly:
+        #   _RESHARD_W2:    ttnn.to_memory_config to same mem cfg
+        #   _REALLOCATE_W2: ttnn.reallocate -> ttnn::move; defrag
+        #                   primitive; usually preserves spec.
+        #   _ASSIGN_W2:     ttnn.assign(w2_out, w2_out) identity assign
+        # Each is mutually exclusive (try one at a time).  If any of
+        # the three preserves coherence under REAL weights AND moves
+        # the buffer address away from 0xa6700, we have a workaround.
+        # A debug print emits the post-relocation buffer_address so we
+        # can confirm relocation actually happened.
+        _u22_dbg = _u19f_os.environ.get("SGLANG_TT_U22_PRINT_ADDR", "0") == "1"
+        if (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U22_RESHARD_W2", "0") == "1"):
+            try:
+                _u22_orig = w2_out
+                _u22_old_addr = w2_out.buffer_address() if _u22_dbg else 0
+                w2_out = ttnn.to_memory_config(_u22_orig, _u22_orig.memory_config())
+                if _u22_orig is not w2_out:
+                    ttnn.deallocate(_u22_orig)
+                if _u22_dbg:
+                    _u22_new_addr = w2_out.buffer_address()
+                    print(f"[U22_RESHARD_W2] old=0x{_u22_old_addr:x} "
+                          f"new=0x{_u22_new_addr:x}", flush=True)
+            except Exception as _u22r_e:
+                print(f"[U22_RESHARD_W2] ERROR: {type(_u22r_e).__name__}: {_u22r_e}",
+                      flush=True)
+        elif (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U22_REALLOCATE_W2", "0") == "1"):
+            try:
+                _u22_old_addr = w2_out.buffer_address() if _u22_dbg else 0
+                # NOTE: passing None lets move pick its own memcfg
+                # (preserves input mem cfg).  Passing explicit
+                # memory_config triggers move_sharded path.
+                _u22_pass_mc = _u19f_os.environ.get(
+                    "SGLANG_TT_U22_REALLOC_PASS_MC", "1") == "1"
+                if _u22_pass_mc:
+                    w2_out = ttnn.reallocate(w2_out, w2_out.memory_config())
+                else:
+                    w2_out = ttnn.reallocate(w2_out)
+                if _u22_dbg:
+                    _u22_new_addr = w2_out.buffer_address()
+                    print(f"[U22_REALLOCATE_W2] old=0x{_u22_old_addr:x} "
+                          f"new=0x{_u22_new_addr:x} "
+                          f"pass_mc={_u22_pass_mc}", flush=True)
+            except Exception as _u22a_e:
+                print(f"[U22_REALLOCATE_W2] ERROR: {type(_u22a_e).__name__}: {_u22a_e}",
+                      flush=True)
+        elif (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U22_ASSIGN_W2", "0") == "1"):
+            try:
+                _u22_old_addr = w2_out.buffer_address() if _u22_dbg else 0
+                # ttnn.assign(input, memory_config=...) creates a NEW
+                # tensor with the given memory_config and copies data
+                # in.  Unlike move_sharded (which has the per-core
+                # chunk-size bug), this uses a proper allocator path.
+                _u22_orig = w2_out
+                w2_out = ttnn.assign(_u22_orig, memory_config=_u22_orig.memory_config())
+                if _u22_orig is not w2_out:
+                    ttnn.deallocate(_u22_orig)
+                if _u22_dbg:
+                    _u22_new_addr = w2_out.buffer_address()
+                    print(f"[U22_ASSIGN_W2] old=0x{_u22_old_addr:x} "
+                          f"new=0x{_u22_new_addr:x}", flush=True)
+            except Exception as _u22s_e:
+                print(f"[U22_ASSIGN_W2] ERROR: {type(_u22s_e).__name__}: {_u22s_e}",
+                      flush=True)
+
+        # U22 — Path B-double-prime: BARRIER CLONE.  Take ttnn.clone(w2_out)
+        # but THROW AWAY the snapshot.  This forces a NoC READ of
+        # 0xa6700 on every receiver core, which (hypothesis) flushes
+        # / orders the stomp before subsequent ops run.
+        if (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U22_BARRIER_CLONE_W2", "0") == "1"):
+            try:
+                _u22b_snap = ttnn.clone(w2_out, memory_config=w2_out.memory_config())
+                ttnn.deallocate(_u22b_snap)  # discard
+                if _u22_dbg:
+                    print(f"[U22_BARRIER_CLONE_W2] w2_addr=0x{w2_out.buffer_address():x}",
+                          flush=True)
+            except Exception as _u22b_e:
+                print(f"[U22_BARRIER_CLONE_W2] ERROR: {type(_u22b_e).__name__}: {_u22b_e}",
+                      flush=True)
+
+        # U22 — Path B-prime: SNAPSHOT_AND_RESTORE pattern.
+        # ttnn.clone(w2_out) → snapshot at a different L1 slot
+        # (not 0xa6700; presumably non-cursed).  Then immediately
+        # ttnn.copy(snapshot, w2_out) — writes snapshot's bytes BACK
+        # to w2_out's L1 0xa6700.  If the stomp fires BETWEEN the
+        # clone (which captures correct data) and the copy (which
+        # restores it), the restore wins and the RS reader sees the
+        # correct value at 0xa6700.  Preserves w2_out's identity and
+        # shard spec exactly — RS reader path unaffected.
+        if (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U22_SNAPSHOT_RESTORE_W2", "0") == "1"):
+            try:
+                _u22sr_snap = ttnn.clone(w2_out, memory_config=w2_out.memory_config())
+                # Now write snapshot back to w2_out's L1 in-place.
+                ttnn.copy(_u22sr_snap, w2_out)
+                ttnn.deallocate(_u22sr_snap)
+                if _u22_dbg:
+                    print(f"[U22_SNAPSHOT_RESTORE_W2] w2_addr=0x{w2_out.buffer_address():x}",
+                          flush=True)
+            except Exception as _u22sr_e:
+                print(f"[U22_SNAPSHOT_RESTORE_W2] ERROR: {type(_u22sr_e).__name__}: {_u22sr_e}",
+                      flush=True)
+
         w2_out_reduced = tt_all_reduce(
             w2_out,
             self.mesh_device,
