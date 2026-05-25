@@ -23,6 +23,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <unordered_set>
@@ -450,11 +451,49 @@ void insert_stall_cmds(
     // Empty wait command initialized here. Will get updated when program is enqueued.
     program_command_sequence.stall_command_sequences[CachedStallSequenceIdx] =
         HostMemDeviceCommand(cached_stall_cmd_seqB);
-    program_command_sequence.stall_command_sequences[CachedStallSequenceIdx].add_dispatch_wait(
-        CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
-        0,
-        MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(*sub_device_id),
-        0);
+    // U16 (2026-05-25) — env-gated cross-sub-device dispatch barrier for
+    // cached path.  Per U1 (root cause LOCATED 2026-05-23): the prefetcher
+    // matmul runs on `receiver_sub_device` while the immediately-following
+    // CCL (reduce_scatter) runs on `worker_sub_device`.  The uncached
+    // (first-compile) path above emits BARRIER|WAIT_STREAM — BARRIER is a
+    // GLOBAL sync across ALL sub-devices, which masks the cross-subdev gap
+    // on the first run.  The cached (trace-replay) path emits only
+    // WAIT_STREAM on the current op's OWN sub-device — leaving a race where
+    // the worker-routed RS can begin BEFORE the receiver-routed matmul's
+    // L1 writes are visible.  When SGLANG_TT_W2_RS_BARRIER=1 is set at
+    // dispatch.cpp compile time, force the cached path to also emit
+    // BARRIER|WAIT_STREAM, closing the gap globally.
+    //
+    // Trade-off: every cached program emits a global barrier instead of a
+    // per-stream wait.  This is the "heavy hammer" — correct but slow.
+    // Per-op opt-in (only RS following matmul) would require richer
+    // metadata propagation through the program-cache key.  For TPOT
+    // measurement we accept the overhead and validate correctness first.
+    static const bool u16_force_barrier_cached =
+        []() {
+            const char* env = std::getenv("SGLANG_TT_W2_RS_BARRIER");
+            bool on = env != nullptr && std::string(env) == "1";
+            // One-time logged so we can verify the cached-path BARRIER
+            // override took effect.
+            log_info(tt::LogMetal,
+                "[U16-DISPATCH] cached-path BARRIER override: SGLANG_TT_W2_RS_BARRIER='{}' -> u16_force_barrier_cached={}",
+                env != nullptr ? env : "(unset)",
+                on ? "true" : "false");
+            return on;
+        }();
+    if (u16_force_barrier_cached) {
+        program_command_sequence.stall_command_sequences[CachedStallSequenceIdx].add_dispatch_wait(
+            CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER | CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
+            0,
+            MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(*sub_device_id),
+            0);
+    } else {
+        program_command_sequence.stall_command_sequences[CachedStallSequenceIdx].add_dispatch_wait(
+            CQ_DISPATCH_CMD_WAIT_FLAG_WAIT_STREAM,
+            0,
+            MetalContext::instance().dispatch_mem_map().get_dispatch_stream_index(*sub_device_id),
+            0);
+    }
 }
 
 template <typename PackedSubCmd>

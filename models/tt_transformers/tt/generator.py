@@ -1711,6 +1711,21 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                     _pref_active = True
                     tt_logits, tt_log_probs = outputs[i]
                     num_links = 2 if self.model_args[i].is_galaxy else 1
+                    # U16 (2026-05-25): post-trace receiver-subdev drain
+                    # REMOVED.  Reasoning: `receiver_sub_device` runs
+                    # persistent kernels that never signal completion
+                    # (prefetcher.py:451-456), so ANY host-side
+                    # `Synchronize(receiver)` hangs forever — both the
+                    # original U5 routing and a sync-after-execute_trace
+                    # mitigation deadlock at the SAME `finish_nolock`
+                    # waiting on receiver's stream counter.  The real
+                    # U16 fix is in tt_metal/impl/program/dispatch.cpp:
+                    # forcing the cached-path WAIT_STREAM to also emit
+                    # CQ_DISPATCH_CMD_WAIT_FLAG_BARRIER under
+                    # SGLANG_TT_W2_RS_BARRIER=1.  That closes the
+                    # cross-sub-device dispatch gap without any
+                    # host-side sync.  CCL ops stay routed to
+                    # worker_sub_device (canonical).
                     _t_ag0 = _time_l15.perf_counter()
                     tt_logits = ttnn.all_gather(
                         tt_logits,

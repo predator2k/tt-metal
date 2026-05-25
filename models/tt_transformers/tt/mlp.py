@@ -16,6 +16,14 @@ def _u5_pref_subdev(prefetcher):
     import os as _os
     if prefetcher is None:
         return None
+    # U16 (2026-05-25): SGLANG_TT_W2_RS_BARRIER does NOT route here.
+    # `receiver_sub_device` runs persistent kernels (no completion
+    # signal), so routing CCL to it deadlocks finish_nolock.  The
+    # W2_RS_BARRIER fix is a dispatch.cpp-level cached-path BARRIER
+    # flag — see tt_metal/impl/program/dispatch.cpp:451.  This
+    # function stays canonical (worker) under U16.
+    # SGLANG_TT_PREFETCHER_OUTPUT_BARRIER retained ONLY for the U5
+    # diagnostic re-run path; setting it still deadlocks (RULED OUT).
     if _os.environ.get("SGLANG_TT_PREFETCHER_OUTPUT_BARRIER", "0") == "1":
         return prefetcher.receiver_sub_device_id
     return prefetcher.worker_sub_device_id
@@ -453,6 +461,9 @@ class MLP(LightweightModule):
                 # the canonical sync `ttnn.reduce_scatter` path.
                 import os as _u5_os
                 _u5_kwargs = {}
+                # U16: W2_RS_BARRIER is dispatch-cpp-level; do NOT route
+                # to receiver here (deadlock — persistent kernels).
+                # Only the legacy OUTPUT_BARRIER reroutes (RULED OUT).
                 if (
                     self.prefetcher is not None
                     and mode == Mode.DECODE

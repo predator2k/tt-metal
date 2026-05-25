@@ -2394,6 +2394,21 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (consumer_probe_env != nullptr && std::string(consumer_probe_env) == "1") {
             mm_kernel_defines["SGLANG_TT_PREFETCHER_CONSUMER_PROBE"] = "1";
         }
+        // U16 (2026-05-25) — PACK-side write fence at end of matmul.
+        // When SGLANG_TT_W2_RS_BARRIER=1, propagate the
+        // SGLANG_TT_W2_RS_BARRIER_KERNEL define to the gathered matmul
+        // compute kernel so it emits `ckernel::tensix_sync()` at the
+        // end of each batch and before kernel exit.  This guarantees
+        // PACK writes to mm_out_cb are coherent in L1 before the
+        // dispatcher marks the matmul "done" — closing the trace-replay
+        // producer-consumer race between matmul PACK and
+        // reduce_scatter's noc_async_read documented in U14/U15.  Only
+        // applied on the gathered (use_global_cb) path so canonical
+        // matmuls remain untouched.
+        const char* w2_rs_barrier_env = std::getenv("SGLANG_TT_W2_RS_BARRIER");
+        if (w2_rs_barrier_env != nullptr && std::string(w2_rs_barrier_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_W2_RS_BARRIER_KERNEL"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {

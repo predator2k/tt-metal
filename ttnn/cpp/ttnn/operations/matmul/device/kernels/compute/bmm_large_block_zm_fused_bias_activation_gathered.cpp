@@ -847,5 +847,23 @@ void kernel_main() {
             ));
         }
 #endif
+
+#ifdef SGLANG_TT_W2_RS_BARRIER_KERNEL
+        // U16 (2026-05-25) — per-batch PACK fence.  When U16 is enabled at
+        // the program-factory level, this kernel was compiled with
+        // SGLANG_TT_W2_RS_BARRIER_KERNEL so PACK writes to mm_out_cb are
+        // guaranteed flushed to L1 before the next dispatch ("matmul done"
+        // signal) fires.  Without this fence, PACK writes can race against
+        // the immediately-following reduce_scatter's noc_async_read of
+        // mm_out_cb's L1 region (U14 / U15 evidence).
+        PACK((ckernel::tensix_sync()));
+#endif
     }
+#ifdef SGLANG_TT_W2_RS_BARRIER_KERNEL
+    // U16 — final kernel-exit fence across all PACK/UNPACK/MATH threads.
+    // Ensures the matmul kernel does NOT return to the dispatcher (which
+    // would advance the receiver-stream completion counter) until every
+    // pending tensix op (including PACK->L1 writes) has retired.
+    ckernel::tensix_sync();
+#endif
 }

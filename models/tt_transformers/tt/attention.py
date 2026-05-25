@@ -50,6 +50,13 @@ def _u5_pref_subdev(prefetcher):
     import os as _os
     if prefetcher is None:
         return None
+    # U16 (2026-05-25): SGLANG_TT_W2_RS_BARRIER does NOT route here.
+    # receiver_sub_device runs persistent kernels (no completion
+    # signal); routing CCL there deadlocks finish_nolock.  The real
+    # W2_RS_BARRIER fix is in tt_metal/impl/program/dispatch.cpp
+    # (cached-path global BARRIER).  This function stays canonical
+    # (worker) under U16.  OUTPUT_BARRIER kept for U5 diagnostic
+    # re-run (still RULED OUT).
     if _os.environ.get("SGLANG_TT_PREFETCHER_OUTPUT_BARRIER", "0") == "1":
         return prefetcher.receiver_sub_device_id
     return prefetcher.worker_sub_device_id
