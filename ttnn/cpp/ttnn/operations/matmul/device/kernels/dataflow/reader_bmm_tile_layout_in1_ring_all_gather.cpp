@@ -94,6 +94,30 @@ void kernel_main() {
         }
         return;
     }
+#ifdef SGLANG_TT_U20_DATAFLOW_PROBE
+    // U20 ENTRY probe — read local L1 0xa6700 BEFORE this kernel does
+    // any work.  See in0_ring_ag for explanation.
+    {
+        static uint32_t u20_in1_entry_budget = 2048;
+        static uint32_t u20_in1_entry_total = 0;
+        u20_in1_entry_total++;
+        if (u20_in1_entry_budget > 0) {
+            u20_in1_entry_budget--;
+            volatile tt_l1_ptr uint32_t* l1p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(0xa6700);
+            uint32_t v0 = l1p[0], v1 = l1p[1], v2 = l1p[2], v3 = l1p[3];
+            bool nz = v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0;
+            DPRINT << "[U20_ENTRY in1_ring_ag l1=0xa6700"
+                   << " w0=0x" << HEX() << v0
+                   << " w1=0x" << v1
+                   << " w2=0x" << v2
+                   << " w3=0x" << v3
+                   << " " << DEC() << "tot=" << u20_in1_entry_total
+                   << " " << (nz ? "NONZERO" : "zero")
+                   << "]" << ENDL();
+        }
+    }
+#endif
     const uint32_t in1_tensor_addr = get_arg_val<uint32_t>(rt_args_idx++);
     const uint32_t ring_idx = get_arg_val<uint32_t>(rt_args_idx++);
     uint32_t dram_bank_id = 0;
@@ -123,6 +147,22 @@ void kernel_main() {
     experimental::CircularBuffer cb_in1(cb_id_in1);
     experimental::CircularBuffer cb_sync(sync_cb);
     experimental::CircularBuffer cb_sync2(sync_cb2);
+#ifdef SGLANG_TT_U20_DATAFLOW_PROBE
+    // U20 ADDR probe — dump cb_in1 L1 address.  cb_in1 is the local
+    // weight tile staging buffer; if it overlaps 0xa6700 on the
+    // receiver core, the in1 DRAM-read writes would stomp.
+    {
+        static uint32_t u20_addr_in1_budget = 256;
+        if (u20_addr_in1_budget > 0) {
+            u20_addr_in1_budget--;
+            uint32_t cb_in1_wr = cb_in1.get_write_ptr();
+            DPRINT << "[U20_ADDR in1_ring_ag"
+                   << " cb_in1_wr=0x" << HEX() << cb_in1_wr
+                   << " in1_tile_size_bytes=0x" << in1_single_tile_size_bytes
+                   << "]" << ENDL();
+        }
+    }
+#endif
 
     uint32_t in1_shard_width_offset_bytes = 0;
     uint32_t in1_dram_shard_block_size_bytes = 0;
@@ -214,4 +254,30 @@ void kernel_main() {
     noc.async_atomic_barrier();
 #endif
     noc.async_write_barrier();
+#ifdef SGLANG_TT_U20_DATAFLOW_PROBE
+    // U20 EXIT probe.  noc.async_write_barrier() above drains any
+    // pending NoC writes from this RISC; local L1 view is up-to-date.
+    {
+        static uint32_t u20_in1_exit_budget = 2048;
+        static uint32_t u20_in1_exit_total = 0;
+        u20_in1_exit_total++;
+        if (u20_in1_exit_budget > 0) {
+            u20_in1_exit_budget--;
+            noc_async_read_barrier();
+            noc_async_write_barrier();
+            volatile tt_l1_ptr uint32_t* l1p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(0xa6700);
+            uint32_t v0 = l1p[0], v1 = l1p[1], v2 = l1p[2], v3 = l1p[3];
+            bool nz = v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0;
+            DPRINT << "[U20_EXIT in1_ring_ag l1=0xa6700"
+                   << " w0=0x" << HEX() << v0
+                   << " w1=0x" << v1
+                   << " w2=0x" << v2
+                   << " w3=0x" << v3
+                   << " " << DEC() << "tot=" << u20_in1_exit_total
+                   << " " << (nz ? "NONZERO" : "zero")
+                   << "]" << ENDL();
+        }
+    }
+#endif
 }

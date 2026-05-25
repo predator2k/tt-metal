@@ -2331,6 +2331,7 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
     }
 
     /* Kernel defines */
+    std::map<std::string, std::string> mm_in0_kernel_defines;
     std::map<std::string, std::string> mm_in1_kernel_defines;
     std::map<std::string, std::string> mm_kernel_defines;
 
@@ -2418,6 +2419,18 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (w2_rs_barrier_env != nullptr && std::string(w2_rs_barrier_env) == "1") {
             mm_kernel_defines["SGLANG_TT_W2_RS_BARRIER_KERNEL"] = "1";
         }
+        // U20 (2026-05-24) — DATAFLOW kernel entry+exit L1 0xa6700 probe.
+        // Wires SGLANG_TT_U20_DATAFLOW_PROBE into BOTH gathered matmul
+        // dataflow kernels (in0_ring_all_gather and in1_ring_all_gather)
+        // so we can determine which one (if any) stomps L1 0xa6700
+        // between W2 PACK exit (clean) and RS reader entry (NONZERO).
+        // Only applied on the gathered (use_global_cb) path so canonical
+        // matmuls remain untouched.
+        const char* u20_dataflow_probe_env = std::getenv("SGLANG_TT_U20_DATAFLOW_PROBE");
+        if (u20_dataflow_probe_env != nullptr && std::string(u20_dataflow_probe_env) == "1") {
+            mm_in0_kernel_defines["SGLANG_TT_U20_DATAFLOW_PROBE"] = "1";
+            mm_in1_kernel_defines["SGLANG_TT_U20_DATAFLOW_PROBE"] = "1";
+        }
     }
 
     if (fused_activation.has_value()) {
@@ -2469,6 +2482,7 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
             .noc = in0_noc,
             .noc_mode = noc_mode,
             .compile_args = in0_sender_compile_time_args,
+            .defines = mm_in0_kernel_defines,
             .named_compile_args = {{"cb_in0", src0_cb_index}, {"cb_in2", src2_cb_index}}});
     // Each core needs to signal to all RS cores, need to get a count of how many cores are in all_cores
     auto mm_kernel_in1_sender_writer_id = tt_metal::CreateKernel(

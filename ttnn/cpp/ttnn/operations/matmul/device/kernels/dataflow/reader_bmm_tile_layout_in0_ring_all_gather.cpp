@@ -30,6 +30,32 @@ void kernel_main() {
     if (core_type == (uint32_t)CORE_TYPE::IDLE_CORE) {
         return;
     }
+#ifdef SGLANG_TT_U20_DATAFLOW_PROBE
+    // U20 ENTRY probe — read local L1 0xa6700 BEFORE this kernel does
+    // any work.  Bounded budget; per-kernel-instance running totals.
+    // If ENTRY = zero across many entries but EXIT = NONZERO, this
+    // kernel is the L1 0xa6700 stomper.
+    {
+        static uint32_t u20_in0_entry_budget = 2048;
+        static uint32_t u20_in0_entry_total = 0;
+        u20_in0_entry_total++;
+        if (u20_in0_entry_budget > 0) {
+            u20_in0_entry_budget--;
+            volatile tt_l1_ptr uint32_t* l1p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(0xa6700);
+            uint32_t v0 = l1p[0], v1 = l1p[1], v2 = l1p[2], v3 = l1p[3];
+            bool nz = v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0;
+            DPRINT << "[U20_ENTRY in0_ring_ag l1=0xa6700"
+                   << " w0=0x" << HEX() << v0
+                   << " w1=0x" << v1
+                   << " w2=0x" << v2
+                   << " w3=0x" << v3
+                   << " " << DEC() << "tot=" << u20_in0_entry_total
+                   << " " << (nz ? "NONZERO" : "zero")
+                   << "]" << ENDL();
+        }
+    }
+#endif
     bool is_hop_core = core_type == (uint32_t)CORE_TYPE::HOP_CORE;
 
     uint32_t ring_idx = get_arg_val<uint32_t>(rt_args_idx++);
@@ -63,6 +89,27 @@ void kernel_main() {
     uint32_t l1_write_addr_in0 = cb_in2.get_write_ptr();
 
     uint32_t hop_core_offset = static_cast<uint32_t>(is_hop_core);
+#ifdef SGLANG_TT_U20_DATAFLOW_PROBE
+    // U20 ADDR probe — dump cb_in0 / cb_in2 L1 addresses so we can see
+    // whether the in0 sender's NoC writes target (next_core, 0xa6700).
+    // If cb_in2.get_write_ptr() == 0xa6700 on any core, then the in0
+    // ring all-gather mcasts INTO the receiver's W2 output L1, which
+    // would be the stomp source.
+    {
+        static uint32_t u20_addr_in0_budget = 256;
+        if (u20_addr_in0_budget > 0) {
+            u20_addr_in0_budget--;
+            DPRINT << "[U20_ADDR in0_ring_ag"
+                   << " local_in0=0x" << HEX() << local_shard_read_addr
+                   << " cb_in2_wr=0x" << l1_write_addr_in0
+                   << " shard_size_bytes=0x" << shard_size_bytes
+                   << " ring_size=" << DEC() << ring_size
+                   << " next_x=" << next_core_noc_x
+                   << " next_y=" << next_core_noc_y
+                   << "]" << ENDL();
+        }
+    }
+#endif
 
     for (uint32_t shard_cnt = hop_core_offset; shard_cnt < ring_size; shard_cnt++) {
         uint32_t curr_ring_idx = (ring_idx + shard_cnt) % ring_size;
@@ -104,4 +151,34 @@ void kernel_main() {
         }
     }
     noc_obj.async_atomic_barrier();
+#ifdef SGLANG_TT_U20_DATAFLOW_PROBE
+    // U20 EXIT probe — read local L1 0xa6700 AFTER this kernel finishes
+    // all its NoC writes (atomic barrier ensures cross-core writes
+    // landed remotely; local L1 here is the SAME core's view).
+    // tensix_sync() ensures any in-flight writes from this RISC to
+    // local L1 are visible before we read.
+    {
+        static uint32_t u20_in0_exit_budget = 2048;
+        static uint32_t u20_in0_exit_total = 0;
+        u20_in0_exit_total++;
+        if (u20_in0_exit_budget > 0) {
+            u20_in0_exit_budget--;
+            // Drain any pending NoC ops to ensure local L1 view is fresh.
+            noc_async_read_barrier();
+            noc_async_write_barrier();
+            volatile tt_l1_ptr uint32_t* l1p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(0xa6700);
+            uint32_t v0 = l1p[0], v1 = l1p[1], v2 = l1p[2], v3 = l1p[3];
+            bool nz = v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0;
+            DPRINT << "[U20_EXIT in0_ring_ag l1=0xa6700"
+                   << " w0=0x" << HEX() << v0
+                   << " w1=0x" << v1
+                   << " w2=0x" << v2
+                   << " w3=0x" << v3
+                   << " " << DEC() << "tot=" << u20_in0_exit_total
+                   << " " << (nz ? "NONZERO" : "zero")
+                   << "]" << ENDL();
+        }
+    }
+#endif
 }
