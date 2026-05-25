@@ -5,6 +5,7 @@
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_mcast_1d_program_factory.hpp"
 #include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -2585,6 +2586,55 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
                 {"cb_sync", sync_cb_index},
                 {"cb_sync2", sync_cb2_index},
                 {"cb_remote", remote_cb_index}}});
+
+    // U31 — env-gated factory-side dump of gathered-matmul compute CT args
+    // along with the SAME elf_tag hash the kernel computes from its CT args
+    // (see SGLANG_TT_PREFETCHER_LLK_PROBE in
+    // bmm_large_block_zm_fused_bias_activation_gathered.cpp).  Used to
+    // correlate the 3 buggy ELFs vs 1 clean ELF identified by U30 Path A
+    // back to their per-matmul (in0_block_w, num_blocks, out_subblock_*,
+    // batch, per_core_M/N, K, M, N) shape.  Default-off; canonical
+    // bytewise-equal.  Only emitted on the gathered (use_global_cb)
+    // factory path so the canonical 1D matmul factory remains silent.
+    if (use_global_cb) {
+        const char* u31_args_env = std::getenv("SGLANG_TT_U31_FACTORY_ARGS");
+        if (u31_args_env != nullptr && std::string(u31_args_env) == "1") {
+            const uint32_t elf_tag =
+                (in0_block_w * 1u) ^
+                (in0_num_subblocks * 131u) ^
+                (in1_num_subblocks * 17u) ^
+                (num_blocks * 7919u) ^
+                (out_subblock_h * 31u) ^
+                (out_subblock_w * 257u) ^
+                (batch * 65537u);
+            const bool spill_flag = (num_blocks > 1) &&
+                                    ((out_block_tiles / out_subblock_num_tiles) > 1);
+            fprintf(stderr,
+                "[U31_FACTORY_ARGS elf=0x%x"
+                " in0_block_w=%u in0_num_subblocks=%u in0_block_num_tiles=%u in0_subblock_num_tiles=%u"
+                " in1_num_subblocks=%u in1_block_num_tiles=%u in1_block_size_bytes=%u"
+                " in1_tensor_size_bytes=%u in1_per_core_w=%u"
+                " num_blocks=%u out_subblock_h=%u out_subblock_w=%u out_subblock_num_tiles=%u"
+                " batch=%u out_block_num_tiles=%u untilize_out=%u"
+                " in1_is_dram_interleaved=%u in1_is_dram_sharded=%u"
+                " per_core_M=%u per_core_N=%u K=%u"
+                " fp32_dest_acc_en=%u packer_l1_acc_en=%u dst_full_sync_en=%u"
+                " num_cores=%u ring_size=%u"
+                " spill=%u out_block_num_subblocks=%u]\n",
+                elf_tag,
+                in0_block_w, in0_num_subblocks, in0_block_num_tiles, in0_subblock_num_tiles,
+                in1_num_subblocks, in1_block_num_tiles, in1_block_size_bytes,
+                in1_tensor_size_bytes, in1_per_core_w,
+                num_blocks, out_subblock_h, out_subblock_w, out_subblock_num_tiles,
+                (unsigned)batch, out_block_tiles, (unsigned)untilize_out,
+                (unsigned)in1_is_dram_interleaved, (unsigned)in1_is_dram_sharded,
+                per_core_M, per_core_N, K,
+                (unsigned)fp32_dest_acc_en, (unsigned)packer_l1_acc_en,
+                (unsigned)dst_full_sync_en, num_cores, ring_size,
+                (unsigned)spill_flag, out_block_num_subblocks);
+            fflush(stderr);
+        }
+    }
 
     auto mm_kernel = tt_metal::CreateKernel(
         program,
