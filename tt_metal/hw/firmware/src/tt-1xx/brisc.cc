@@ -436,6 +436,39 @@ int main() {
             DeviceZoneSetCounter(launch_msg_address->kernel_config.host_assigned_id);
 
             uint32_t enables = launch_msg_address->kernel_config.enables;
+#ifdef SGLANG_TT_U27_KERNEL_ENTRY_PROBE
+            // U27 — per-kernel-launch L1 0xa6700 entry probe on receiver (2,7).
+            // Reads the 16 bytes at L1 0xa6700 at the START of EVERY kernel
+            // dispatched to (2,7) and DPRINTs host_assigned_id + value.  If a
+            // kernel sees nonzero at entry, the stomp happened BEFORE this
+            // kernel ran (i.e., it was the PREVIOUS kernel's exit→this
+            // kernel's entry gap).  By comparing entry/exit pairs we can
+            // narrow the stomper to the gap between two specific kernel
+            // dispatches.  Default-off; canonical bytewise-equal.
+            if (my_logical_x_ == 2 && my_logical_y_ == 7) {
+                static uint32_t u27_entry_budget = 256;
+                static uint32_t u27_entry_total = 0;
+                u27_entry_total++;
+                if (u27_entry_budget > 0) {
+                    u27_entry_budget--;
+                    invalidate_l1_cache();
+                    volatile tt_l1_ptr uint32_t* p =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(0xa6700);
+                    uint32_t v0 = p[0], v1 = p[1], v2 = p[2], v3 = p[3];
+                    bool nz = v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0;
+                    DPRINT << "[U27_ENTRY core=(2,7)"
+                           << " hai=" << launch_msg_address->kernel_config.host_assigned_id
+                           << " enables=0x" << HEX() << enables
+                           << " w0=0x" << v0
+                           << " w1=0x" << v1
+                           << " w2=0x" << v2
+                           << " w3=0x" << v3
+                           << " " << DEC() << "tot=" << u27_entry_total
+                           << " " << (nz ? "NONZERO" : "zero")
+                           << "]" << ENDL();
+                }
+            }
+#endif
             // Trigger the NCRISC to start loading CBs and IRAM as soon as possible.
             if (enables &
                 (1u << static_cast<std::underlying_type<TensixProcessorTypes>::type>(TensixProcessorTypes::DM1))) {
@@ -566,6 +599,38 @@ int main() {
             if (noc_mode == DM_DYNAMIC_NOC) {
                 // re-init for profiler to able to run barrier in dedicated noc mode
                 noc_local_state_init(noc_index);
+            }
+#endif
+
+#ifdef SGLANG_TT_U27_KERNEL_ENTRY_PROBE
+            // U27 — per-kernel-EXIT L1 0xa6700 probe on receiver (2,7).
+            // Reads L1 0xa6700 at the END of EVERY kernel dispatched to
+            // (2,7), AFTER wait_ncrisc_trisc has joined all RISCs.  Pair
+            // with U27_ENTRY: if a kernel sees zero at entry and NONZERO
+            // at exit, IT is the stomper.  If both are zero, the stomp
+            // happened in the gap after this kernel before the next.
+            if (my_logical_x_ == 2 && my_logical_y_ == 7) {
+                static uint32_t u27_exit_budget = 256;
+                static uint32_t u27_exit_total = 0;
+                u27_exit_total++;
+                if (u27_exit_budget > 0) {
+                    u27_exit_budget--;
+                    invalidate_l1_cache();
+                    volatile tt_l1_ptr uint32_t* p =
+                        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(0xa6700);
+                    uint32_t v0 = p[0], v1 = p[1], v2 = p[2], v3 = p[3];
+                    bool nz = v0 != 0 || v1 != 0 || v2 != 0 || v3 != 0;
+                    DPRINT << "[U27_EXIT  core=(2,7)"
+                           << " hai=" << launch_msg_address->kernel_config.host_assigned_id
+                           << " enables=0x" << HEX() << enables
+                           << " w0=0x" << v0
+                           << " w1=0x" << v1
+                           << " w2=0x" << v2
+                           << " w3=0x" << v3
+                           << " " << DEC() << "tot=" << u27_exit_total
+                           << " " << (nz ? "NONZERO" : "zero")
+                           << "]" << ENDL();
+                }
             }
 #endif
 

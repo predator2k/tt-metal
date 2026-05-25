@@ -7,6 +7,7 @@
 #include <tracy/Tracy.hpp>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -79,6 +80,18 @@ std::map<std::string, std::string> initialize_device_kernel_defines(const JitDev
 
     device_kernel_defines.emplace("PCIE_NOC_X", std::to_string(config.pcie_core.x));
     device_kernel_defines.emplace("PCIE_NOC_Y", std::to_string(config.pcie_core.y));
+
+    // U27 — env-gated propagation of the firmware-level kernel-launch L1 0xa6700
+    // entry/exit probe on receiver (2,7).  When SGLANG_TT_U27_KERNEL_ENTRY_PROBE=1
+    // is set in the env at firmware build time, brisc.cc emits a DPRINT at every
+    // kernel-launch start/end on (2,7) showing host_assigned_id + L1[0xa6700].
+    // Default-off; canonical bytewise-equal when env is unset.
+    {
+        const char* env = std::getenv("SGLANG_TT_U27_KERNEL_ENTRY_PROBE");
+        if (env != nullptr && std::string(env) == "1") {
+            device_kernel_defines.emplace("SGLANG_TT_U27_KERNEL_ENTRY_PROBE", "1");
+        }
+    }
 
     return device_kernel_defines;
 }
