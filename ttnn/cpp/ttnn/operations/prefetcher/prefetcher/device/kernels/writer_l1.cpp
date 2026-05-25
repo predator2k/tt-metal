@@ -43,6 +43,45 @@ void kernel_main() {
     // 0xa6700 (the W2 output L1 address), we've found the stomper.
     static uint32_t u18_pref_write_budget = 256;
 #endif
+#ifdef SGLANG_TT_U21_PREFETCHER_ADDR_PROBE
+    // U21 Probe C — log the prefetcher's per-receiver page-sent
+    // semaphore L1 address (`aligned_pages_sent_ptr`).  When the
+    // sender finishes writing pages, it calls noc_semaphore_inc on
+    // this remote L1 address on EACH receiver core.  If any
+    // receiver's aligned_pages_sent_ptr lands at 0xa6700, this is
+    // the stomp source.  Also dump remote_cb config_ptr (where the
+    // sender's update_remote_cb_config_in_l1 writes) and
+    // receiver_noc_xy_ptr.  Per-RISC budget; runs once per receiver
+    // per send.
+    static uint32_t u21_addr_budget = 512;
+    {
+        auto& _u21_remote_cb = get_remote_sender_cb_interface(remote_cb_id);
+        uint32_t _u21_aligned_pages_sent_ptr = _u21_remote_cb.aligned_pages_sent_ptr;
+        uint32_t _u21_config_ptr = _u21_remote_cb.config_ptr;
+        uint32_t _u21_receiver_noc_xy_ptr = _u21_remote_cb.receiver_noc_xy_ptr;
+        uint32_t _u21_num_receivers = _u21_remote_cb.num_receivers;
+        uint32_t _u21_fifo_start = _u21_remote_cb.fifo_start_addr;
+        if (u21_addr_budget > 0) {
+            u21_addr_budget--;
+            DPRINT << "[U21_PREF_ADDR aligned_pages_sent_ptr=0x" << HEX()
+                   << _u21_aligned_pages_sent_ptr
+                   << " config_ptr=0x" << _u21_config_ptr
+                   << " receiver_noc_xy_ptr=0x" << _u21_receiver_noc_xy_ptr
+                   << " fifo_start=0x" << _u21_fifo_start
+                   << DEC() << " num_receivers=" << _u21_num_receivers
+                   << "]" << ENDL();
+            // Also dump the per-receiver pages_sent slots (stride 2*L1_ALIGNMENT).
+            // L1_ALIGNMENT on blackhole = 16; we step by 32 bytes per receiver.
+            for (uint32_t _u21_i = 0; _u21_i < _u21_num_receivers && _u21_i < 16; _u21_i++) {
+                uint32_t _u21_per_recv_ptr =
+                    _u21_aligned_pages_sent_ptr + _u21_i * 2 * L1_ALIGNMENT;
+                DPRINT << "[U21_PREF_RECV_PSENT i=" << _u21_i
+                       << " psent_ptr=0x" << HEX() << _u21_per_recv_ptr
+                       << DEC() << "]" << ENDL();
+            }
+        }
+    }
+#endif
     for (uint32_t layer = 0; layer < num_layers; layer++) {
         for (uint32_t t = 0; t < num_tensors; t++) {
             uint32_t curr_coalesced_page_size = coalesced_page_sizes[t];

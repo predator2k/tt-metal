@@ -221,6 +221,16 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
             writer_defines["SGLANG_TT_U18_PREFETCHER_WRITE_PROBE"] = "1";
         }
     }
+    // U21 Probe C — env-gated propagation of SGLANG_TT_U21_PREFETCHER_ADDR_PROBE
+    // to the prefetcher writer_l1 kernel so it can DPRINT
+    // aligned_pages_sent_ptr / config_ptr / receiver_noc_xy_ptr / per-receiver
+    // pages_sent slot addresses.  Default-off; canonical bytewise-equal.
+    {
+        const char* env = std::getenv("SGLANG_TT_U21_PREFETCHER_ADDR_PROBE");
+        if (env != nullptr && std::string(env) == "1") {
+            writer_defines["SGLANG_TT_U21_PREFETCHER_ADDR_PROBE"] = "1";
+        }
+    }
     auto writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/prefetcher/prefetcher/device/kernels/writer_l1.cpp",
