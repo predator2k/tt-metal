@@ -684,6 +684,31 @@ class MLP(LightweightModule):
                 else None,
                 optional_output_tensor=_u26c_out_t,
             )
+        # U28 — capture w2_in shard grid BEFORE deallocation.
+        try:
+            if (mode == Mode.DECODE and self.prefetcher is not None
+                    and _u26a_os.environ.get("SGLANG_TT_U28_PER_CORE_PROBE", "0") == "1"
+                    and (int(getattr(self, "layer_num", -1)) == 0)
+                    and not getattr(self, "_u28_w2in_logged", False)):
+                _u28_w2in_mc = w2_in.memory_config()
+                _u28_w2in_ss = _u28_w2in_mc.shard_spec
+                _u28_w2in_cores = []
+                if _u28_w2in_ss is not None:
+                    for _u28_cr in _u28_w2in_ss.grid.ranges():
+                        for _ux in range(_u28_cr.start.x, _u28_cr.end.x + 1):
+                            for _uy in range(_u28_cr.start.y, _u28_cr.end.y + 1):
+                                _u28_w2in_cores.append((_ux, _uy))
+                print(
+                    f"[U28_W2_IN_GRID] layer=0 "
+                    f"mem_layout={_u28_w2in_mc.memory_layout} "
+                    f"num_cores={len(_u28_w2in_cores)} "
+                    f"shard_shape={_u28_w2in_ss.shape if _u28_w2in_ss else 'N/A'}",
+                    flush=True,
+                )
+                print(f"[U28_W2_IN_GRID]   cores={sorted(_u28_w2in_cores)}", flush=True)
+                self._u28_w2in_logged = True
+        except Exception as _u28e:
+            print(f"[U28_W2_IN_GRID] ERROR: {type(_u28e).__name__}: {_u28e}", flush=True)
         ttnn.deallocate(w2_in)
 
         # U26 Phase A — POST-W2 buffer enumeration.  Pair with PRE_W2 above.
@@ -995,6 +1020,162 @@ class MLP(LightweightModule):
                 print(f"[U22_SNAPSHOT_RESTORE_W2] ERROR: {type(_u22sr_e).__name__}: {_u22sr_e}",
                       flush=True)
 
+        # U28 Phase 1 — per-core W2 output address probe.  Confirms or
+        # refutes hypothesis U28-α (per-core address mismatch): W2's PACK
+        # writes to per-core differing L1 base addresses, but the RS
+        # reader uses the bank-averaged address as the universal NoC
+        # read target.  If the per-core addresses ENUMERATED HERE differ
+        # from each other, U28-α is confirmed: receivers like (2,7) at
+        # 0xa6700 vs (2,5) at 0xa4700 will be read by the RS reader at
+        # the SAME (bank-averaged) L1 offset, so cores not at the
+        # bank-averaged offset return stale pre-existing data.
+        if (mode == Mode.DECODE
+                and _u26a_os.environ.get("SGLANG_TT_U28_PER_CORE_PROBE", "0") == "1"):
+            try:
+                _u28_layer_num = int(getattr(self, "layer_num", -1))
+                self._u28_iter = getattr(self, "_u28_iter", 0) + 1
+                if self._u28_iter <= 144:
+                    _u28_is_pc = bool(w2_out.is_per_core_allocated())
+                    try:
+                        _u28_bavg = w2_out.buffer_address()
+                    except Exception:
+                        _u28_bavg = -1
+                    print(
+                        f"[U28_W2_PER_CORE] iter={self._u28_iter} "
+                        f"layer={_u28_layer_num} "
+                        f"is_per_core_allocated={_u28_is_pc} "
+                        f"bank_avg_addr={'NA' if _u28_bavg == -1 else hex(_u28_bavg)}",
+                        flush=True,
+                    )
+                    # Enumerate cores from shard spec; query per-core address
+                    # for each.  For NON per-core-allocated buffers, the
+                    # nanobind call still returns the bank-averaged value, so
+                    # a uniform result here doesn't prove same per-core L1.
+                    _u28_mc = w2_out.memory_config()
+                    _u28_ss = _u28_mc.shard_spec
+                    _u28_grid = _u28_ss.grid if _u28_ss else None
+                    _u28_cores = []
+                    if _u28_grid is not None:
+                        try:
+                            for _u28_cr in _u28_grid.ranges():
+                                for _ux in range(_u28_cr.start.x, _u28_cr.end.x + 1):
+                                    for _uy in range(_u28_cr.start.y, _u28_cr.end.y + 1):
+                                        _u28_cores.append(ttnn.CoreCoord(_ux, _uy))
+                        except Exception:
+                            pass
+                    if not _u28_cores:
+                        for _ux in range(0, 8):
+                            for _uy in range(0, 8):
+                                _u28_cores.append(ttnn.CoreCoord(_ux, _uy))
+                    _u28_addrs = {}
+                    for _u28_c in _u28_cores[:64]:
+                        try:
+                            _u28_a = w2_out.experimental_per_core_buffer_address(_u28_c)
+                            _u28_addrs.setdefault(_u28_a, []).append(
+                                (int(_u28_c.x), int(_u28_c.y))
+                            )
+                        except Exception:
+                            pass
+                    print(
+                        f"[U28_W2_PER_CORE] iter={self._u28_iter} "
+                        f"layer={_u28_layer_num} "
+                        f"unique_addrs={len(_u28_addrs)} "
+                        f"cores_probed={sum(len(_v) for _v in _u28_addrs.values())}",
+                        flush=True,
+                    )
+                    for _u28_a in sorted(_u28_addrs.keys()):
+                        _u28_cs = _u28_addrs[_u28_a]
+                        print(
+                            f"[U28_W2_PER_CORE]   addr=0x{_u28_a:x} "
+                            f"count={len(_u28_cs)} cores={_u28_cs[:8]}",
+                            flush=True,
+                        )
+                    if _u28_layer_num == 0 and self._u28_iter <= 4:
+                        try:
+                            _u28_grid_str = str(_u28_ss.grid) if _u28_ss else "None"
+                            _u28_shape_str = str(_u28_ss.shape) if _u28_ss else "N/A"
+                            _u28_orient = str(_u28_ss.orientation) if _u28_ss else "N/A"
+                            print(
+                                f"[U28_W2_PER_CORE_GRID] layer=0 "
+                                f"mem_layout={_u28_mc.memory_layout} "
+                                f"shard_grid={_u28_grid_str} "
+                                f"shard_shape={_u28_shape_str} "
+                                f"orient={_u28_orient}",
+                                flush=True,
+                            )
+                        except Exception as _u28_ge:
+                            print(f"[U28_W2_PER_CORE_GRID] ERROR: {_u28_ge}", flush=True)
+                        # Also dump prefetcher.global_cb.sender_cores +
+                        # receiver_cores (under the gathered matmul path,
+                        # the W2 PACK kernel runs on sender cores; receiver
+                        # cores get weights pushed in via NoC).  If w2_out's
+                        # shard grid contains cores that are NOT in
+                        # sender_cores, those cores' L1 slot for w2_out is
+                        # allocated but NEVER written by W2 PACK — RS reader
+                        # reads stale bytes.  This is the U28 root cause.
+                        try:
+                            _u28_pref = self.prefetcher
+                            if _u28_pref is not None:
+                                _u28_srm = getattr(_u28_pref, "sender_receiver_mapping", None)
+                                if _u28_srm:
+                                    _u28_senders = []
+                                    _u28_receivers = set()
+                                    for _entry in _u28_srm:
+                                        try:
+                                            _scc, _rcr_set = _entry
+                                            _u28_senders.append((int(_scc.x), int(_scc.y)))
+                                            for _rcr in _rcr_set.ranges():
+                                                for _rx in range(_rcr.start.x, _rcr.end.x + 1):
+                                                    for _ry in range(_rcr.start.y, _rcr.end.y + 1):
+                                                        _u28_receivers.add((_rx, _ry))
+                                        except Exception:
+                                            pass
+                                    _u28_recv_sorted = sorted(_u28_receivers)
+                                    print(
+                                        f"[U28_GCB_GRID] layer=0 "
+                                        f"num_senders={len(_u28_senders)} "
+                                        f"num_unique_receivers={len(_u28_recv_sorted)}",
+                                        flush=True,
+                                    )
+                                    print(
+                                        f"[U28_GCB_GRID]   senders={_u28_senders}",
+                                        flush=True,
+                                    )
+                                    print(
+                                        f"[U28_GCB_GRID]   receivers={_u28_recv_sorted}",
+                                        flush=True,
+                                    )
+                                    # Compute set difference: w2_out shard
+                                    # grid cores NOT in (senders ∪ receivers).
+                                    _u28_w2_cores = set()
+                                    if _u28_grid is not None:
+                                        for _u28_cr in _u28_grid.ranges():
+                                            for _ux in range(_u28_cr.start.x, _u28_cr.end.x + 1):
+                                                for _uy in range(_u28_cr.start.y, _u28_cr.end.y + 1):
+                                                    _u28_w2_cores.add((_ux, _uy))
+                                    _u28_all_gcb = set(_u28_senders) | set(_u28_recv_sorted)
+                                    _u28_in_w2_not_gcb = sorted(_u28_w2_cores - _u28_all_gcb)
+                                    _u28_in_gcb_not_w2 = sorted(_u28_all_gcb - _u28_w2_cores)
+                                    print(
+                                        f"[U28_GCB_GRID]   w2_out_cores_not_in_gcb={_u28_in_w2_not_gcb}",
+                                        flush=True,
+                                    )
+                                    print(
+                                        f"[U28_GCB_GRID]   gcb_cores_not_in_w2={_u28_in_gcb_not_w2}",
+                                        flush=True,
+                                    )
+                                else:
+                                    print("[U28_GCB_GRID] no sender_receiver_mapping", flush=True)
+                            else:
+                                print("[U28_GCB_GRID] prefetcher=None", flush=True)
+                        except Exception as _u28_in_e:
+                            print(f"[U28_GCB_GRID] ERROR: {type(_u28_in_e).__name__}: {_u28_in_e}", flush=True)
+            except Exception as _u28_e:
+                print(
+                    f"[U28_W2_PER_CORE] ERROR: {type(_u28_e).__name__}: {_u28_e}",
+                    flush=True,
+                )
+
         # U26 Phase A — buffer enumeration IMMEDIATELY before tt_all_reduce.
         # By the time we get here, w2_out has been deallocated/reallocated
         # by the U22 Path B variants (if active).  We want to see the L1
@@ -1033,6 +1214,32 @@ class MLP(LightweightModule):
             except Exception as _u26a_e:
                 print(f"[U26_ADJ_PRE_RS] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
                       flush=True)
+
+        # U28 Phase 2 — TEST: insert host-side sync between W2
+        # (runs on receiver_sub_device) and tt_all_reduce → RS (runs on
+        # worker_sub_device).  receiver_sub_device is NOT in the stall_group
+        # so RS dispatched on worker sub-device starts before W2's PACK
+        # on receiver_sub_device completes — this is the U28 cross-subdev
+        # race hypothesis.  NOTE: host-side synchronize_device fails inside
+        # trace capture (Event Synchronization not supported in trace).
+        # Diagnostic-only; not a real fix path.
+        if (mode == Mode.DECODE and self.prefetcher is not None
+                and _u26a_os.environ.get("SGLANG_TT_U28_W2_RS_SYNC", "0") == "1"):
+            try:
+                ttnn.synchronize_device(
+                    self.mesh_device,
+                    sub_device_ids=[self.prefetcher.receiver_sub_device_id],
+                )
+            except Exception as _u28_se:
+                # Expected to fail inside trace ('Event Synchronization is
+                # not supported during trace capture').  Logged once for
+                # diagnostic clarity.
+                if not getattr(self, "_u28_sync_err_logged", False):
+                    print(
+                        f"[U28_W2_RS_SYNC] ERROR: {type(_u28_se).__name__}: {_u28_se}",
+                        flush=True,
+                    )
+                    self._u28_sync_err_logged = True
 
         w2_out_reduced = tt_all_reduce(
             w2_out,
