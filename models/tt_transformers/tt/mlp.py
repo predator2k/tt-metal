@@ -314,6 +314,56 @@ class MLP(LightweightModule):
             self.w3_pdg = None
             self.w2_pdg = None
 
+    def _u26c_prealloc_w2_out(self):
+        """U26 Path C — pre-allocate the w2_out destination buffer OUTSIDE the trace.
+
+        Lazily creates a persistent device tensor at MLP forward dispatch time,
+        but BEFORE trace capture closes, with the exact mem_config / shape that
+        ttnn.linear(w2) would otherwise allocate.  Passed via
+        optional_output_tensor= so the matmul writes INTO this preallocated
+        buffer rather than allocating a fresh in-trace one each iteration.
+
+        This is the Path C workaround for the U25 / U26 0xa6700 stomp:
+        - REALLOCATE_W2 (U22) moves the buffer post-matmul but breaks under
+          real weights because reallocate fires inside the captured trace.
+        - Pre-allocating outside the trace gives the trace replay a stable
+          destination address (chosen by the allocator at first call), and
+          no in-trace allocator activity happens for w2_out.
+        Returns the persistent tensor, or None if any step fails.
+        """
+        if getattr(self, "_u26c_w2_out", None) is not None:
+            return self._u26c_w2_out
+        try:
+            _mc = self.args.get_mlp_ff2_mem_config(Mode.DECODE, self.prefetcher)
+            # Match the W2 matmul's output dtype: ccl_dtype on Galaxy, bf16
+            # otherwise.  See `dtype=self.args.ccl_dtype if TG else
+            # activation_dtype or ttnn.bfloat16` in forward().
+            _dtype = (
+                self.args.ccl_dtype if self.args.is_galaxy else ttnn.bfloat16
+            )
+            # Shape: [1, 1, 32, dim] — matches the W2 matmul output before
+            # reduce_scatter (full dim, per-receiver-shard width = dim/ring_size).
+            _shape = (1, 1, 32, self.args.dim)
+            _t = ttnn.allocate_tensor_on_device(
+                ttnn.Shape(_shape),
+                _dtype,
+                ttnn.TILE_LAYOUT,
+                self.mesh_device,
+                _mc,
+            )
+            self._u26c_w2_out = _t
+            print(
+                f"[U26C_PREALLOC] layer={self.layer_num} "
+                f"w2_out.addr=0x{_t.buffer_address():x} "
+                f"shape={tuple(_t.shape)} dtype={_dtype}",
+                flush=True,
+            )
+            return self._u26c_w2_out
+        except Exception as _e:
+            print(f"[U26C_PREALLOC] ERROR: {type(_e).__name__}: {_e}", flush=True)
+            self._u26c_w2_out = None
+            return None
+
     def forward(self, x: ttnn.Tensor, mode: Mode) -> ttnn.Tensor:
         """
         w1 -> gate_proj
@@ -532,6 +582,49 @@ class MLP(LightweightModule):
             decoder_id=layer_num, op=OpGroup.LI_FF2, configuration=self.args
         )
 
+        # U26 Phase A — adjacent-buffer ownership probe (env-gated).
+        # Enumerate all L1 buffers in [0xa6000, 0xb0000] BEFORE the W2 matmul
+        # allocates w2_out at 0xa6700.  Whatever lives at 0xa8700 NOW (before
+        # W2 dispatches) is the SIBLING we are hunting.  Bracketed with an
+        # AFTER-W2 enumeration to confirm w2_out lands at 0xa6700.  Runs on
+        # EVERY layer (not just layer 0) so we can tell whether 0xa8700's
+        # owner is a previous-layer persistent buffer or a per-iteration
+        # allocation.  Default-off.
+        import os as _u26a_os
+        if (mode == Mode.DECODE
+                and _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1"):
+            try:
+                self._u26_iter = getattr(self, "_u26_iter", 0) + 1
+                _u26a_lo = 0xa6000
+                _u26a_hi = 0xb0000
+                _u26a_devs = (
+                    self.mesh_device.get_devices()
+                    if hasattr(self.mesh_device, "get_devices")
+                    else [self.mesh_device]
+                )
+                _u26a_bufs = ttnn._ttnn.reports.get_buffers(list(_u26a_devs))
+                _u26a_near = sorted(
+                    [(int(_b.address), _b.buffer_type, _b.buffer_layout,
+                      _b.max_size_per_bank)
+                     for _b in _u26a_bufs
+                     if _u26a_lo <= int(_b.address) <= _u26a_hi]
+                )
+                print(
+                    f"[U26_ADJ_PRE_W2] iter={self._u26_iter} "
+                    f"layer={getattr(self, 'layer_num', '?')} mode={mode} "
+                    f"bufs_in_range={len(_u26a_near)}",
+                    flush=True,
+                )
+                for _b in _u26a_near[:32]:
+                    print(
+                        f"[U26_ADJ_PRE_W2]   addr=0x{_b[0]:x} bt={_b[1]} "
+                        f"bl={_b[2]} sz_per_bank={_b[3]}",
+                        flush=True,
+                    )
+            except Exception as _u26a_e:
+                print(f"[U26_ADJ_PRE_W2] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
+                      flush=True)
+
         if seq_len > 128 and mode != Mode.DECODE:
             w2_out = ttnn.experimental.minimal_matmul(
                 w2_in,
@@ -562,6 +655,21 @@ class MLP(LightweightModule):
                     return self.w2_pdg
                 return self.w2
 
+            # U26 Path C — pre-allocated w2_out destination (env-gated).
+            # NOTE (U26 finding): pre-allocating via ttnn.allocate_tensor_on_device
+            # BEFORE trace capture fails with "Tensor is not allocated" once
+            # the trace capture closes — the allocation's storage is invalidated
+            # between the compile pass and the capture pass.  Kept here as a
+            # historical record; do NOT enable until pre-alloc lifetime is
+            # threaded properly through trace capture.
+            import os as _u26c_os
+            _u26c_active = (
+                mode == Mode.DECODE
+                and self.prefetcher is not None
+                and not _w2_use_skip
+                and _u26c_os.environ.get("SGLANG_TT_U26_PREALLOC_W2", "0") == "1"
+            )
+            _u26c_out_t = self._u26c_prealloc_w2_out() if _u26c_active else None
             w2_out = ttnn.linear(
                 w2_in,
                 _w2_weight(),
@@ -574,8 +682,47 @@ class MLP(LightweightModule):
                 sub_device_id=self.prefetcher.receiver_sub_device_id
                 if self.prefetcher is not None and mode == Mode.DECODE
                 else None,
+                optional_output_tensor=_u26c_out_t,
             )
         ttnn.deallocate(w2_in)
+
+        # U26 Phase A — POST-W2 buffer enumeration.  Pair with PRE_W2 above.
+        # Confirms w2_out lands at 0xa6700 and shows whether any NEW buffer
+        # was allocated between PRE and POST.
+        if (mode == Mode.DECODE
+                and _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1"):
+            try:
+                _u26a_lo = 0xa6000
+                _u26a_hi = 0xb0000
+                _u26a_devs = (
+                    self.mesh_device.get_devices()
+                    if hasattr(self.mesh_device, "get_devices")
+                    else [self.mesh_device]
+                )
+                _u26a_bufs = ttnn._ttnn.reports.get_buffers(list(_u26a_devs))
+                _u26a_near = sorted(
+                    [(int(_b.address), _b.buffer_type, _b.buffer_layout,
+                      _b.max_size_per_bank)
+                     for _b in _u26a_bufs
+                     if _u26a_lo <= int(_b.address) <= _u26a_hi]
+                )
+                _u26a_w2 = w2_out.buffer_address()
+                print(
+                    f"[U26_ADJ_POST_W2] iter={self._u26_iter} "
+                    f"layer={getattr(self, 'layer_num', '?')} "
+                    f"w2_out.addr=0x{_u26a_w2:x} "
+                    f"bufs_in_range={len(_u26a_near)}",
+                    flush=True,
+                )
+                for _b in _u26a_near[:32]:
+                    print(
+                        f"[U26_ADJ_POST_W2]   addr=0x{_b[0]:x} bt={_b[1]} "
+                        f"bl={_b[2]} sz_per_bank={_b[3]}",
+                        flush=True,
+                    )
+            except Exception as _u26a_e:
+                print(f"[U26_ADJ_POST_W2] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
+                      flush=True)
 
         # ---- U18 Probe P2 (env-gated): W2 matmul output buffer address ----
         # Print w2_out.buffer_address() on EVERY layer 0 invocation so we
@@ -848,6 +995,45 @@ class MLP(LightweightModule):
                 print(f"[U22_SNAPSHOT_RESTORE_W2] ERROR: {type(_u22sr_e).__name__}: {_u22sr_e}",
                       flush=True)
 
+        # U26 Phase A — buffer enumeration IMMEDIATELY before tt_all_reduce.
+        # By the time we get here, w2_out has been deallocated/reallocated
+        # by the U22 Path B variants (if active).  We want to see the L1
+        # layout RIGHT BEFORE RS dispatches.
+        if (mode == Mode.DECODE
+                and _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1"):
+            try:
+                _u26a_lo = 0xa6000
+                _u26a_hi = 0xb0000
+                _u26a_devs = (
+                    self.mesh_device.get_devices()
+                    if hasattr(self.mesh_device, "get_devices")
+                    else [self.mesh_device]
+                )
+                _u26a_bufs = ttnn._ttnn.reports.get_buffers(list(_u26a_devs))
+                _u26a_near = sorted(
+                    [(int(_b.address), _b.buffer_type, _b.buffer_layout,
+                      _b.max_size_per_bank)
+                     for _b in _u26a_bufs
+                     if _u26a_lo <= int(_b.address) <= _u26a_hi]
+                )
+                _u26a_w2 = w2_out.buffer_address()
+                print(
+                    f"[U26_ADJ_PRE_RS] iter={self._u26_iter} "
+                    f"layer={getattr(self, 'layer_num', '?')} "
+                    f"w2_out.addr=0x{_u26a_w2:x} "
+                    f"bufs_in_range={len(_u26a_near)}",
+                    flush=True,
+                )
+                for _b in _u26a_near[:32]:
+                    print(
+                        f"[U26_ADJ_PRE_RS]   addr=0x{_b[0]:x} bt={_b[1]} "
+                        f"bl={_b[2]} sz_per_bank={_b[3]}",
+                        flush=True,
+                    )
+            except Exception as _u26a_e:
+                print(f"[U26_ADJ_PRE_RS] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
+                      flush=True)
+
         w2_out_reduced = tt_all_reduce(
             w2_out,
             self.mesh_device,
@@ -870,6 +1056,44 @@ class MLP(LightweightModule):
             if mode == Mode.DECODE
             else None,
         )
+
+        # U26 Phase A — POST-RS buffer enumeration.  Show what was allocated
+        # by tt_all_reduce / reduce_scatter_minimal_async.  Confirms whether
+        # 0xa8700 ends up as the RS output / intermediate buffer slot.
+        if (mode == Mode.DECODE
+                and _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1"):
+            try:
+                _u26a_lo = 0xa6000
+                _u26a_hi = 0xb0000
+                _u26a_devs = (
+                    self.mesh_device.get_devices()
+                    if hasattr(self.mesh_device, "get_devices")
+                    else [self.mesh_device]
+                )
+                _u26a_bufs = ttnn._ttnn.reports.get_buffers(list(_u26a_devs))
+                _u26a_near = sorted(
+                    [(int(_b.address), _b.buffer_type, _b.buffer_layout,
+                      _b.max_size_per_bank)
+                     for _b in _u26a_bufs
+                     if _u26a_lo <= int(_b.address) <= _u26a_hi]
+                )
+                _u26a_red = w2_out_reduced.buffer_address()
+                print(
+                    f"[U26_ADJ_POST_RS] iter={self._u26_iter} "
+                    f"layer={getattr(self, 'layer_num', '?')} "
+                    f"reduced.addr=0x{_u26a_red:x} "
+                    f"bufs_in_range={len(_u26a_near)}",
+                    flush=True,
+                )
+                for _b in _u26a_near[:32]:
+                    print(
+                        f"[U26_ADJ_POST_RS]   addr=0x{_b[0]:x} bt={_b[1]} "
+                        f"bl={_b[2]} sz_per_bank={_b[3]}",
+                        flush=True,
+                    )
+            except Exception as _u26a_e:
+                print(f"[U26_ADJ_POST_RS] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
+                      flush=True)
         # Ensure dim 0 and 1 are 1
         original_shape = w2_out_reduced.shape
         w2_out_reduced = ttnn.reshape(

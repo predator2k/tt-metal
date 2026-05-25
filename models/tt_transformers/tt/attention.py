@@ -1743,6 +1743,43 @@ class Attention(LightweightModule):
                             and getattr(self, "wo_sharded_ring_pdg", None) is not None)
                         else (self.wo_sharded_ring if self.prefetcher is not None else self.wo)
                     )
+                    # U26 Phase A — adjacent-buffer ownership probe at attention WO.
+                    # Pair with mlp.py PRE_W2/POST_W2 probes.  See whether WO matmul
+                    # (per layer per iteration) allocates a buffer at 0xa8700 or
+                    # any other address in [0xa6000, 0xb0000].
+                    import os as _u26a_os
+                    if _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1":
+                        try:
+                            self._u26_attn_iter = getattr(self, "_u26_attn_iter", 0) + 1
+                            _u26a_lo = 0xa6000
+                            _u26a_hi = 0xb0000
+                            _u26a_devs = (
+                                self.mesh_device.get_devices()
+                                if hasattr(self.mesh_device, "get_devices")
+                                else [self.mesh_device]
+                            )
+                            _u26a_bufs = ttnn._ttnn.reports.get_buffers(list(_u26a_devs))
+                            _u26a_near = sorted(
+                                [(int(_b.address), _b.buffer_type, _b.buffer_layout,
+                                  _b.max_size_per_bank)
+                                 for _b in _u26a_bufs
+                                 if _u26a_lo <= int(_b.address) <= _u26a_hi]
+                            )
+                            print(
+                                f"[U26_ADJ_PRE_WO] iter={self._u26_attn_iter} "
+                                f"layer={getattr(self, 'layer_num', '?')} "
+                                f"bufs_in_range={len(_u26a_near)}",
+                                flush=True,
+                            )
+                            for _b in _u26a_near[:32]:
+                                print(
+                                    f"[U26_ADJ_PRE_WO]   addr=0x{_b[0]:x} bt={_b[1]} "
+                                    f"bl={_b[2]} sz_per_bank={_b[3]}",
+                                    flush=True,
+                                )
+                        except Exception as _u26a_e:
+                            print(f"[U26_ADJ_PRE_WO] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
+                                  flush=True)
                     dense_out_sharded = ttnn.linear(
                         all_gather_output,
                         _wo_for_mm,
@@ -1754,6 +1791,40 @@ class Attention(LightweightModule):
                         # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
                         sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
                     )
+                    # U26 Phase A — POST-WO probe (paired).
+                    if _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1":
+                        try:
+                            _u26a_lo = 0xa6000
+                            _u26a_hi = 0xb0000
+                            _u26a_devs = (
+                                self.mesh_device.get_devices()
+                                if hasattr(self.mesh_device, "get_devices")
+                                else [self.mesh_device]
+                            )
+                            _u26a_bufs = ttnn._ttnn.reports.get_buffers(list(_u26a_devs))
+                            _u26a_near = sorted(
+                                [(int(_b.address), _b.buffer_type, _b.buffer_layout,
+                                  _b.max_size_per_bank)
+                                 for _b in _u26a_bufs
+                                 if _u26a_lo <= int(_b.address) <= _u26a_hi]
+                            )
+                            _u26a_wo = dense_out_sharded.buffer_address()
+                            print(
+                                f"[U26_ADJ_POST_WO] iter={self._u26_attn_iter} "
+                                f"layer={getattr(self, 'layer_num', '?')} "
+                                f"wo_out.addr=0x{_u26a_wo:x} "
+                                f"bufs_in_range={len(_u26a_near)}",
+                                flush=True,
+                            )
+                            for _b in _u26a_near[:32]:
+                                print(
+                                    f"[U26_ADJ_POST_WO]   addr=0x{_b[0]:x} bt={_b[1]} "
+                                    f"bl={_b[2]} sz_per_bank={_b[3]}",
+                                    flush=True,
+                                )
+                        except Exception as _u26a_e:
+                            print(f"[U26_ADJ_POST_WO] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
+                                  flush=True)
                 ttnn.deallocate(all_gather_output)
             ttnn.deallocate(attn_output_cat)
             dense_out_sharded = ttnn.to_memory_config(
