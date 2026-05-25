@@ -1057,6 +1057,27 @@ class Prefetcher(LightweightModule):
         (gcb_size - gcb_size%page_size) which for Qwen3-8B-balanced
         is 835584 (page_size divides 835584 evenly for every tensor).
         We apply modulo gcb_size here.
+
+        U33 (2026-05-25) — *consumer-side* offset computation.
+        The U32 Python formula tried to mirror the producer's per-tensor
+        per-receiver write byte count (`num_blocks *
+        block_size_per_receiver`), where block_size_per_receiver depends
+        on `tensor_block_num_tiles = shard_h_tiles * shard_w_tiles /
+        num_blocks`.  But the matmul **CONSUMER** reads tensor t at
+        `num_blocks * in1_block_size_bytes[t]` bytes per dispatch, where
+        `in1_block_size_bytes[t] = per_core_N[t] * in0_block_w[t] *
+        tile_bytes[t]`.  Producer and consumer write/read the SAME data
+        for tensor t — so the cumulative offset for tensor t equals the
+        cumulative *consumer* bytes for all tensors written-and-read
+        before t.  Computing this Python-side requires knowing each
+        tensor's matmul program_config — which is known Python-side.
+        Caller (mlp.py / attention.py) registers the per-tensor consumer
+        bytes via `set_tensor_consumer_bytes()` BEFORE the first
+        ttnn.linear dispatch.  Until registered, fall back to the U32
+        producer-side estimate (preserves the no-op force-zero path).
+        Env-gated SGLANG_TT_U33_FACTORY_OFFSET=1 (the misnomer — the
+        OFFSET COMPUTATION runs Python-side; the env var name is kept
+        for plan continuity with U33).
         """
         if not hasattr(self, "_tensor_byte_offsets") or not self.prefetched_tensors:
             return 0
@@ -1075,13 +1096,96 @@ class Prefetcher(LightweightModule):
         # same relative position MODULO the GCB wrap, and the matmul reads
         # from fifo_start + per_tensor_offset on EVERY layer's dispatch).
         # Take the offset from the per-layer position (idx % num_tensors).
+        per_layer_idx = (idx % self.num_tensors) if self.num_tensors > 0 else idx
+
+        # U33 — prefer consumer-side cumulative when SGLANG_TT_U33_FACTORY_OFFSET=1.
+        # Use whichever consumer bytes have been registered so far; treat
+        # unset entries as 0.  This means iteration-1 may use partial info
+        # but the registrations all happen during the first pass and become
+        # bytewise-stable from iteration 2 onwards.
+        use_u33 = (
+            os.environ.get("SGLANG_TT_U33_FACTORY_OFFSET", "0") == "1"
+            and getattr(self, "_tensor_consumer_bytes", None) is not None
+            and len(self._tensor_consumer_bytes) > 0
+        )
+        gcb_size = self.max_tensor_block_size if self.max_tensor_block_size > 0 else 1
+        if use_u33:
+            # Sum consumer bytes for all tensors BEFORE this one in the
+            # per-layer order.  Each tensor's matmul reads num_blocks *
+            # in1_block_size_bytes per dispatch; producer wrote that many
+            # bytes per tensor per receiver in the GCB; offsets are
+            # cumulative until GCB-wrap.
+            offset = 0
+            for i in range(per_layer_idx):
+                if i < len(self._tensor_consumer_bytes):
+                    offset += int(self._tensor_consumer_bytes[i])
+            return offset % gcb_size
+
         if self.num_tensors > 0:
             offset = self._tensor_byte_offsets[idx % self.num_tensors]
         else:
             offset = self._tensor_byte_offsets[idx]
         # Wrap to fit within the GlobalCB region.
-        gcb_size = self.max_tensor_block_size if self.max_tensor_block_size > 0 else 1
         return offset % gcb_size
+
+    def set_tensor_consumer_bytes(self, tensor: ttnn.Tensor, consumer_bytes_per_dispatch: int) -> None:
+        """U33 — register per-tensor consumer bytes per dispatch.
+
+        The matmul that consumes `tensor` reads
+        `num_blocks * in1_block_size_bytes` bytes per dispatch where
+        `in1_block_size_bytes = per_core_N * in0_block_w * tile_bytes`.
+        Once every tensor's consumer bytes are registered,
+        `get_tensor_gcb_offset_bytes` switches to consumer-side cumulative.
+
+        Idempotent (overwrites previously set value).  No-op if tensor is
+        not in `prefetched_tensors`.
+
+        Use buffer_address as the lookup key (ttnn.Tensor equality may be
+        unreliable across slicing/permutation; buffer address is the actual
+        DRAM placement that the prefetcher actually reads).
+        """
+        if not hasattr(self, "_tensor_consumer_bytes"):
+            self._tensor_consumer_bytes = []
+        # Lookup by Python object identity first; fall back to buffer
+        # address comparison if identity fails.  Note: buffer_address()
+        # may surface previously-queued async errors — caller must handle.
+        idx = None
+        for i, t in enumerate(self.prefetched_tensors):
+            if t is tensor:
+                idx = i
+                break
+        if idx is None:
+            try:
+                tgt_addr = tensor.buffer_address()
+            except Exception:
+                tgt_addr = None
+            if tgt_addr is not None:
+                for i, addr in enumerate(self.prefetched_tensor_addr):
+                    if addr == tgt_addr:
+                        idx = i
+                        break
+        if idx is None:
+            return
+        per_layer_idx = (idx % self.num_tensors) if self.num_tensors > 0 else idx
+        # Grow up to num_tensors slots (per-layer; offsets are the same across layers).
+        n_slots = self.num_tensors if self.num_tensors > 0 else (per_layer_idx + 1)
+        while len(self._tensor_consumer_bytes) < n_slots:
+            self._tensor_consumer_bytes.append(0)
+        was = self._tensor_consumer_bytes[per_layer_idx]
+        self._tensor_consumer_bytes[per_layer_idx] = int(consumer_bytes_per_dispatch)
+        if was != int(consumer_bytes_per_dispatch):
+            gcb_size = self.max_tensor_block_size if self.max_tensor_block_size > 0 else 1
+            cum = 0
+            offs = []
+            for i in range(n_slots):
+                offs.append(cum % gcb_size)
+                cum += int(self._tensor_consumer_bytes[i])
+            logger.info(
+                f"[U33] set_tensor_consumer_bytes per_layer_idx={per_layer_idx} "
+                f"bytes={consumer_bytes_per_dispatch} (was={was}) "
+                f"gcb_size={gcb_size} per_tensor_bytes={self._tensor_consumer_bytes} "
+                f"cumulative_offsets={offs}"
+            )
 
     def prefetch(self):
         """

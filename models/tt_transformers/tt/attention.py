@@ -1065,6 +1065,25 @@ class Attention(LightweightModule):
                 _u32_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
                 and self.prefetcher is not None
             )
+            # U33 — register WQKV's consumer bytes once.  See prefetcher.py
+            # for the cumulative-bytes formula.  Matmul reads num_blocks *
+            # in1_block_size_bytes = ring_size * per_core_N * in0_block_w *
+            # tile_bytes per dispatch.
+            _u33_active = (
+                _u32_active
+                and _u32_os.environ.get("SGLANG_TT_U33_FACTORY_OFFSET", "0") == "1"
+            )
+            if _u33_active:
+                try:
+                    _u33_pc = self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher)
+                    _u33_dt = _wqkv_for_mm.dtype
+                    _u33_tb = {ttnn.bfloat4_b: 576, ttnn.bfloat8_b: 1088, ttnn.bfloat16: 2048}.get(_u33_dt, 1088)
+                    _u33_pcn = int(_u33_pc.per_core_N)
+                    _u33_ibw = int(_u33_pc.in0_block_w)
+                    _u33_per = int(self.prefetcher.ring_size) * _u33_pcn * _u33_ibw * _u33_tb
+                    self.prefetcher.set_tensor_consumer_bytes(_wqkv_for_mm, _u33_per)
+                except Exception:
+                    pass
             _u32_qkv_prev = _u32_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
             if _u32_active:
                 try:
@@ -1807,6 +1826,22 @@ class Attention(LightweightModule):
                         _u32_wo_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
                         and self.prefetcher is not None
                     )
+                    # U33 — register WO's consumer bytes once.
+                    _u33_wo_active = (
+                        _u32_wo_active
+                        and _u32_wo_os.environ.get("SGLANG_TT_U33_FACTORY_OFFSET", "0") == "1"
+                    )
+                    if _u33_wo_active:
+                        try:
+                            _u33wo_pc = self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher)
+                            _u33wo_dt = _wo_for_mm.dtype
+                            _u33wo_tb = {ttnn.bfloat4_b: 576, ttnn.bfloat8_b: 1088, ttnn.bfloat16: 2048}.get(_u33wo_dt, 1088)
+                            _u33wo_pcn = int(_u33wo_pc.per_core_N)
+                            _u33wo_ibw = int(_u33wo_pc.in0_block_w)
+                            _u33wo_per = int(self.prefetcher.ring_size) * _u33wo_pcn * _u33wo_ibw * _u33wo_tb
+                            self.prefetcher.set_tensor_consumer_bytes(_wo_for_mm, _u33wo_per)
+                        except Exception:
+                            pass
                     _u32_wo_prev = _u32_wo_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
                     if _u32_wo_active:
                         try:
@@ -1915,6 +1950,22 @@ class Attention(LightweightModule):
                 _u32_wotg_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
                 and self.prefetcher is not None
             )
+            # U33 — register WO TG's consumer bytes once.
+            _u33_wotg_active = (
+                _u32_wotg_active
+                and _u32_wotg_os.environ.get("SGLANG_TT_U33_FACTORY_OFFSET", "0") == "1"
+            )
+            if _u33_wotg_active:
+                try:
+                    _u33wotg_pc = self.args.get_attn_wo_program_config(Mode.DECODE, 1, self.prefetcher)
+                    _u33wotg_dt = self.wo.dtype
+                    _u33wotg_tb = {ttnn.bfloat4_b: 576, ttnn.bfloat8_b: 1088, ttnn.bfloat16: 2048}.get(_u33wotg_dt, 1088)
+                    _u33wotg_pcn = int(_u33wotg_pc.per_core_N)
+                    _u33wotg_ibw = int(_u33wotg_pc.in0_block_w)
+                    _u33wotg_per = int(self.prefetcher.ring_size) * _u33wotg_pcn * _u33wotg_ibw * _u33wotg_tb
+                    self.prefetcher.set_tensor_consumer_bytes(self.wo, _u33wotg_per)
+                except Exception:
+                    pass
             _u32_wotg_prev = _u32_wotg_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
             if _u32_wotg_active:
                 try:

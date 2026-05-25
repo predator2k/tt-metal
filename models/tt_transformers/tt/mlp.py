@@ -492,6 +492,51 @@ class MLP(LightweightModule):
             and mode == Mode.DECODE
             and self.prefetcher is not None
         )
+        # U33 — register per-tensor CONSUMER bytes (matmul side).
+        # Each ttnn.linear that consumes a prefetched tensor reads
+        # `num_blocks * in1_block_size_bytes` bytes per dispatch, where
+        # `in1_block_size_bytes = per_core_N * in0_block_w * tile_bytes`.
+        # Cumulative consumer bytes across tensors = where the producer
+        # had to have written this tensor in the GCB.  Used in
+        # prefetcher.get_tensor_gcb_offset_bytes when
+        # SGLANG_TT_U33_FACTORY_OFFSET=1.
+        _u33_active = (
+            _u32_active
+            and _u32_os.environ.get("SGLANG_TT_U33_FACTORY_OFFSET", "0") == "1"
+        )
+
+        def _u33_tile_bytes(weight):
+            try:
+                _dt = weight.dtype
+            except Exception:
+                return 1088
+            return {ttnn.bfloat4_b: 576, ttnn.bfloat8_b: 1088, ttnn.bfloat16: 2048}.get(_dt, 1088)
+
+        def _u33_in1_block_bytes(pc, weight):
+            try:
+                per_core_n = int(pc.per_core_N)
+                in0_bw = int(pc.in0_block_w)
+            except Exception:
+                return 0
+            return per_core_n * in0_bw * _u33_tile_bytes(weight)
+
+        def _u33_register(weight, pc, label=""):
+            if not _u33_active or weight is None or pc is None:
+                return
+            try:
+                num_blocks = int(self.prefetcher.ring_size)
+            except Exception:
+                num_blocks = 32
+            per_dispatch = num_blocks * _u33_in1_block_bytes(pc, weight)
+            try:
+                self.prefetcher.set_tensor_consumer_bytes(weight, per_dispatch)
+            except Exception:
+                pass
+
+        if _u33_active and not _w1_use_skip:
+            _u33_register(_w1_weight(), pc_1, "w1")
+            _u33_register(_w3_weight(), pc_3, "w3")
+
         def _u32_set_offset_for(weight):
             if not _u32_active or weight is None:
                 return None
@@ -808,6 +853,9 @@ class MLP(LightweightModule):
                 # u29_prev_seen (counter).  No host-side coordination
                 # required.
             # U32 — set per-tensor offset for W2 before ttnn.linear.
+            # U33 — register W2's consumer bytes once.
+            if _u33_active and not _w2_use_skip:
+                _u33_register(_w2_weight(), pc_2, "w2")
             _u32_w2_prev = _u32_set_offset_for(_w2_weight())
             try:
                 w2_out = ttnn.linear(
