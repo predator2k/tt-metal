@@ -1218,6 +1218,15 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
         reader_compute_defines["SGLANG_TT_PREFETCHER_CONSUMER_PROBE"] = "1";
     }
 
+    // U17 Phase-0 — PRE-RS probe.  Reads producer's L1 bytes at RS reader
+    // entry, BEFORE any normal RS work fires.  Discriminates whether the
+    // stomper acts BEFORE or DURING the RS reader's execution.  Only
+    // applied when SGLANG_TT_U17_PROBE_RS_PRE=1.
+    const char* u17_pre_probe_env = std::getenv("SGLANG_TT_U17_PROBE_RS_PRE");
+    if (u17_pre_probe_env != nullptr && std::string(u17_pre_probe_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U17_PROBE_RS_PRE"] = "1";
+    }
+
     // KERNEL CREATION
     if (fuse_op) {
         fused_op_signaler->init_reduce_scatter(program, mesh_device, sender_worker_core_range_set);

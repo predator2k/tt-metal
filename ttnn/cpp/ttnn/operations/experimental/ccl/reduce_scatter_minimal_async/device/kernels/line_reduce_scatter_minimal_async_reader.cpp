@@ -19,6 +19,22 @@
 #include "api/debug/dprint.h"
 #endif
 
+#ifdef SGLANG_TT_U17_PROBE_RS_PRE
+// U17 — Phase-0 PRE-RS probe.  Reads producer's L1 bytes at the very
+// start of the RS reader, BEFORE any RS work fires.  Issues a single
+// noc_async_read of the first 16 bytes from input_tensor_address +
+// computed tile_id_start, drains the read with noc_async_read_barrier,
+// and prints the bytes.  This discriminates:
+//   - L1 zero at RS reader entry  -> stomper lives inside RS reader logic
+//                                    or in a kernel that runs concurrently
+//                                    with RS reader (very unlikely).
+//   - L1 NONZERO at RS reader entry -> stomper runs BEFORE RS reader gets
+//                                      its dispatch (i.e., some op between
+//                                      W2 PACK completion and RS reader
+//                                      start has stomped 0xa6700).
+#include "api/debug/dprint.h"
+#endif
+
 using address_t = uint32_t;
 
 ///////////////////////////////////////////////////
@@ -159,6 +175,51 @@ void kernel_main() {
     uint32_t chunk_count = 0;
     uint32_t fwd_sync_cnt = 0;
     uint32_t sem_target = 0;
+
+#ifdef SGLANG_TT_U17_PROBE_RS_PRE
+    // U17 Phase-0 — PRE-RS probe.  Read producer's first tile L1 bytes
+    // immediately at RS reader entry, BEFORE any normal RS work fires.
+    // Uses tile_id 0 (start_tiles_read=0 is the most common case for the
+    // forward direction's first slice).  We read into a temporary L1
+    // scratch slot (reuse cb_input_id's first reserve).  Per-launch
+    // budget keeps log size bounded.
+    {
+        static uint32_t u17_pre_budget = 16;
+        if (u17_pre_budget > 0) {
+            u17_pre_budget--;
+            cb_reserve_back(cb_input_id, 1);
+            uint32_t l1_scratch = get_write_ptr(cb_input_id);
+            uint32_t probe_tile_id = 0;  // first tile of input
+            uint64_t probe_noc_addr = get_noc_addr(probe_tile_id, input_tensor_addrgen);
+            // Zero-fill scratch first so a zero result is meaningful.
+            volatile tt_l1_ptr uint32_t* z =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_scratch);
+            z[0] = 0; z[1] = 0; z[2] = 0; z[3] = 0;
+            // Issue a single read of page_size bytes from producer's L1.
+            noc_async_read(probe_noc_addr, l1_scratch, page_size);
+            noc_async_read_barrier();
+            volatile tt_l1_ptr uint32_t* p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_scratch);
+            uint32_t v[4] = { p[0], p[1], p[2], p[3] };
+            bool any_nonzero = v[0] != 0 || v[1] != 0 || v[2] != 0 || v[3] != 0;
+            DPRINT << "[U17_PRE_RS in_addr=0x" << HEX() << input_tensor_address
+                   << " noc=0x" << probe_noc_addr
+                   << " w0=0x" << v[0]
+                   << " w1=0x" << v[1]
+                   << " w2=0x" << v[2]
+                   << " w3=0x" << v[3]
+                   << " " << DEC() << (any_nonzero ? "NONZERO" : "zero")
+                   << "]" << ENDL();
+            // Do NOT push_back — leave scratch reserved-but-not-consumed,
+            // we'll write over it in the normal flow.  Or rather: we just
+            // reset the cb_input_id reservation by NOT pushing.  Safer is
+            // to not reserve at all — but cb_reserve_back is required so
+            // we get a valid l1_write_addr.  Since we never push_back, the
+            // subsequent cb_reserve_back calls in the main loop will see
+            // the same address and overwrite.
+        }
+    }
+#endif
 
     for (uint32_t b = 0; b < input_tensor_B; b++) {
         if (fuse_op) {
