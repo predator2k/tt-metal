@@ -2442,6 +2442,46 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u25_rcb_probe_env != nullptr && std::string(u25_rcb_probe_env) == "1") {
             mm_in1_kernel_defines["SGLANG_TT_U25_RCB_PROBE"] = "1";
         }
+        // U29 (2026-05-25) — device-side W2→RS producer-consumer signaler.
+        // Cross-sub-device dispatch race confirmed in U28:
+        // W2 matmul lives on receiver_sub_device; RS lives on
+        // worker_sub_device; set_sub_device_stall_group([worker])
+        // excludes receiver from cross-subdev sync, so trace replay
+        // can dispatch RS reader's noc_async_read of W2's mm_out_cb
+        // L1 region BEFORE W2's final PACK has retired.  Result:
+        // RS reader observes pre-existing residual bytes at 0xa6700
+        // (the U17 46% NONZERO race).
+        //
+        // Architectural fix: kernel-level producer-consumer handshake
+        // via a fixed-L1-address atomic counter on each receiver core.
+        // W2 in1 sender writer (LAST RISC-side code on producer core)
+        // does noc_semaphore_inc on its OWN core's U29 L1 sema slot
+        // after async_write_barrier(); RS reader does noc_async_read of
+        // each producer core's U29 sema slot at entry, waits for
+        // value >= expected counter, then proceeds.
+        //
+        // Both kernels see the same U29_SEMA_L1 address via this
+        // matched compile-time define.  Both kernels read the
+        // expected-count via runtime arg from program factory.
+        //
+        // Default OFF; canonical bytewise-equal under U29=0.
+        // Only applies on gathered (use_global_cb) path so non-prefetcher
+        // matmuls remain untouched.
+        const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
+        if (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") {
+            // Pick a fixed L1 scratch address well outside the W2_out
+            // L1 region (0xa6700) AND outside the prefetcher GCB receivers'
+            // shard slots.  0x90000 is in the unreserved L1 region on BH
+            // and is unused by either of those.  4-byte atomic counter.
+            //
+            // NOTE: The counter is monotonic across forwards; the matched
+            // expected value comes from a runtime arg.  Override-runtime-args
+            // will bump the expected per forward.
+            mm_in1_kernel_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
+            mm_in1_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+            mm_kernel_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
+            mm_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+        }
     }
 
     if (fused_activation.has_value()) {

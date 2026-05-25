@@ -290,6 +290,36 @@ void kernel_main() {
     noc.async_atomic_barrier();
 #endif
     noc.async_write_barrier();
+#ifdef SGLANG_TT_U29_W2_RS_SIGNALER
+    // U29 — producer-side counter increment.  Closes the W2→RS cross-
+    // sub-device dispatch race confirmed in U28.  This RISC is the LAST
+    // code that runs on the W2 producer core; the `noc.async_write_barrier()`
+    // call immediately above guarantees all in-flight L1 writes (including
+    // PACK's writes to mm_out_cb at the residual-data L1 region 0xa6700)
+    // have retired.
+    //
+    // We atomically increment a 4-byte L1 counter at the fixed scratch
+    // address SGLANG_TT_U29_SEMA_L1 (default 0x90000) on THIS core.  The
+    // RS reader (running on worker_sub_device cores under trace replay)
+    // will read this counter across all W2 producer cores and wait for
+    // value >= expected before issuing its first noc_async_read of mm_out_cb.
+    //
+    // SGLANG_TT_U29_SEMA_L1 is defined by the program factory and must
+    // match between this kernel and the RS reader kernel.
+    //
+    // PHASE 1 (current commit): scaffold only — `noc_semaphore_inc` with
+    // own-core noc coord.  PHASE 2: wire the per-producer-core noc-coord
+    // list as a runtime arg in the RS reader so the wait can iterate
+    // over all 32 producer cores.
+    {
+        const uint32_t u29_my_x = my_x[noc_index];
+        const uint32_t u29_my_y = my_y[noc_index];
+        uint64_t u29_self_sema_noc_addr =
+            get_noc_addr(u29_my_x, u29_my_y, (uint32_t)(SGLANG_TT_U29_SEMA_L1));
+        noc_semaphore_inc(u29_self_sema_noc_addr, 1);
+        noc_async_atomic_barrier();
+    }
+#endif
 #ifdef SGLANG_TT_U20_DATAFLOW_PROBE
     // U20 EXIT probe.  noc.async_write_barrier() above drains any
     // pending NoC writes from this RISC; local L1 view is up-to-date.

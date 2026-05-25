@@ -927,4 +927,18 @@ void kernel_main() {
     // pending tensix op (including PACK->L1 writes) has retired.
     ckernel::tensix_sync();
 #endif
+#ifdef SGLANG_TT_U29_W2_RS_SIGNALER
+    // U29 — kernel-exit fence to guarantee PACK->L1 retirement BEFORE
+    // the dataflow in1 sender writer kernel issues its
+    // noc_semaphore_inc.  Combined with the in1 sender writer's
+    // `noc.async_write_barrier()` + `noc_semaphore_inc`, this
+    // 2-stage fence forms the producer side of the W2->RS
+    // cross-sub-device dispatch-race fix (U28-β confirmed).
+    //
+    // See reader_bmm_tile_layout_in1_ring_all_gather.cpp for the
+    // matching `noc_semaphore_inc` and
+    // line_reduce_scatter_minimal_async_reader.cpp for the
+    // matching consumer-side wait.
+    ckernel::tensix_sync();
+#endif
 }

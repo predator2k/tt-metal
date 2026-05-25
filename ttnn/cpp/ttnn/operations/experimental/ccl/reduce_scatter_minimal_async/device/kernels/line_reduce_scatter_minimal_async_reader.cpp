@@ -215,6 +215,38 @@ void kernel_main() {
     uint32_t fwd_sync_cnt = 0;
     uint32_t sem_target = 0;
 
+#ifdef SGLANG_TT_U29_W2_RS_SIGNALER
+    // U29 — consumer-side signal wait.  Pair to the W2 in1_ring_all_gather
+    // producer-side `noc_semaphore_inc` increment.  See
+    // matmul_multicore_reuse_mcast_1d_program_factory.cpp (factory) and
+    // reader_bmm_tile_layout_in1_ring_all_gather.cpp (producer kernel).
+    //
+    // Cross-sub-device dispatch race (U28-β CONFIRMED): without an
+    // in-kernel handshake, RS reader's noc_async_read of W2's mm_out_cb
+    // L1 region can fire BEFORE W2's PACK has retired, observing
+    // residual data at 0xa6700.
+    //
+    // PHASE 1 (current commit): scaffold only — logs U29 enablement
+    // signature once per kernel invocation via DPRINT.  No actual wait;
+    // we land the env-gate + define-propagation + producer increment
+    // first, then verify the increment fires under trace via the U29
+    // counter readback.
+    //
+    // PHASE 2: read producer L1 U29_SEMA_L1 across the producer-cores
+    // noc-coord list (passed as a new runtime arg via factory) and
+    // wait until each is >= expected counter (passed as runtime arg,
+    // bumped per forward via override_runtime_args).
+    {
+        static uint32_t u29_log_budget = 64;
+        if (u29_log_budget > 0) {
+            u29_log_budget--;
+            DPRINT << "[U29_RS_READER_ENTRY signaler_addr=0x" << HEX()
+                   << (uint32_t)(SGLANG_TT_U29_SEMA_L1) << DEC()
+                   << " scaffold_only]" << ENDL();
+        }
+    }
+#endif
+
 #ifdef SGLANG_TT_U17_PROBE_RS_PRE
     // U17 Phase-0 — PRE-RS probe.  Read producer's first tile L1 bytes
     // immediately at RS reader entry, BEFORE any normal RS work fires.

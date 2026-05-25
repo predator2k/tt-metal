@@ -1291,6 +1291,30 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
         reader_compute_defines["SGLANG_TT_U25_BYTE_HUNT"] = "1";
     }
 
+    // U29 (2026-05-25) — device-side W2→RS signaler (consumer side).
+    // Pair to the W2 matmul producer-side increment in
+    // matmul_multicore_reuse_mcast_1d_program_factory.cpp.  When
+    // SGLANG_TT_U29_W2_RS_SIGNALER=1, the RS reader kernel waits on
+    // each producer core's L1 U29 sema slot at U29_SEMA_L1 (default
+    // 0x90000) before issuing its first noc_async_read of producer L1.
+    //
+    // Cross-sub-device dispatch race (U28-β CONFIRMED): W2 on
+    // receiver_sub_device, RS on worker_sub_device; receiver excluded
+    // from stall_group; trace replay schedules per-subdev independently.
+    // The L1-sema-handshake closes the gap entirely in-kernel.
+    //
+    // Default OFF; canonical bytewise-equal under U29=0.
+    //
+    // Phase 1 (this commit) lands the scaffold only — the kernel-side
+    // wait loop is wired in line_reduce_scatter_minimal_async_reader.cpp
+    // under the same define.  Phase 2 wires the per-producer-core
+    // noc_addr list as a runtime arg.
+    const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
+    if (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
+        reader_compute_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+    }
+
     // KERNEL CREATION
     if (fuse_op) {
         fused_op_signaler->init_reduce_scatter(program, mesh_device, sender_worker_core_range_set);
