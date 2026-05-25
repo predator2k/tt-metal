@@ -2482,18 +2482,39 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         const bool u29_active = (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") &&
                                 (u29_now_env != nullptr && std::string(u29_now_env) == "1");
         if (u29_active) {
-            // Pick a fixed L1 scratch address well outside the W2_out
-            // L1 region (0xa6700) AND outside the prefetcher GCB receivers'
-            // shard slots.  0x90000 is in the unreserved L1 region on BH
-            // and is unused by either of those.  4-byte atomic counter.
+            // U29 Phase 3 — replace fixed-L1-address (0x90000, found to
+            // collide with allocator-managed tensor placement in Phase 2)
+            // with the address of a properly allocated GlobalSemaphore.
             //
-            // NOTE: The counter is monotonic across forwards (no host-side
-            // reset needed); the RS reader uses a relative-counter wait
-            // (see line_reduce_scatter_minimal_async_reader.cpp).
+            // The Python caller (mlp.py) creates a single GlobalSemaphore
+            // on the W2 receiver-core grid at MLP __init__ time (via
+            // ttnn.create_global_semaphore), queries its address with
+            // ttnn.get_global_semaphore_address, and exports it via env
+            // var SGLANG_TT_U29_SEMA_L1_ADDR=0x<addr>.  We read it here
+            // at program-creation time and bake it into the kernel's
+            // SGLANG_TT_U29_SEMA_L1 define.  When the env var is NOT
+            // set (e.g. Phase 1/2 legacy debug runs), fall back to the
+            // historical 0x90000 to preserve probe reproducibility.
+            const char* u29_addr_env = std::getenv("SGLANG_TT_U29_SEMA_L1_ADDR");
+            std::string u29_sema_l1_define = "0x90000";
+            if (u29_addr_env != nullptr && u29_addr_env[0] != '\0') {
+                u29_sema_l1_define = std::string(u29_addr_env);
+            }
             mm_in1_kernel_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
-            mm_in1_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+            mm_in1_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = u29_sema_l1_define;
             mm_kernel_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
-            mm_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+            mm_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = u29_sema_l1_define;
+
+            // U29 Phase 3 — sentinel-mode override.  When set, producer
+            // writes 0xDEADBEEF to the sema slot (no atomic_inc); RS
+            // reader DPRINTs the value read back.  Used to confirm the
+            // handshake engages on a safe L1 slot end-to-end BEFORE
+            // committing to the counter-increment design.
+            const char* u29_sentinel_env = std::getenv("SGLANG_TT_U29_SENTINEL");
+            if (u29_sentinel_env != nullptr && std::string(u29_sentinel_env) == "1") {
+                mm_in1_kernel_defines["SGLANG_TT_U29_SENTINEL"] = "1";
+                mm_kernel_defines["SGLANG_TT_U29_SENTINEL"] = "1";
+            }
         }
     }
 

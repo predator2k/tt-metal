@@ -1312,10 +1312,35 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
     // (bumped by 1 each kernel invocation).  Both kernels see the
     // same U29_SEMA_L1 via matched compile-time defines.
     const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
-    const bool u29_enabled = (u29_sig_env != nullptr && std::string(u29_sig_env) == "1");
+    // U29 Phase 3 — narrow the RS-side wait + sema-addr define to the
+    // W2 -> tt_all_reduce chain ONLY (mlp.py sets SGLANG_TT_U29_W2_RS_NOW
+    // immediately before the W2 RS call).  Other RS calls (w1/w3 in MLP,
+    // WO in attention) use the same kernel binary but must NOT have the
+    // wait loop baked in — they have no producer-side increment and would
+    // spin forever on a never-incremented sema.
+    const char* u29_rs_now_env = std::getenv("SGLANG_TT_U29_W2_RS_NOW");
+    const bool u29_enabled =
+        (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") &&
+        (u29_rs_now_env != nullptr && std::string(u29_rs_now_env) == "1");
     if (u29_enabled) {
+        // U29 Phase 3 — read the GlobalSemaphore L1 address from env
+        // (set by mlp.py around the W2 ttnn.linear call).  Fall back to
+        // 0x90000 for Phase 1/2 debug reproducibility when env not set.
+        // See matmul factory for the matched read.
+        const char* u29_addr_env = std::getenv("SGLANG_TT_U29_SEMA_L1_ADDR");
+        std::string u29_sema_l1_define = "0x90000";
+        if (u29_addr_env != nullptr && u29_addr_env[0] != '\0') {
+            u29_sema_l1_define = std::string(u29_addr_env);
+        }
         reader_compute_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
-        reader_compute_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+        reader_compute_defines["SGLANG_TT_U29_SEMA_L1"] = u29_sema_l1_define;
+        // U29 Phase 3 — sentinel-mode override.  Producer writes
+        // 0xDEADBEEF, RS reader DPRINTs the readback.  See matmul
+        // factory for the matched read.
+        const char* u29_sentinel_env = std::getenv("SGLANG_TT_U29_SENTINEL");
+        if (u29_sentinel_env != nullptr && std::string(u29_sentinel_env) == "1") {
+            reader_compute_defines["SGLANG_TT_U29_SENTINEL"] = "1";
+        }
         // U29 Phase 2 debug DPRINT propagation (env-gated; default OFF).
         const char* u29_dbg_env = std::getenv("SGLANG_TT_U29_DEBUG_DPRINT");
         if (u29_dbg_env != nullptr && std::string(u29_dbg_env) == "1") {

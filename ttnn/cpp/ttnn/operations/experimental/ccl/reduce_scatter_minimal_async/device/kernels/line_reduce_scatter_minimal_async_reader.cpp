@@ -253,6 +253,50 @@ void kernel_main() {
     {
         static uint32_t u29_prev_seen = 0;
 
+#ifdef SGLANG_TT_U29_SENTINEL
+        // U29 Phase 3 — sentinel-mode handshake verification.
+        //
+        // Goal: prove or disprove that the chosen L1 sema slot is a
+        // SAFE address (i.e. not stomped on by a tensor placement) AND
+        // that the producer's noc-write actually lands there before
+        // the RS reader reads it.
+        //
+        // The producer writes 0xDEADBEEF to the slot at end of W2 PACK
+        // (see reader_bmm_tile_layout_in1_ring_all_gather.cpp).  The RS
+        // reader reads from each producer's slot here and DPRINTs the
+        // value.  If we consistently see 0xDEADBEEF on the FIRST forward
+        // (and any value other than 0 after the second forward when the
+        // sema is reset to 0 between forwards), the handshake works.
+        // If we see any other value (e.g., looks like tensor data,
+        // looks like the previous L1 contents), the slot is unsafe.
+        if (u29_num_producers > 0) {
+            cb_reserve_back(cb_input_id, 1);
+            uint32_t u29_l1_scratch = get_write_ptr(cb_input_id);
+            volatile tt_l1_ptr uint32_t* u29_scratch_p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(u29_l1_scratch);
+
+            static uint32_t u29_sentinel_log_budget = 64;
+            // Sample only the FIRST producer core to keep DPRINT volume
+            // manageable; one log per RS-reader-call is enough to confirm
+            // the handshake.
+            const uint32_t px = get_arg_val<uint32_t>(u29_producer_args_start + 0);
+            const uint32_t py = get_arg_val<uint32_t>(u29_producer_args_start + 1);
+            const uint64_t prod_sema_noc_addr =
+                get_noc_addr(px, py, static_cast<uint32_t>(SGLANG_TT_U29_SEMA_L1));
+            u29_scratch_p[0] = 0;
+            noc_async_read(prod_sema_noc_addr, u29_l1_scratch, 4);
+            noc_async_read_barrier();
+            const uint32_t observed = u29_scratch_p[0];
+            if (u29_sentinel_log_budget > 0) {
+                u29_sentinel_log_budget--;
+                DPRINT << "[U29_SENTINEL prod=(" << px << "," << py
+                       << ") sema_addr=0x" << HEX()
+                       << static_cast<uint32_t>(SGLANG_TT_U29_SEMA_L1)
+                       << " val=0x" << observed
+                       << DEC() << "]" << ENDL();
+            }
+        }
+#else
 #ifndef SGLANG_TT_U29_DISABLE_WAIT
         if (u29_num_producers > 0) {
             cb_reserve_back(cb_input_id, 1);
@@ -300,6 +344,7 @@ void kernel_main() {
             }
         }
 #endif
+#endif  // SGLANG_TT_U29_SENTINEL
     }
 #endif
 

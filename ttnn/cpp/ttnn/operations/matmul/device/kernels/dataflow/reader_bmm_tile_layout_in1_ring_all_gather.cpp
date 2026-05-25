@@ -312,10 +312,39 @@ void kernel_main() {
     {
         const uint32_t u29_my_x = my_x[noc_index];
         const uint32_t u29_my_y = my_y[noc_index];
+        // U29 Phase 3 — the L1 sema address is now provided either as a
+        // compile-time define (SGLANG_TT_U29_SEMA_L1, default 0x90000 from
+        // the matmul factory's env-driven define) OR — when the factory
+        // detects SGLANG_TT_U29_SEMA_L1_ADDR=0x<addr> in its environment
+        // — bakes the safely-allocated GlobalSemaphore address into the
+        // same define.  The kernel does not need to distinguish; both
+        // paths feed through the same SGLANG_TT_U29_SEMA_L1 token.
         uint64_t u29_self_sema_noc_addr =
             get_noc_addr(u29_my_x, u29_my_y, (uint32_t)(SGLANG_TT_U29_SEMA_L1));
+#ifdef SGLANG_TT_U29_SENTINEL
+        // U29 Phase 3 — sentinel mode.  Write a known-fixed magic value
+        // 0xDEADBEEF to the L1 sema slot instead of an atomic increment.
+        // The RS reader DPRINTs the readback to confirm whether the
+        // handshake is engaging on a safely-allocated L1 slot OR being
+        // clobbered by some other tensor placement.
+        //
+        // Write directly to local L1 via a volatile pointer (the sema
+        // slot is on THIS core, so noc-routing is unnecessary).  Pair
+        // with noc_async_write_barrier() to ensure the write commits
+        // (and is visible to remote noc-readers) before the RS reader
+        // reads it.
+        {
+            volatile tt_l1_ptr uint32_t* u29_local_sema =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                    (uint32_t)(SGLANG_TT_U29_SEMA_L1));
+            u29_local_sema[0] = 0xDEADBEEFu;
+            // Drain to L1 so remote NoC reads see the new value.
+            noc_async_write_barrier();
+        }
+#else
         noc_semaphore_inc(u29_self_sema_noc_addr, 1);
         noc_async_atomic_barrier();
+#endif
     }
 #endif
 #ifdef SGLANG_TT_U20_DATAFLOW_PROBE

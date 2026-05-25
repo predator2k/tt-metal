@@ -314,6 +314,48 @@ class MLP(LightweightModule):
             self.w3_pdg = None
             self.w2_pdg = None
 
+        # U29 Phase 3 — lazy-init slot for the W2 producer-consumer
+        # GlobalSemaphore.  The sema is created on FIRST W2 forward (in
+        # _u29_ensure_sema below) because at MLP __init__ time the
+        # prefetcher has not yet been initialised (receiver_cores is
+        # still None — it gets bound in prefetcher.init(Mode.DECODE)).
+        # Default OFF; only fires under SGLANG_TT_U29_W2_RS_SIGNALER=1.
+        self._u29_sema = None
+        self._u29_sema_addr = None
+        self._u29_sema_init_attempted = False
+
+    def _u29_ensure_sema(self):
+        """U29 Phase 3 — lazily allocate the W2 GlobalSemaphore.
+
+        Must be called from inside the forward pass, AFTER
+        prefetcher.init(Mode.DECODE) has bound receiver_cores.  Allocates
+        ONCE per MLP instance; subsequent calls are a no-op.
+        """
+        if self._u29_sema is not None or self._u29_sema_init_attempted:
+            return
+        self._u29_sema_init_attempted = True
+        if self.prefetcher is None:
+            return
+        try:
+            _u29_recv_crs = self.prefetcher.to_core_range_set(
+                self.prefetcher.receiver_cores(sender_active=True, receiver_active=True)
+            )
+            self._u29_sema = ttnn.create_global_semaphore(
+                self.mesh_device, _u29_recv_crs, 0
+            )
+            self._u29_sema_addr = int(ttnn.get_global_semaphore_address(self._u29_sema))
+            print(
+                f"[U29_PHASE3_INIT layer={self.layer_num} "
+                f"sema_addr=0x{self._u29_sema_addr:x}]",
+                flush=True,
+            )
+        except Exception as _u29_init_e:
+            print(
+                f"[U29_PHASE3_INIT ERROR layer={getattr(self, 'layer_num', '?')}: "
+                f"{type(_u29_init_e).__name__}: {_u29_init_e}]",
+                flush=True,
+            )
+
     def _u26c_prealloc_w2_out(self):
         """U26 Path C — pre-allocate the w2_out destination buffer OUTSIDE the trace.
 
@@ -695,8 +737,32 @@ class MLP(LightweightModule):
                 and not _w2_use_skip
             )
             if _u29_active:
+                # U29 Phase 3 — lazy sema init (prefetcher.receiver_cores
+                # is only bound after prefetcher.init(Mode.DECODE)).
+                self._u29_ensure_sema()
                 _u29_prev = _u29_os.environ.get("SGLANG_TT_U29_W2_PRODUCER_NOW")
                 _u29_os.environ["SGLANG_TT_U29_W2_PRODUCER_NOW"] = "1"
+                # U29 Phase 3 — export the GlobalSemaphore L1 address as
+                # an env var so the matmul factory (this W2 ttnn.linear's
+                # program creation) and the matched RS line factory (the
+                # immediately following ttnn.experimental.reduce_scatter_
+                # minimal_async program creation) bake the SAME address
+                # into their kernel binaries via SGLANG_TT_U29_SEMA_L1.
+                # Without this, both fall back to the historical Phase 2
+                # value 0x90000 (which collides with allocator-managed
+                # tensor placement and was the root cause of Phase 2's
+                # "wait passes immediately" behavior).
+                _u29_addr_prev = _u29_os.environ.get("SGLANG_TT_U29_SEMA_L1_ADDR")
+                if getattr(self, "_u29_sema_addr", None) is not None:
+                    _u29_os.environ["SGLANG_TT_U29_SEMA_L1_ADDR"] = f"0x{self._u29_sema_addr:x}"
+                # U29 Phase 3 — sentinel reset SKIPPED.  reset_global_
+                # semaphore_value is a host write op that fails inside
+                # trace capture/replay.  Not needed: producer overwrites
+                # the slot with 0xDEADBEEF (sentinel mode) or atomic_inc
+                # (counter mode) on every dispatch; the RS reader either
+                # observes the magic value (sentinel) or compares to
+                # u29_prev_seen (counter).  No host-side coordination
+                # required.
             try:
                 w2_out = ttnn.linear(
                     w2_in,
@@ -718,6 +784,12 @@ class MLP(LightweightModule):
                         _u29_os.environ.pop("SGLANG_TT_U29_W2_PRODUCER_NOW", None)
                     else:
                         _u29_os.environ["SGLANG_TT_U29_W2_PRODUCER_NOW"] = _u29_prev
+                    # U29 Phase 3 — restore the addr env var so it does
+                    # not leak into other (non-W2) program-creation calls.
+                    if _u29_addr_prev is None:
+                        _u29_os.environ.pop("SGLANG_TT_U29_SEMA_L1_ADDR", None)
+                    else:
+                        _u29_os.environ["SGLANG_TT_U29_SEMA_L1_ADDR"] = _u29_addr_prev
         # U28 — capture w2_in shard grid BEFORE deallocation.
         try:
             if (mode == Mode.DECODE and self.prefetcher is not None
@@ -1275,28 +1347,69 @@ class MLP(LightweightModule):
                     )
                     self._u28_sync_err_logged = True
 
-        w2_out_reduced = tt_all_reduce(
-            w2_out,
-            self.mesh_device,
-            self.tt_ccl,
-            cluster_axis=0,
-            dim=0 if (TG and self.dim < 8192) else 3,
-            sharded=(mode == Mode.DECODE),
-            memory_config=self.args.get_mlp_ff2_all_reduce_mem_config(mode, w2_out),
-            rs_memory_config=self.model_config["MLP_RS_CONFIG"]["rs_memory_config"]
-            if mode == Mode.DECODE
-            else ttnn.DRAM_MEMORY_CONFIG,
-            dtype=self.args.ccl_dtype,
-            use_composite=True if self.dim == 8192 else False,
-            topology=self.args.ccl_topology(),
-            chunks_per_sync=self.model_config["MLP_RS_CONFIG"]["chunks_per_sync"] if mode == Mode.DECODE else 10,
-            num_workers_per_link=self.model_config["MLP_RS_CONFIG"]["num_workers_per_link"]
-            if mode == Mode.DECODE
-            else 2,
-            subdevice_id=_u5_pref_subdev(self.prefetcher)
-            if mode == Mode.DECODE
-            else None,
+        # U29 Phase 3 — narrow the RS-side wait + sema-addr define to the
+        # W2 -> tt_all_reduce chain ONLY.  Other RS calls in this MLP
+        # (w1/w3 reduce_scatter at lines ~519/535) and other modules
+        # (attention WO -> AR) use the same line_reduce_scatter_minimal_async
+        # kernel; without narrowing, they would all bake in the wait loop
+        # and spin forever on a never-incremented producer counter (since
+        # only W2's matmul has the producer-side increment baked in via
+        # SGLANG_TT_U29_W2_PRODUCER_NOW).  The RS factory checks
+        # SGLANG_TT_U29_W2_RS_NOW at program-creation time.  The W2 RS
+        # is THE rs that needs the wait, so we wrap only this call.
+        #
+        # Also re-export SGLANG_TT_U29_SEMA_L1_ADDR here because the RS
+        # program is created OUTSIDE the W2 ttnn.linear try/finally where
+        # we set it the first time; the addr env restore in the linear
+        # finally has already cleared it.
+        import os as _u29_rs_os
+        _u29_rs_active = (
+            _u29_rs_os.environ.get("SGLANG_TT_U29_W2_RS_SIGNALER", "0") == "1"
+            and mode == Mode.DECODE
+            and self.prefetcher is not None
         )
+        if _u29_rs_active:
+            # U29 Phase 3 — lazy sema init (idempotent; W2 wrapper above
+            # already triggered the allocation but call again defensively).
+            self._u29_ensure_sema()
+            _u29_rs_prev_now = _u29_rs_os.environ.get("SGLANG_TT_U29_W2_RS_NOW")
+            _u29_rs_prev_addr = _u29_rs_os.environ.get("SGLANG_TT_U29_SEMA_L1_ADDR")
+            _u29_rs_os.environ["SGLANG_TT_U29_W2_RS_NOW"] = "1"
+            if getattr(self, "_u29_sema_addr", None) is not None:
+                _u29_rs_os.environ["SGLANG_TT_U29_SEMA_L1_ADDR"] = f"0x{self._u29_sema_addr:x}"
+        try:
+            w2_out_reduced = tt_all_reduce(
+                w2_out,
+                self.mesh_device,
+                self.tt_ccl,
+                cluster_axis=0,
+                dim=0 if (TG and self.dim < 8192) else 3,
+                sharded=(mode == Mode.DECODE),
+                memory_config=self.args.get_mlp_ff2_all_reduce_mem_config(mode, w2_out),
+                rs_memory_config=self.model_config["MLP_RS_CONFIG"]["rs_memory_config"]
+                if mode == Mode.DECODE
+                else ttnn.DRAM_MEMORY_CONFIG,
+                dtype=self.args.ccl_dtype,
+                use_composite=True if self.dim == 8192 else False,
+                topology=self.args.ccl_topology(),
+                chunks_per_sync=self.model_config["MLP_RS_CONFIG"]["chunks_per_sync"] if mode == Mode.DECODE else 10,
+                num_workers_per_link=self.model_config["MLP_RS_CONFIG"]["num_workers_per_link"]
+                if mode == Mode.DECODE
+                else 2,
+                subdevice_id=_u5_pref_subdev(self.prefetcher)
+                if mode == Mode.DECODE
+                else None,
+            )
+        finally:
+            if _u29_rs_active:
+                if _u29_rs_prev_now is None:
+                    _u29_rs_os.environ.pop("SGLANG_TT_U29_W2_RS_NOW", None)
+                else:
+                    _u29_rs_os.environ["SGLANG_TT_U29_W2_RS_NOW"] = _u29_rs_prev_now
+                if _u29_rs_prev_addr is None:
+                    _u29_rs_os.environ.pop("SGLANG_TT_U29_SEMA_L1_ADDR", None)
+                else:
+                    _u29_rs_os.environ["SGLANG_TT_U29_SEMA_L1_ADDR"] = _u29_rs_prev_addr
 
         # U26 Phase A — POST-RS buffer enumeration.  Show what was allocated
         # by tt_all_reduce / reduce_scatter_minimal_async.  Confirms whether
