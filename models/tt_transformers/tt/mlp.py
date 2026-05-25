@@ -475,32 +475,76 @@ class MLP(LightweightModule):
                 return self.w3_pdg
             return self.w3
 
-        w1_out = ttnn.linear(
-            x,
-            _w1_weight(),
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
-            core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
-            compute_kernel_config=li_ff1_3_compute_kernel_cfg,
-            program_config=_pc_w13_skip if _w1_use_skip else pc_1,
-            memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
-            global_cb=None if _w1_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
-            sub_device_id=self.prefetcher.receiver_sub_device_id
-            if self.prefetcher is not None and mode == Mode.DECODE
-            else None,
+        # U32 (2026-05-25) — per-tensor GCB byte-offset fix.
+        # The prefetcher writes tensors SEQUENTIALLY into the GlobalCB
+        # (W1 at offset 0, W3 at offset != 0, W2 at ..., WQKV at ..., WO ...).
+        # But every gathered matmul's `setup_local_cb_read_write_interfaces`
+        # resets the local CB rd_ptr to fifo_start at kernel entry — so
+        # every matmul reads from offset 0 (tensor 0's bytes), independent
+        # of which tensor it actually owns.  Under zero weights this is
+        # silently correct (x*0=0); under real weights it produces garbage.
+        # Set the env var to the per-tensor offset BEFORE the ttnn.linear
+        # call; the matmul factory bakes the value into the kernel's
+        # runtime args (and re-updates on cache hits).
+        import os as _u32_os
+        _u32_active = (
+            _u32_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
+            and mode == Mode.DECODE
+            and self.prefetcher is not None
         )
-        w3_out = ttnn.linear(
-            x,
-            _w3_weight(),
-            dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
-            core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
-            compute_kernel_config=li_ff1_3_compute_kernel_cfg,
-            program_config=_pc_w13_skip if _w3_use_skip else pc_3,
-            memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
-            global_cb=None if _w3_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
-            sub_device_id=self.prefetcher.receiver_sub_device_id
-            if self.prefetcher is not None and mode == Mode.DECODE
-            else None,
-        )
+        def _u32_set_offset_for(weight):
+            if not _u32_active or weight is None:
+                return None
+            try:
+                off = self.prefetcher.get_tensor_gcb_offset_bytes(weight)
+            except Exception:
+                off = 0
+            _prev = _u32_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
+            _u32_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = str(int(off))
+            return _prev
+        def _u32_restore_offset(prev):
+            if not _u32_active:
+                return
+            if prev is None:
+                _u32_os.environ.pop("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES", None)
+            else:
+                _u32_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = prev
+
+        _u32_w1_prev = _u32_set_offset_for(_w1_weight())
+        try:
+            w1_out = ttnn.linear(
+                x,
+                _w1_weight(),
+                dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+                core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_1 else None,
+                compute_kernel_config=li_ff1_3_compute_kernel_cfg,
+                program_config=_pc_w13_skip if _w1_use_skip else pc_1,
+                memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
+                global_cb=None if _w1_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
+                sub_device_id=self.prefetcher.receiver_sub_device_id
+                if self.prefetcher is not None and mode == Mode.DECODE
+                else None,
+            )
+        finally:
+            _u32_restore_offset(_u32_w1_prev)
+
+        _u32_w3_prev = _u32_set_offset_for(_w3_weight())
+        try:
+            w3_out = ttnn.linear(
+                x,
+                _w3_weight(),
+                dtype=ttnn.bfloat8_b if TG else activation_dtype or ttnn.bfloat16,
+                core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_3 else None,
+                compute_kernel_config=li_ff1_3_compute_kernel_cfg,
+                program_config=_pc_w13_skip if _w3_use_skip else pc_3,
+                memory_config=self.args.get_mlp_ff1_3_mem_config(mode, self.prefetcher),
+                global_cb=None if _w3_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
+                sub_device_id=self.prefetcher.receiver_sub_device_id
+                if self.prefetcher is not None and mode == Mode.DECODE
+                else None,
+            )
+        finally:
+            _u32_restore_offset(_u32_w3_prev)
         ttnn.deallocate(x)
 
         if TG:
@@ -763,6 +807,8 @@ class MLP(LightweightModule):
                 # observes the magic value (sentinel) or compares to
                 # u29_prev_seen (counter).  No host-side coordination
                 # required.
+            # U32 — set per-tensor offset for W2 before ttnn.linear.
+            _u32_w2_prev = _u32_set_offset_for(_w2_weight())
             try:
                 w2_out = ttnn.linear(
                     w2_in,
@@ -779,6 +825,7 @@ class MLP(LightweightModule):
                     optional_output_tensor=_u26c_out_t,
                 )
             finally:
+                _u32_restore_offset(_u32_w2_prev)
                 if _u29_active:
                     if _u29_prev is None:
                         _u29_os.environ.pop("SGLANG_TT_U29_W2_PRODUCER_NOW", None)

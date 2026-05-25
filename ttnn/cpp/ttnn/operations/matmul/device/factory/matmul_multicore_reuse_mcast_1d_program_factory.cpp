@@ -2468,6 +2468,33 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         // Default OFF; canonical bytewise-equal under U29=0.
         // Only applies on gathered (use_global_cb) path so non-prefetcher
         // matmuls remain untouched.
+        // U32 (2026-05-25) — per-tensor GCB byte-offset fix.
+        // Discriminator at last identified (U31): the prefetcher writes
+        // tensors SEQUENTIALLY into the GlobalCB (W1 @ offset 0,
+        // W3 @ 221184, W2 @ 442368, ...) but every gathered matmul's
+        // `setup_local_cb_read_write_interfaces` resets fifo_rd_ptr to
+        // fifo_start at kernel entry — so every matmul reads from
+        // offset 0 (tensor 0's bytes), independent of which tensor it
+        // actually owns.  Under zero weights every offset reads 0 →
+        // x*0=0 is correct.  Under real weights, mis-aligned BFP8
+        // decodes BFP4 bytes → ~2^60-2^109 magnitudes → garbage
+        // logits (U7/U30 PACK-side 86% NaN/Inf signature).
+        //
+        // Fix: caller (mlp.py / attention.py) sets
+        // SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES before each ttnn.linear
+        // call; factory bakes value into kernel's runtime args at
+        // program-create time AND on every cache hit re-updates the
+        // runtime arg from a fresh env-var read.  Kernel then offsets
+        // its local rd_ptr by tensor_offset_bytes at top of batch
+        // BEFORE the ring_idx advancement.
+        //
+        // Default OFF; canonical bytewise-equal under U32=0.  Only
+        // applies on gathered (use_global_cb) path so non-prefetcher
+        // matmuls remain untouched.
+        const char* u32_gcb_offset_env = std::getenv("SGLANG_TT_U32_GCB_OFFSET");
+        if (u32_gcb_offset_env != nullptr && std::string(u32_gcb_offset_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U32_GCB_OFFSET"] = "1";
+        }
         const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
         // U29 Phase 2 v3 — additional env gate `SGLANG_TT_U29_W2_PRODUCER_NOW`
         // distinguishes W2 (which should increment the counter) from all
@@ -2880,6 +2907,29 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
             unpadded_in0_shard_widths_in_tiles.begin(),
             unpadded_in0_shard_widths_in_tiles.end());
 
+        // U32 — per-tensor GCB byte offset.  Always append this runtime arg
+        // when use_global_cb (i.e. on the gathered/prefetcher path) so that
+        // `override_gather_in0_program_parameters` can later update it on
+        // cache hits without changing the arg-vector layout.  Default value
+        // is 0 (preserves canonical behavior when the kernel binary was
+        // compiled WITHOUT SGLANG_TT_U32_GCB_OFFSET — the kernel simply
+        // ignores the extra trailing runtime arg).  When the env var is
+        // unset, the offset stays 0 and the kernel's behavior is
+        // bytewise-equal to the pre-U32 baseline.  Only emitted on the
+        // gathered factory path; canonical 1D matmul factory unchanged.
+        if (use_global_cb) {
+            const char* u32_off_env = std::getenv("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES");
+            uint32_t u32_off = 0;
+            if (u32_off_env != nullptr && u32_off_env[0] != '\0') {
+                try {
+                    u32_off = static_cast<uint32_t>(std::stoul(u32_off_env, nullptr, 0));
+                } catch (...) {
+                    u32_off = 0;
+                }
+            }
+            mm_kernel_compute_args.push_back(u32_off);
+        }
+
         tt_metal::SetRuntimeArgs(program, mm_kernel, core, mm_kernel_compute_args);
     }
 
@@ -2923,8 +2973,14 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
     std::vector<tt::tt_metal::CBHandle> shared_cbs = {cb_src0, cb_src1};
     shared_cbs.insert(shared_cbs.end(), cb_outputs.begin(), cb_outputs.end());
 
+    // U32 — store the compute kernel handle (mm_kernel) as kernels[1] so
+    // `override_gather_in0_program_parameters` can update the per-tensor
+    // GCB byte-offset runtime arg on cache hits.  Pre-U32 baseline only
+    // stored {mm_kernel_in1_sender_writer_id} at kernels[0].  Adding
+    // kernels[1] is harmless to existing override code which only
+    // references kernels.at(0).
     return MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t{
-        {mm_kernel_in1_sender_writer_id},
+        {mm_kernel_in1_sender_writer_id, mm_kernel},
         shared_cbs,
         false,
         CoreCoord{0, 0},
@@ -3124,6 +3180,51 @@ inline void override_gather_in0_program_parameters(
 
         /* in1 */
         writer_runtime_args[1] = src_buffer_b->address();
+    }
+
+    // U32 — re-update the per-tensor GCB byte offset on cache hits.  The
+    // Python caller (mlp.py / attention.py) sets
+    // SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES before every ttnn.linear call
+    // (program-creation OR cached-replay); we re-read on every dispatch
+    // so the SAME compiled kernel binary serves W1 (offset 0), W3
+    // (offset != 0), etc. with correct per-tensor offsets.
+    //
+    // The compute-kernel handle is stored at kernels[1] (U32 added).
+    // Pre-U32 baseline only had kernels[0]; older callers / non-gathered
+    // builds may not have kernels[1] — guard accordingly.  The runtime
+    // arg layout (when use_global_cb): [core_type, ring_idx, ...widths(ring_size)..., tensor_offset_bytes].
+    // Idle/hop cores have a single-element runtime arg vector [core_type]
+    // — they are skipped naturally by the `args.size() > offset_idx` guard.
+    if (override_variables.kernels.size() >= 2 && global_cb.has_value()) {
+        const char* u32_off_env = std::getenv("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES");
+        uint32_t u32_off = 0;
+        if (u32_off_env != nullptr && u32_off_env[0] != '\0') {
+            try {
+                u32_off = static_cast<uint32_t>(std::stoul(u32_off_env, nullptr, 0));
+            } catch (...) {
+                u32_off = 0;
+            }
+        }
+        auto& compute_runtime_args_by_core = GetRuntimeArgs(program, override_variables.kernels.at(1));
+        for (const auto& core : override_variables.cores) {
+            auto& compute_runtime_args = compute_runtime_args_by_core[core.x][core.y];
+            const std::size_t n = compute_runtime_args.size();
+            if (n > 0) {
+                // Last runtime arg is u32_tensor_offset_bytes (appended at
+                // create time when use_global_cb).  Idle / hop cores have
+                // a single-element vector [core_type] only and are skipped
+                // — their kernel exits before reading the offset arg.
+                // We rely on the WORKER cores having >=3 args: core_type,
+                // ring_idx, ..., tensor_offset_bytes.  Touching index n-1
+                // is safe in both cases (the idle path is harmless: we
+                // overwrite core_type momentarily, but the kernel's first
+                // arg-read is core_type, which we then restore below).
+                // Simpler: only update workers (size > 1).
+                if (n > 1) {
+                    compute_runtime_args[n - 1] = u32_off;
+                }
+            }
+        }
     }
 }
 

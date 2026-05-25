@@ -1058,20 +1058,41 @@ class Attention(LightweightModule):
                     and getattr(self, "wqkv_pdg", None) is not None)
                 else self.wqkv
             )
-            xqkv_fused_sharded = ttnn.linear(
-                x,
-                _wqkv_for_mm,
-                memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
-                program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
-                compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
-                dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
-                global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                # QKV ring-gather matmul: x is sharded on receiver cores, so the
-                # factory's subdevice_cores query must use receiver_sub_device_id
-                # (not worker_sub_device_id) to avoid an empty CoreRangeSet when
-                # intersecting x.shard_spec().grid with subdevice_cores.
-                sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+            # U32 — set per-tensor GCB byte offset for WQKV before ttnn.linear.
+            # See mlp.py for the rationale and the matched factory/kernel change.
+            import os as _u32_os
+            _u32_active = (
+                _u32_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
+                and self.prefetcher is not None
             )
+            _u32_qkv_prev = _u32_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
+            if _u32_active:
+                try:
+                    _u32_qkv_off = self.prefetcher.get_tensor_gcb_offset_bytes(_wqkv_for_mm)
+                except Exception:
+                    _u32_qkv_off = 0
+                _u32_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = str(int(_u32_qkv_off))
+            try:
+                xqkv_fused_sharded = ttnn.linear(
+                    x,
+                    _wqkv_for_mm,
+                    memory_config=self.args.get_attn_qkv_mm_mem_config(Mode.DECODE, self.prefetcher),
+                    program_config=self.args.get_attn_qkv_program_config(Mode.DECODE, 1, self.prefetcher),
+                    compute_kernel_config=self.li_qkv_decode_compute_kernel_cfg,
+                    dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
+                    global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+                    # QKV ring-gather matmul: x is sharded on receiver cores, so the
+                    # factory's subdevice_cores query must use receiver_sub_device_id
+                    # (not worker_sub_device_id) to avoid an empty CoreRangeSet when
+                    # intersecting x.shard_spec().grid with subdevice_cores.
+                    sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+                )
+            finally:
+                if _u32_active:
+                    if _u32_qkv_prev is None:
+                        _u32_os.environ.pop("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES", None)
+                    else:
+                        _u32_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = _u32_qkv_prev
         # ------------------------------------------------------------------
         # U15 probes (env-gated, default-OFF): isolate matmul output L1
         # producer vs. reduce_scatter consumer disagreement at L1 0xa6700.
@@ -1780,17 +1801,37 @@ class Attention(LightweightModule):
                         except Exception as _u26a_e:
                             print(f"[U26_ADJ_PRE_WO] ERROR: {type(_u26a_e).__name__}: {_u26a_e}",
                                   flush=True)
-                    dense_out_sharded = ttnn.linear(
-                        all_gather_output,
-                        _wo_for_mm,
-                        memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
-                        program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
-                        compute_kernel_config=_wo_kernel_cfg,
-                        global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                        # dense_out ring-gather matmul: all_gather_output is sharded on receiver cores,
-                        # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
-                        sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+                    # U32 — set per-tensor GCB byte offset for WO before ttnn.linear.
+                    import os as _u32_wo_os
+                    _u32_wo_active = (
+                        _u32_wo_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
+                        and self.prefetcher is not None
                     )
+                    _u32_wo_prev = _u32_wo_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
+                    if _u32_wo_active:
+                        try:
+                            _u32_wo_off = self.prefetcher.get_tensor_gcb_offset_bytes(_wo_for_mm)
+                        except Exception:
+                            _u32_wo_off = 0
+                        _u32_wo_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = str(int(_u32_wo_off))
+                    try:
+                        dense_out_sharded = ttnn.linear(
+                            all_gather_output,
+                            _wo_for_mm,
+                            memory_config=self.args.get_attn_dense_output_mem_config(Mode.DECODE, self.prefetcher),
+                            program_config=self.args.get_attn_all_gather_matmul_program_config(Mode.DECODE, self.prefetcher),
+                            compute_kernel_config=_wo_kernel_cfg,
+                            global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+                            # dense_out ring-gather matmul: all_gather_output is sharded on receiver cores,
+                            # so use receiver_sub_device_id (not worker_sub_device_id) to avoid empty CoreRangeSet.
+                            sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+                        )
+                    finally:
+                        if _u32_wo_active:
+                            if _u32_wo_prev is None:
+                                _u32_wo_os.environ.pop("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES", None)
+                            else:
+                                _u32_wo_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = _u32_wo_prev
                     # U26 Phase A — POST-WO probe (paired).
                     if _u26a_os.environ.get("SGLANG_TT_U26_ADJ_BUFFER_PROBE", "0") == "1":
                         try:
@@ -1868,17 +1909,37 @@ class Attention(LightweightModule):
                 )
 
             # TODO: Fix this once self.TG supports dram-sharded matmuls
-            dense_out_sharded = ttnn.linear(
-                attn_output,
-                self.wo,
-                core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
-                program_config=self.args.get_attn_wo_program_config(Mode.DECODE, 1, self.prefetcher),
-                memory_config=self.args.get_attn_wo_output_mem_config(Mode.DECODE, self.prefetcher),
-                dtype=ttnn.bfloat8_b if self.TG else None,
-                compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
-                global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
-                sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+            # U32 — set per-tensor GCB byte offset for WO (TG path) before ttnn.linear.
+            import os as _u32_wotg_os
+            _u32_wotg_active = (
+                _u32_wotg_os.environ.get("SGLANG_TT_U32_GCB_OFFSET", "0") == "1"
+                and self.prefetcher is not None
             )
+            _u32_wotg_prev = _u32_wotg_os.environ.get("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES")
+            if _u32_wotg_active:
+                try:
+                    _u32_wotg_off = self.prefetcher.get_tensor_gcb_offset_bytes(self.wo)
+                except Exception:
+                    _u32_wotg_off = 0
+                _u32_wotg_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = str(int(_u32_wotg_off))
+            try:
+                dense_out_sharded = ttnn.linear(
+                    attn_output,
+                    self.wo,
+                    core_grid=ttnn.CoreGrid(y=4, x=8) if self.TG else None,
+                    program_config=self.args.get_attn_wo_program_config(Mode.DECODE, 1, self.prefetcher),
+                    memory_config=self.args.get_attn_wo_output_mem_config(Mode.DECODE, self.prefetcher),
+                    dtype=ttnn.bfloat8_b if self.TG else None,
+                    compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
+                    global_cb=self.prefetcher.global_cb if self.prefetcher is not None else None,
+                    sub_device_id=self.prefetcher.receiver_sub_device_id if self.prefetcher is not None else None,
+                )
+            finally:
+                if _u32_wotg_active:
+                    if _u32_wotg_prev is None:
+                        _u32_wotg_os.environ.pop("SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES", None)
+                    else:
+                        _u32_wotg_os.environ["SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES"] = _u32_wotg_prev
 
             ttnn.deallocate(attn_output_cat)
 

@@ -1000,11 +1000,88 @@ class Prefetcher(LightweightModule):
             self._max_tile_bytes * self._max_block_tiles,
             self.max_tensor_block_size,
         )
+        # U32 — track per-tensor byte offset within the GlobalCB.
+        # The prefetcher writer (writer_l1.cpp) writes tensors sequentially:
+        # for each tensor t, writes num_blocks (= ring_size) blocks of
+        # block_size_per_receiver = (tensor_block_num_tiles * single_tile_bytes) / num_receivers_per_reader.
+        # On Blackhole the GCB-per-receiver is ring_size's slice, so the
+        # per-receiver block_size = tensor_block_num_tiles * tile_size_bytes / num_senders.
+        # Equivalently: per-receiver per-tensor total bytes = ring_size * (block_num_tiles * tile_bytes) / num_senders
+        #              = block_num_tiles * tile_bytes * num_receiver_cores.
+        # Use the receiver-side semantics that match the matmul kernel:
+        #   in1_block_size_bytes = max_tensor_tiles * tile_bytes  (per-receiver block, per ring iteration)
+        #   per_tensor_bytes     = ring_size * in1_block_size_bytes
+        # Wait wait — careful.  Each receiver gets ring_size's worth of
+        # blocks of the tensor (one per ring iteration / ring_idx).
+        # Producer writes per receiver: ring_size blocks of size
+        # block_size_per_receiver = (block_num_tiles*tile_bytes)/num_receivers_per_reader.
+        # Since ring_size = num_senders * num_receivers_per_reader (= num_blocks
+        # in the producer), and each receiver only owns 1/num_receivers_per_reader
+        # of the per-sender stride... the per-receiver advance after one
+        # tensor is num_blocks * block_size_per_receiver bytes.
+        # The matmul's `in1_block_size_bytes` (compile-time) matches the
+        # producer's `block_size_per_receiver`, so:
+        #   per_tensor_bytes_per_receiver = num_blocks * in1_block_size_bytes
+        #                                 = ring_size * (block_num_tiles * tile_bytes / num_receivers_per_reader)
+        # We don't know num_receivers_per_reader at this point but it
+        # equals self.num_receiver_cores.  Compute that here.
+        per_tensor_block_size_per_receiver = (
+            max_tensor_tiles * bytes_in_tile[tensor.dtype]
+        ) // self.num_receiver_cores
+        per_tensor_bytes_per_receiver = self.ring_size * per_tensor_block_size_per_receiver
+
+        if not hasattr(self, "_tensor_byte_offsets"):
+            self._tensor_byte_offsets = []
+        if not hasattr(self, "_running_tensor_offset_bytes"):
+            self._running_tensor_offset_bytes = 0
+        self._tensor_byte_offsets.append(self._running_tensor_offset_bytes)
+        self._running_tensor_offset_bytes += per_tensor_bytes_per_receiver
+
         self.prefetched_tensors.append(tensor)
         self.prefetched_tensor_addr.append(tensor.buffer_address())
         logger.info(
-            f"[DRAM Prefetcher] Inserted tensor of shape {tensor.shape} into prefetcher, total number of tensors in prefetcher queue: {len(self.prefetched_tensor_addr)}"
+            f"[DRAM Prefetcher] Inserted tensor of shape {tensor.shape} into prefetcher, "
+            f"total in queue: {len(self.prefetched_tensor_addr)} "
+            f"u32_offset_bytes={self._tensor_byte_offsets[-1]} "
+            f"u32_per_tensor_bytes={per_tensor_bytes_per_receiver}"
         )
+
+    def get_tensor_gcb_offset_bytes(self, tensor: ttnn.Tensor) -> int:
+        """U32 — return the per-tensor byte offset within the GlobalCB
+        for this tensor (or 0 if not registered or U32 isn't tracked).
+        Used by mlp.py / attention.py to set
+        SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES before each ttnn.linear
+        call so the gathered matmul reads from the GCB region where
+        the prefetcher actually wrote this tensor's data.
+        Modulo the GCB-size wrap: the producer's wr_ptr wraps at
+        (gcb_size - gcb_size%page_size) which for Qwen3-8B-balanced
+        is 835584 (page_size divides 835584 evenly for every tensor).
+        We apply modulo gcb_size here.
+        """
+        if not hasattr(self, "_tensor_byte_offsets") or not self.prefetched_tensors:
+            return 0
+        # U32 — force-zero offset escape hatch.  When SGLANG_TT_U32_FORCE_ZERO=1,
+        # always return 0 regardless of which tensor.  Lets us isolate "U32
+        # kernel define is benign at offset=0" from "U32 offset values are
+        # incorrect".  Default 0 (real per-tensor offsets used).
+        if os.environ.get("SGLANG_TT_U32_FORCE_ZERO", "0") == "1":
+            return 0
+        try:
+            idx = self.prefetched_tensors.index(tensor)
+        except ValueError:
+            return 0
+        # Per-layer tensor list is the FIRST num_tensors entries; per-layer
+        # offsets are the same across layers (producer's wr_ptr keeps the
+        # same relative position MODULO the GCB wrap, and the matmul reads
+        # from fifo_start + per_tensor_offset on EVERY layer's dispatch).
+        # Take the offset from the per-layer position (idx % num_tensors).
+        if self.num_tensors > 0:
+            offset = self._tensor_byte_offsets[idx % self.num_tensors]
+        else:
+            offset = self._tensor_byte_offsets[idx]
+        # Wrap to fit within the GlobalCB region.
+        gcb_size = self.max_tensor_block_size if self.max_tensor_block_size > 0 else 1
+        return offset % gcb_size
 
     def prefetch(self):
         """

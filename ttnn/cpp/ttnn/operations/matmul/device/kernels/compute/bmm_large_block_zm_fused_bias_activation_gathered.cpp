@@ -253,6 +253,26 @@ void kernel_main() {
     const uint32_t* unpadded_in0_shard_widths_in_tiles = (uint32_t*)get_arg_addr(rt_args_idx);
     rt_args_idx += ring_size;
 
+#ifdef SGLANG_TT_U32_GCB_OFFSET
+    // U32 — per-tensor GCB byte offset.  The prefetcher writes tensors
+    // SEQUENTIALLY into the GlobalCB starting at fifo_start (tensor 0 at
+    // offset 0, tensor 1 at offset = num_blocks * block_size_per_receiver[0],
+    // ...).  But every matmul kernel's `setup_local_cb_read_write_interfaces`
+    // resets the local CB rd_ptr to `fifo_start` at kernel entry — so without
+    // this offset, every matmul reads from offset 0 (tensor 0's bytes),
+    // regardless of which tensor it actually owns.  Under zero weights every
+    // offset reads 0 → x*0=0 is correct.  Under real weights, mis-aligned
+    // reads decode other tensors' BFP4/BFP8 bytes as huge magnitudes
+    // (U7's 2^60-2^109 signature; U30 PACK-side 86% NaN/Inf).
+    //
+    // The byte offset is set by the Python caller (mlp.py / attention.py)
+    // via env var SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES at ttnn.linear
+    // program-create time; the factory bakes the value into this kernel's
+    // runtime args and updates it on every cache hit via
+    // override_gather_in0_program_parameters.
+    uint32_t u32_tensor_offset_bytes = get_arg_val<uint32_t>(rt_args_idx++);
+#endif
+
     constexpr uint32_t out_block_w = out_subblock_w * in1_num_subblocks;
 
 #ifdef SFPU_ACTIVATION
@@ -302,6 +322,19 @@ void kernel_main() {
         // the kernel still runs; the key signal is whether the garbage
         // signature changes class.
         UNPACK((in1_cb_start_addr = get_local_cb_start_addr(in1_cb_id)));
+    #ifdef SGLANG_TT_U32_GCB_OFFSET
+        // U32 — instead of letting in1_rd_ptr_start_addr be wherever
+        // setup_local_cb_read_write_interfaces last reset it (= fifo_start),
+        // set it to fifo_start + tensor_offset_bytes so that THIS matmul
+        // reads from the GCB region where the prefetcher actually wrote
+        // this tensor's data.  The fifo_rd_ptr is stored in SHIFTED L1
+        // units (1 unit = L1_ALIGNMENT bytes); add the offset in the
+        // same shifted units.  ring_idx advancement (below) then steps
+        // by ring_idx * block_size_bytes / L1_ALIGNMENT from this base.
+        UNPACK((update_local_cb_rd_ptr(
+            in1_cb_id,
+            in1_cb_start_addr + u32_tensor_offset_bytes / L1_ALIGNMENT)));
+    #endif
         UNPACK((in1_rd_ptr_start_addr = get_local_cb_rd_ptr(in1_cb_id)));
         UNPACK((curr_in1_block_index = ring_idx));
         UNPACK((in1_tensor_split = is_tensor_split(in1_cb_id, in1_tensor_size_bytes)));
