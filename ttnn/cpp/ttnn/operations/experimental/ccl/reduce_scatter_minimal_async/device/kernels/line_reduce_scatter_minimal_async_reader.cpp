@@ -205,6 +205,104 @@ void kernel_main() {
         matmul_receiver = ReduceScatterOpReceiver(arg_idx);
     }
 
+#ifdef SGLANG_TT_U29_W2_RS_SIGNALER
+    // U29 Phase 2 — consumer-side signal WAIT (relative-counter model).
+    // Pair to the W2 in1_ring_all_gather producer-side
+    // `noc_semaphore_inc` increment.  See
+    // matmul_multicore_reuse_mcast_1d_program_factory.cpp (factory)
+    // and reader_bmm_tile_layout_in1_ring_all_gather.cpp (producer
+    // kernel).
+    //
+    // Cross-sub-device dispatch race (U28-β CONFIRMED): without an
+    // in-kernel handshake, RS reader's noc_async_read of W2's
+    // mm_out_cb L1 region can fire BEFORE W2's PACK has retired,
+    // observing residual data at 0xa6700.
+    //
+    // Runtime args appended by the program factory AFTER any sharding
+    // and fused-op args:
+    //   [arg_idx]   num_producers (uint32, e.g. 32 for Qwen3-8B W2)
+    //   [arg_idx+1] producer0_noc_x
+    //   [arg_idx+2] producer0_noc_y
+    //   ...         (interleaved x, y per producer)
+    //
+    // Per-replay synchronization model (RELATIVE):
+    //   * ALL gathered matmuls on the prefetcher path increment the
+    //     same producer-core L1 slot 0x90000 by 1 per dispatch.  Thus
+    //     the absolute counter value drifts with the number of
+    //     gathered matmuls per layer (W2, WO, FF1, FF2, FF3, WQKV ~ 6
+    //     per layer), not 1:1 with RS-reader calls.
+    //   * BUT, the trace-replay schedule is deterministic: each W2 is
+    //     always dispatched immediately before its paired RS in the
+    //     same layer.  So between RS_{K-1} and RS_K, AT LEAST ONE
+    //     producer-side increment fires — specifically, W2 of layer K.
+    //   * Therefore: track in per-RS-worker local L1 (`u29_prev_seen`)
+    //     the producer-counter value observed at the END of the prior
+    //     RS wait.  On entry, spin until producer's counter strictly
+    //     EXCEEDS `u29_prev_seen` on every producer core; then update
+    //     `u29_prev_seen` to the *minimum* observed value (conservative
+    //     lower bound for next iteration).
+    //
+    // This is robust to all gathered matmuls sharing the same 0x90000
+    // slot, and converges on the W2→RS race specifically because W2 is
+    // the LAST gathered matmul to fire on the receiver cores before
+    // the line RS dispatches on the worker cores.
+    const uint32_t u29_num_producers = get_arg_val<uint32_t>(arg_idx++);
+    uint32_t u29_producer_args_start = arg_idx;
+    arg_idx += u29_num_producers * 2;  // skip past x,y pairs for tail args (none today)
+
+    {
+        static uint32_t u29_prev_seen = 0;
+
+#ifndef SGLANG_TT_U29_DISABLE_WAIT
+        if (u29_num_producers > 0) {
+            cb_reserve_back(cb_input_id, 1);
+            uint32_t u29_l1_scratch = get_write_ptr(cb_input_id);
+            volatile tt_l1_ptr uint32_t* u29_scratch_p =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(u29_l1_scratch);
+
+            uint32_t u29_min_observed = 0xFFFFFFFFu;
+            for (uint32_t i = 0; i < u29_num_producers; i++) {
+                const uint32_t px = get_arg_val<uint32_t>(u29_producer_args_start + 2 * i);
+                const uint32_t py = get_arg_val<uint32_t>(u29_producer_args_start + 2 * i + 1);
+                const uint64_t prod_sema_noc_addr =
+                    get_noc_addr(px, py, static_cast<uint32_t>(SGLANG_TT_U29_SEMA_L1));
+                uint32_t cur_val = 0;
+                // Spin until producer counter has advanced past
+                // u29_prev_seen.  This guarantees the W2 PACK for THIS
+                // layer's RS has retired (last gathered matmul before
+                // this RS in deterministic trace order).
+                do {
+                    u29_scratch_p[0] = 0;
+                    noc_async_read(prod_sema_noc_addr, u29_l1_scratch, 4);
+                    noc_async_read_barrier();
+                    cur_val = u29_scratch_p[0];
+                } while (cur_val <= u29_prev_seen);
+                if (cur_val < u29_min_observed) {
+                    u29_min_observed = cur_val;
+                }
+            }
+            // Conservative: bump prev_seen to the lowest observed value.
+            // Any future wait must see counter > this min.
+            u29_prev_seen = u29_min_observed;
+        }
+#endif  // SGLANG_TT_U29_DISABLE_WAIT
+
+#ifdef SGLANG_TT_U29_DEBUG_DPRINT
+        {
+            static uint32_t u29_log_budget = 32;
+            if (u29_log_budget > 0) {
+                u29_log_budget--;
+                DPRINT << "[U29_RS_READER_OK prev_seen=" << u29_prev_seen
+                       << " num_producers=" << u29_num_producers
+                       << " sema_addr=0x" << HEX()
+                       << static_cast<uint32_t>(SGLANG_TT_U29_SEMA_L1)
+                       << DEC() << "]" << ENDL();
+            }
+        }
+#endif
+    }
+#endif
+
     /**
      * Intermediate buffer is double-sized (shape [2, *input_shape]) to accommodate forward and backward.
      * BWD indexes into second half of intermediate buffer.
@@ -214,38 +312,6 @@ void kernel_main() {
     uint32_t chunk_count = 0;
     uint32_t fwd_sync_cnt = 0;
     uint32_t sem_target = 0;
-
-#ifdef SGLANG_TT_U29_W2_RS_SIGNALER
-    // U29 — consumer-side signal wait.  Pair to the W2 in1_ring_all_gather
-    // producer-side `noc_semaphore_inc` increment.  See
-    // matmul_multicore_reuse_mcast_1d_program_factory.cpp (factory) and
-    // reader_bmm_tile_layout_in1_ring_all_gather.cpp (producer kernel).
-    //
-    // Cross-sub-device dispatch race (U28-β CONFIRMED): without an
-    // in-kernel handshake, RS reader's noc_async_read of W2's mm_out_cb
-    // L1 region can fire BEFORE W2's PACK has retired, observing
-    // residual data at 0xa6700.
-    //
-    // PHASE 1 (current commit): scaffold only — logs U29 enablement
-    // signature once per kernel invocation via DPRINT.  No actual wait;
-    // we land the env-gate + define-propagation + producer increment
-    // first, then verify the increment fires under trace via the U29
-    // counter readback.
-    //
-    // PHASE 2: read producer L1 U29_SEMA_L1 across the producer-cores
-    // noc-coord list (passed as a new runtime arg via factory) and
-    // wait until each is >= expected counter (passed as runtime arg,
-    // bumped per forward via override_runtime_args).
-    {
-        static uint32_t u29_log_budget = 64;
-        if (u29_log_budget > 0) {
-            u29_log_budget--;
-            DPRINT << "[U29_RS_READER_ENTRY signaler_addr=0x" << HEX()
-                   << (uint32_t)(SGLANG_TT_U29_SEMA_L1) << DEC()
-                   << " scaffold_only]" << ENDL();
-        }
-    }
-#endif
 
 #ifdef SGLANG_TT_U17_PROBE_RS_PRE
     // U17 Phase-0 — PRE-RS probe.  Read producer's first tile L1 bytes

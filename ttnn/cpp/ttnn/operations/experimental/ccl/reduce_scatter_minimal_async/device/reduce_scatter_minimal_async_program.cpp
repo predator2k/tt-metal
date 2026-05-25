@@ -1305,14 +1305,59 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
     //
     // Default OFF; canonical bytewise-equal under U29=0.
     //
-    // Phase 1 (this commit) lands the scaffold only — the kernel-side
-    // wait loop is wired in line_reduce_scatter_minimal_async_reader.cpp
-    // under the same define.  Phase 2 wires the per-producer-core
-    // noc_addr list as a runtime arg.
+    // Phase 2 (this commit) wires the actual per-producer-core NoC
+    // coord list as runtime args.  Each RS reader instance receives
+    // num_producers + 2 × num_producers (x, y) pairs, then waits in
+    // kernel for *(producer L1 @ 0x90000) >= local-static expected
+    // (bumped by 1 each kernel invocation).  Both kernels see the
+    // same U29_SEMA_L1 via matched compile-time defines.
     const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
-    if (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") {
+    const bool u29_enabled = (u29_sig_env != nullptr && std::string(u29_sig_env) == "1");
+    if (u29_enabled) {
         reader_compute_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
         reader_compute_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
+        // U29 Phase 2 debug DPRINT propagation (env-gated; default OFF).
+        const char* u29_dbg_env = std::getenv("SGLANG_TT_U29_DEBUG_DPRINT");
+        if (u29_dbg_env != nullptr && std::string(u29_dbg_env) == "1") {
+            reader_compute_defines["SGLANG_TT_U29_DEBUG_DPRINT"] = "1";
+        }
+        // U29 Phase 2 disable-wait propagation (env-gated; default OFF).
+        // When set, kernel reads U29 RT args but DOES NOT spin — used as
+        // a control to attribute latency to the wait loop vs. the args.
+        const char* u29_dw_env = std::getenv("SGLANG_TT_U29_DISABLE_WAIT");
+        if (u29_dw_env != nullptr && std::string(u29_dw_env) == "1") {
+            reader_compute_defines["SGLANG_TT_U29_DISABLE_WAIT"] = "1";
+        }
+    }
+
+    // U29 Phase 2 — derive producer-core NoC coords from input tensor's
+    // shard grid.  Per U28 step 1.E, the input tensor's (w2_out's)
+    // shard grid == W2 matmul receiver-core grid (32 cores for Qwen3-8B
+    // BH P150a).  Convert each logical core to a worker-NoC coord via
+    // mesh_device->worker_core_from_logical_core(c).  Each RS reader
+    // instance reads num_producers, then 2 × num_producers uint32
+    // (x, y interleaved).  The kernel waits in a tight spin loop until
+    // *(producer L1 @ U29_SEMA_L1) >= expected.
+    std::vector<uint32_t> u29_producer_noc_coords;  // flat: [x0,y0, x1,y1, ...]
+    if (u29_enabled) {
+        if (input_is_sharded && input_tensor.memory_config().shard_spec().has_value()) {
+            const auto producer_grid = input_tensor.memory_config().shard_spec()->grid;
+            const auto producer_logical_cores = tt::tt_metal::corerange_to_cores(
+                producer_grid, std::nullopt, /*row_wise=*/true);
+            u29_producer_noc_coords.reserve(producer_logical_cores.size() * 2);
+            for (const auto& lc : producer_logical_cores) {
+                const auto nc = mesh_device->worker_core_from_logical_core(lc);
+                u29_producer_noc_coords.push_back(static_cast<uint32_t>(nc.x));
+                u29_producer_noc_coords.push_back(static_cast<uint32_t>(nc.y));
+            }
+        }
+        // Sanity: emit a single compile-time log so the build is auditable.
+        // (Suppressed if log_trace not desired.)
+        log_trace(
+            tt::LogOp,
+            "U29 Phase 2: {} producer NoC coords prepared for RS reader (input_is_sharded={})",
+            u29_producer_noc_coords.size() / 2,
+            input_is_sharded);
     }
 
     // KERNEL CREATION
@@ -1619,6 +1664,19 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
                 }
                 if (fuse_op) {
                     fused_op_signaler->push_reduce_scatter_fused_op_rt_args(reader_rt_args);
+                }
+                // U29 Phase 2 — append per-producer-core NoC coord list:
+                //   [num_producers, x0, y0, x1, y1, ..., xN-1, yN-1]
+                // Kernel reads num_producers first, then 2*num_producers
+                // uint32 values.  See the build-side U29 block above.
+                if (u29_enabled) {
+                    const uint32_t num_producers =
+                        static_cast<uint32_t>(u29_producer_noc_coords.size() / 2);
+                    reader_rt_args.push_back(num_producers);
+                    reader_rt_args.insert(
+                        reader_rt_args.end(),
+                        u29_producer_noc_coords.begin(),
+                        u29_producer_noc_coords.end());
                 }
                 tt::tt_metal::SetRuntimeArgs(program, reader_kernel_id, {core}, reader_rt_args);
 

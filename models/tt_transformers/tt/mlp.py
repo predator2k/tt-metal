@@ -670,20 +670,54 @@ class MLP(LightweightModule):
                 and _u26c_os.environ.get("SGLANG_TT_U26_PREALLOC_W2", "0") == "1"
             )
             _u26c_out_t = self._u26c_prealloc_w2_out() if _u26c_active else None
-            w2_out = ttnn.linear(
-                w2_in,
-                _w2_weight(),
-                compute_kernel_config=li_ff2_compute_kernel_cfg,
-                dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
-                program_config=_pc_w2_skip if _w2_use_skip else pc_2,
-                memory_config=self.args.get_mlp_ff2_mem_config(mode, self.prefetcher),
-                core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
-                global_cb=None if _w2_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
-                sub_device_id=self.prefetcher.receiver_sub_device_id
-                if self.prefetcher is not None and mode == Mode.DECODE
-                else None,
-                optional_output_tensor=_u26c_out_t,
+            # U29 Phase 2 v3 — narrow the U29 producer-side counter
+            # increment to W2 only.  All gathered matmuls (W2, WO, FF1,
+            # FF2, FF3, WQKV) share the same matmul factory branch with
+            # SGLANG_TT_U29_W2_RS_SIGNALER=1.  Without this narrowing,
+            # every gathered matmul increments L1 0x90000 on each
+            # receiver core, breaking the 1:N counter↔dispatch
+            # correspondence the RS reader's relative-counter wait
+            # relies on.
+            #
+            # The flag SGLANG_TT_U29_W2_PRODUCER_NOW=1 is read at MATMUL
+            # PROGRAM CREATION time (the first ttnn.linear call for this
+            # shape).  The matmul factory bakes the increment into the
+            # JIT kernel binary's defines if (and only if) this flag is
+            # set at that moment.  Subsequent (cached) calls re-use the
+            # baked-in binary without re-reading the env.  Thus the
+            # narrowing is robust against the prefill path which also
+            # touches gathered matmuls.
+            import os as _u29_os
+            _u29_active = (
+                _u29_os.environ.get("SGLANG_TT_U29_W2_RS_SIGNALER", "0") == "1"
+                and mode == Mode.DECODE
+                and self.prefetcher is not None
+                and not _w2_use_skip
             )
+            if _u29_active:
+                _u29_prev = _u29_os.environ.get("SGLANG_TT_U29_W2_PRODUCER_NOW")
+                _u29_os.environ["SGLANG_TT_U29_W2_PRODUCER_NOW"] = "1"
+            try:
+                w2_out = ttnn.linear(
+                    w2_in,
+                    _w2_weight(),
+                    compute_kernel_config=li_ff2_compute_kernel_cfg,
+                    dtype=self.args.ccl_dtype if TG else activation_dtype or ttnn.bfloat16,
+                    program_config=_pc_w2_skip if _w2_use_skip else pc_2,
+                    memory_config=self.args.get_mlp_ff2_mem_config(mode, self.prefetcher),
+                    core_grid=None,  # FIXME: validate on TG ttnn.CoreGrid(y=8, x=8) if not pc_2 else None,
+                    global_cb=None if _w2_use_skip else (self.prefetcher.global_cb if self.prefetcher is not None and mode == Mode.DECODE else None),
+                    sub_device_id=self.prefetcher.receiver_sub_device_id
+                    if self.prefetcher is not None and mode == Mode.DECODE
+                    else None,
+                    optional_output_tensor=_u26c_out_t,
+                )
+            finally:
+                if _u29_active:
+                    if _u29_prev is None:
+                        _u29_os.environ.pop("SGLANG_TT_U29_W2_PRODUCER_NOW", None)
+                    else:
+                        _u29_os.environ["SGLANG_TT_U29_W2_PRODUCER_NOW"] = _u29_prev
         # U28 — capture w2_in shard grid BEFORE deallocation.
         try:
             if (mode == Mode.DECODE and self.prefetcher is not None

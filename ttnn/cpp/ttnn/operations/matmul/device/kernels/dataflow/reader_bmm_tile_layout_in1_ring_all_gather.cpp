@@ -291,26 +291,24 @@ void kernel_main() {
 #endif
     noc.async_write_barrier();
 #ifdef SGLANG_TT_U29_W2_RS_SIGNALER
-    // U29 — producer-side counter increment.  Closes the W2→RS cross-
-    // sub-device dispatch race confirmed in U28.  This RISC is the LAST
-    // code that runs on the W2 producer core; the `noc.async_write_barrier()`
-    // call immediately above guarantees all in-flight L1 writes (including
-    // PACK's writes to mm_out_cb at the residual-data L1 region 0xa6700)
-    // have retired.
+    // U29 Phase 2 v4 — producer-side counter increment.  Closes the
+    // W2→RS cross-sub-device dispatch race (U28-β confirmed).
     //
-    // We atomically increment a 4-byte L1 counter at the fixed scratch
-    // address SGLANG_TT_U29_SEMA_L1 (default 0x90000) on THIS core.  The
-    // RS reader (running on worker_sub_device cores under trace replay)
-    // will read this counter across all W2 producer cores and wait for
-    // value >= expected before issuing its first noc_async_read of mm_out_cb.
+    // CRITICAL ORDERING: this dataflow kernel and the compute kernel
+    // run on DIFFERENT RISCs on the same tensix core; the dataflow's
+    // `noc.async_write_barrier()` above only drains DATAFLOW writes,
+    // NOT compute's PACK→L1 writes to mm_out_cb.  Without an explicit
+    // wait on compute, the increment fires BEFORE compute's final
+    // tensix_sync.  Per-batch sync_buf handshakes happen INSIDE the
+    // main loop above, but compute does its FINAL tensix_sync AFTER
+    // the loop, so we need ONE MORE sync_buf round here.
     //
-    // SGLANG_TT_U29_SEMA_L1 is defined by the program factory and must
-    // match between this kernel and the RS reader kernel.
-    //
-    // PHASE 1 (current commit): scaffold only — `noc_semaphore_inc` with
-    // own-core noc coord.  PHASE 2: wire the per-producer-core noc-coord
-    // list as a runtime arg in the RS reader so the wait can iterate
-    // over all 32 producer cores.
+    // The compute kernel (bmm_large_block_zm_fused_bias_activation_gathered.cpp)
+    // pushes sync_buf one extra time after its final tensix_sync under
+    // SGLANG_TT_U29_W2_RS_SIGNALER.  Wait for it here, then increment.
+    cb_sync.wait_front(1);
+    cb_sync.pop_front(1);
+    noc.async_write_barrier();  // re-drain after the wait
     {
         const uint32_t u29_my_x = my_x[noc_index];
         const uint32_t u29_my_y = my_y[noc_index];

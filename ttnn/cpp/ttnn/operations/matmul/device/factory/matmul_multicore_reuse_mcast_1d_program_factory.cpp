@@ -2468,15 +2468,28 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         // Only applies on gathered (use_global_cb) path so non-prefetcher
         // matmuls remain untouched.
         const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
-        if (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") {
+        // U29 Phase 2 v3 — additional env gate `SGLANG_TT_U29_W2_PRODUCER_NOW`
+        // distinguishes W2 (which should increment the counter) from all
+        // other gathered matmuls (WO, FF1, FF2, FF3, WQKV) that share the
+        // gathered code path on the prefetcher.  Without this gate, every
+        // gathered matmul increments 0x90000 on its receiver cores,
+        // breaking the 1:N counter↔dispatch correspondence the RS reader
+        // relies on.  The mlp.py caller sets _NOW=1 just before W2's
+        // ttnn.linear call (at program-creation time the env var is
+        // captured into the JIT define; subsequent forward calls hit the
+        // cached program and reuse the same kernel binary).
+        const char* u29_now_env = std::getenv("SGLANG_TT_U29_W2_PRODUCER_NOW");
+        const bool u29_active = (u29_sig_env != nullptr && std::string(u29_sig_env) == "1") &&
+                                (u29_now_env != nullptr && std::string(u29_now_env) == "1");
+        if (u29_active) {
             // Pick a fixed L1 scratch address well outside the W2_out
             // L1 region (0xa6700) AND outside the prefetcher GCB receivers'
             // shard slots.  0x90000 is in the unreserved L1 region on BH
             // and is unused by either of those.  4-byte atomic counter.
             //
-            // NOTE: The counter is monotonic across forwards; the matched
-            // expected value comes from a runtime arg.  Override-runtime-args
-            // will bump the expected per forward.
+            // NOTE: The counter is monotonic across forwards (no host-side
+            // reset needed); the RS reader uses a relative-counter wait
+            // (see line_reduce_scatter_minimal_async_reader.cpp).
             mm_in1_kernel_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";
             mm_in1_kernel_defines["SGLANG_TT_U29_SEMA_L1"] = "0x90000";
             mm_kernel_defines["SGLANG_TT_U29_W2_RS_SIGNALER"] = "1";

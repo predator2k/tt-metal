@@ -928,17 +928,23 @@ void kernel_main() {
     ckernel::tensix_sync();
 #endif
 #ifdef SGLANG_TT_U29_W2_RS_SIGNALER
-    // U29 — kernel-exit fence to guarantee PACK->L1 retirement BEFORE
-    // the dataflow in1 sender writer kernel issues its
-    // noc_semaphore_inc.  Combined with the in1 sender writer's
-    // `noc.async_write_barrier()` + `noc_semaphore_inc`, this
-    // 2-stage fence forms the producer side of the W2->RS
-    // cross-sub-device dispatch-race fix (U28-β confirmed).
+    // U29 Phase 2 v4 — proper producer-side sync between compute and
+    // dataflow.  The in1 sender writer's noc_semaphore_inc CANNOT run
+    // until ALL PACK→L1 writes for the entire matmul are retired.
+    // Within the per-batch loop, dataflow already cb_sync.wait_fronts
+    // on compute's per-batch sync_buf push.  But the FINAL tensix_sync
+    // (this one) happens AFTER the loop exits in compute — at which
+    // point dataflow's loop has also exited and is NOT waiting on
+    // anything.  Result: dataflow's exit-time noc_semaphore_inc fires
+    // BEFORE compute's final tensix_sync, racing PACK.
     //
-    // See reader_bmm_tile_layout_in1_ring_all_gather.cpp for the
-    // matching `noc_semaphore_inc` and
-    // line_reduce_scatter_minimal_async_reader.cpp for the
-    // matching consumer-side wait.
+    // Fix: push one MORE sync_buf entry AFTER the final tensix_sync.
+    // Dataflow's exit code (in1 sender writer) waits on this push
+    // before issuing noc_semaphore_inc.  The sync_cb has capacity 1
+    // page (16 bytes) and is empty at this point (all per-batch
+    // pushes have been popped), so this push fits.
     ckernel::tensix_sync();
+    sync_buf.reserve_back(1);
+    sync_buf.push_back(1);
 #endif
 }
