@@ -35,6 +35,45 @@
 #include "api/debug/dprint.h"
 #endif
 
+#if defined(SGLANG_TT_U19_FORCE_ZERO) || defined(SGLANG_TT_U19_ADDR_DUMP)
+// U19 — workaround / addr-dump in the reader kernel.
+// FORCE_ZERO: after the first noc_async_read_barrier in the
+//   "is_first_device_in_direction" branch, overwrites the local CB
+//   bytes with ZERO.  Compute will then sum zero into the reduction —
+//   if final output collapses to zero / a sane deterministic value,
+//   confirms the stomp at L1 0xa6700 is the bug; otherwise something
+//   else is also broken.
+// ADDR_DUMP: prints intermediate_tensor_address and output_tensor_address
+//   at kernel entry alongside U17's input_tensor_address dump.  Lets us
+//   see if either intermediate or output is co-located at 0xa6700 across
+//   iterations (i.e., L1 allocator reuse).
+#include "api/debug/dprint.h"
+#endif
+
+// U19 — L1 data-cache invalidate ("fence") workaround.  Per the
+// Blackhole bring-up guide: "Writing an address on one core and reading
+// it from another only requires the reader to invalidate if the address
+// was previously read."  L1 data cache is disabled by default but a
+// stale-line race can still occur via the RISC-V write-buffer ordering.
+// invalidate_l1_cache() is just a RISC-V fence on BH, which also
+// orders all pending memory operations.  When set, the RS reader
+// issues a fence before EVERY noc_async_read of producer L1.  If the
+// 46% NONZERO race at L1 0xa6700 disappears, this is the bug.  No
+// extra #include needed: invalidate_l1_cache() comes from
+// dataflow_api.h already included above.
+
+// U19 — FORCE_PRODUCER_ZERO workaround.  After the U17 PRE_RS probe
+// confirms L1 0xa6700 is NONZERO on producer (2,7), do a NoC
+// noc_async_write of zero bytes back to producer L1 0xa6700 to FORCE
+// it to zero.  Then drain the write with noc_async_write_barrier.
+// All subsequent RS reads of producer L1 0xa6700 will get zero (until
+// PACK writes again, which it won't this iter).  Under zero weights,
+// this should make the RS read deterministic zero — same as the
+// canonical-no-prefetcher path — and the U11 garbage signature should
+// appear consistently (not the racy variation we see today).  Under
+// REAL weights this BREAKS the model (overwrites W2 output with zero)
+// — diagnostic only.
+
 using address_t = uint32_t;
 
 ///////////////////////////////////////////////////
@@ -200,6 +239,10 @@ void kernel_main() {
             volatile tt_l1_ptr uint32_t* z =
                 reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_scratch);
             z[0] = 0; z[1] = 0; z[2] = 0; z[3] = 0;
+#ifdef SGLANG_TT_U19_INVALIDATE_CACHE
+            // U19 — fence in U17 probe too.
+            invalidate_l1_cache();
+#endif
             // Issue a single read of page_size bytes from producer's L1.
             noc_async_read(probe_noc_addr, l1_scratch, page_size);
             noc_async_read_barrier();
@@ -216,6 +259,51 @@ void kernel_main() {
                    << " " << DEC() << " tot=" << u17_pre_total
                    << " " << (any_nonzero ? "NONZERO" : "zero")
                    << "]" << ENDL();
+#ifdef SGLANG_TT_U19_ADDR_DUMP
+            // U19 — also dump intermediate & output addresses so we can
+            // correlate every RS dispatch's full tensor-address triple
+            // against W2 output address 0xa6700.  If intermediate or
+            // output ever equal 0xa6700, the RS writer (which writes to
+            // intermediate and output) is a candidate stomper.
+            DPRINT << "[U19_ADDR_DUMP in=0x" << HEX() << input_tensor_address
+                   << " inter=0x" << intermediate_tensor_address
+                   << " out=0x" << output_tensor_address
+                   << DEC() << "]" << ENDL();
+#endif
+#ifdef SGLANG_TT_U19_FORCE_PRODUCER_ZERO
+            // U19 — FORCE producer L1 to zero via NoC write-back, then
+            // READBACK to verify.  After the U17 probe shows producer L1
+            // NONZERO, we overwrite via a NoC write of zero bytes, then
+            // re-read to confirm.  If the readback ALSO shows NONZERO,
+            // something is constantly stomping producer L1 (not a
+            // historical artifact).  If readback shows zero, the write
+            // worked and the bytes are coherent — meaning the original
+            // U17 NONZERO read was racing against an in-flight stomper
+            // that DIDN'T re-stomp after our write.
+            {
+                volatile tt_l1_ptr uint32_t* zlocal =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_scratch);
+                for (uint32_t i = 0; i < page_size / 4; ++i) {
+                    zlocal[i] = 0;
+                }
+                noc_async_write(l1_scratch, probe_noc_addr, page_size);
+                noc_async_write_barrier();
+                // Reuse same scratch; readback overwrites it.
+                noc_async_read(probe_noc_addr, l1_scratch, page_size);
+                noc_async_read_barrier();
+                uint32_t r[4] = { zlocal[0], zlocal[1], zlocal[2], zlocal[3] };
+                bool rback_nonzero = r[0] != 0 || r[1] != 0 || r[2] != 0 || r[3] != 0;
+                DPRINT << "[U19_FORCED_ZERO_RBACK probe_noc=0x" << HEX()
+                       << probe_noc_addr
+                       << " r0=0x" << r[0]
+                       << " r1=0x" << r[1]
+                       << " r2=0x" << r[2]
+                       << " r3=0x" << r[3]
+                       << " " << DEC()
+                       << (rback_nonzero ? "NONZERO" : "zero")
+                       << "]" << ENDL();
+            }
+#endif
             // Do NOT push_back — leave scratch reserved-but-not-consumed,
             // we'll write over it in the normal flow.  Or rather: we just
             // reset the cb_input_id reservation by NOT pushing.  Safer is
@@ -272,9 +360,18 @@ void kernel_main() {
 
                         cb_reserve_back(cb_in0, tile_granularity);
                         uint32_t l1_write_addr = get_write_ptr(cb_in0);
-#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+#if defined(SGLANG_TT_PREFETCHER_CONSUMER_PROBE) || defined(SGLANG_TT_U19_FORCE_ZERO)
                         uint32_t u14_l1_base = l1_write_addr;
+#endif
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
                         uint64_t u14_first_noc_addr = 0;
+#endif
+#ifdef SGLANG_TT_U19_INVALIDATE_CACHE
+                        // U19 — invalidate this RISC's L1 cache lines (fence)
+                        // BEFORE issuing the NoC read of producer L1.  If the
+                        // producer's stale bytes are sitting in our local
+                        // cache line for 0xa6700, fence forces a re-fetch.
+                        invalidate_l1_cache();
 #endif
                         for (uint32_t j = 0; j < num_pages_to_read; ++j) {
                             uint32_t tile_id = input_tile_id_start + input_row_offset + input_pages_read_in_row;
@@ -296,6 +393,26 @@ void kernel_main() {
                         tiles_read += num_pages_to_read;
 
                         noc_async_read_barrier();
+#ifdef SGLANG_TT_U19_FORCE_ZERO
+                        // U19 Phase-1 — WORKAROUND TEST.  Overwrite every
+                        // byte the reader just brought in with ZERO.  The
+                        // reduction kernel then sums zero into the accumulator
+                        // (and the writer scatters zero out), short-circuiting
+                        // the stomped-L1 read.  Under zero-weight injection,
+                        // the entire RS output should collapse to zero, and
+                        // server output should become deterministic.  This
+                        // PROVES the L1-0xa6700 stomp is the bug if the
+                        // garbage signature disappears.
+                        {
+                            uint32_t bytes_just_read = num_pages_to_read * page_size;
+                            uint32_t words = bytes_just_read >> 2;
+                            volatile tt_l1_ptr uint32_t* z =
+                                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(u14_l1_base);
+                            for (uint32_t k = 0; k < words; ++k) {
+                                z[k] = 0;
+                            }
+                        }
+#endif
 #ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
                         // U14 — read the first 16 bytes the consumer pulled
                         // from the matmul output's L1 buffer.  After
@@ -358,9 +475,15 @@ void kernel_main() {
 
                         cb_reserve_back(cb_in0, tile_granularity);
                         uint32_t l1_write_addr = get_write_ptr(cb_in0);
-#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
+#if defined(SGLANG_TT_PREFETCHER_CONSUMER_PROBE) || defined(SGLANG_TT_U19_FORCE_ZERO)
                         uint32_t u14_l1_base_in = l1_write_addr;
+#endif
+#ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
                         uint64_t u14_first_noc_addr_in = 0;
+#endif
+#ifdef SGLANG_TT_U19_INVALIDATE_CACHE
+                        // U19 — fence before reading producer L1 (input branch).
+                        invalidate_l1_cache();
 #endif
                         for (uint32_t j = 0; j < num_pages_to_read; ++j) {
                             uint32_t tile_id = input_tile_id_start + input_row_offset + input_pages_read_in_row;
@@ -405,6 +528,30 @@ void kernel_main() {
                         }
 
                         noc_async_read_barrier();
+#ifdef SGLANG_TT_U19_FORCE_ZERO
+                        // U19 Phase-1 — WORKAROUND TEST.  Zero both
+                        // input and intermediate L1 bytes in the
+                        // "not first device" branch.  See FORCE_ZERO
+                        // comment in the "is_first_device" branch above.
+                        {
+                            uint32_t bytes_just_read = num_pages_to_read * page_size;
+                            uint32_t words = bytes_just_read >> 2;
+                            volatile tt_l1_ptr uint32_t* zi =
+                                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(u14_l1_base_in);
+                            for (uint32_t k = 0; k < words; ++k) {
+                                zi[k] = 0;
+                            }
+                            // Also zero the intermediate buffer we just
+                            // populated to keep the reduction summing zero.
+                            uint32_t l1_intermediate_base =
+                                l1_write_addr - bytes_just_read;
+                            volatile tt_l1_ptr uint32_t* zr =
+                                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_intermediate_base);
+                            for (uint32_t k = 0; k < words; ++k) {
+                                zr[k] = 0;
+                            }
+                        }
+#endif
 #ifdef SGLANG_TT_PREFETCHER_CONSUMER_PROBE
                         // U14 — same probe, "not first device" branch.  After
                         // the barrier both the input and intermediate buffers

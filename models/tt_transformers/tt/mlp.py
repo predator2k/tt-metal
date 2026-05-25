@@ -688,6 +688,56 @@ class MLP(LightweightModule):
                         flush=True,
                     )
 
+        # U19 — Python-side workaround test: insert a ttnn.fill(w2_out, 0)
+        # BEFORE tt_all_reduce.  This forces w2_out's L1 to zero via a
+        # captured trace op (no host sync needed).  Under zero weights,
+        # tt_all_reduce's RS reader should now consistently see zero
+        # and the output should become the deterministic U11 zero-weight
+        # signature.  Under REAL weights, this DESTROYS W2's contribution
+        # — diagnostic only.  Confirms (or refutes) "L1 0xa6700 is
+        # genuinely stomped between W2 exit and RS reader".
+        import os as _u19f_os
+        if (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U19_FILL_W2_ZERO", "0") == "1"):
+            try:
+                # ttnn.fill needs (tensor, value).  Use 0 in same dtype.
+                ttnn.fill(w2_out, 0)
+            except Exception as _u19f_e:
+                print(f"[U19_FILL_W2_ZERO] ERROR: {type(_u19f_e).__name__}: {_u19f_e}",
+                      flush=True)
+
+        # U19 — CLONE w2_out into a fresh L1 buffer before tt_all_reduce.
+        # If the bug is "stomper writes to L1 0xa6700 between W2 exit and
+        # RS reader", routing the RS through a CLONED tensor at a
+        # DIFFERENT L1 address sidesteps the stomp at 0xa6700.  Preserves
+        # W2's correct contribution — should fix the bug under REAL
+        # weights, NOT just under zero weights.
+        if (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U19_CLONE_W2", "0") == "1"):
+            try:
+                w2_out_orig = w2_out
+                w2_out = ttnn.clone(w2_out_orig, memory_config=w2_out_orig.memory_config())
+                ttnn.deallocate(w2_out_orig)
+            except Exception as _u19c_e:
+                print(f"[U19_CLONE_W2] ERROR: {type(_u19c_e).__name__}: {_u19c_e}",
+                      flush=True)
+
+        # U19 — COPY w2_out onto itself as a NO-OP DISPATCH BARRIER.
+        # The op reads-then-writes the same L1 region — IF the stomper
+        # fires BEFORE this copy, the copy preserves the stomped bytes
+        # (data unchanged), and RS reader still sees stomp.  IF the
+        # stomper fires DURING/AFTER this copy, the copy's NoC reads
+        # happen first.  This isolates whether the FILL fix is about
+        # (a) writing zero (data-destructive) or (b) just dispatching
+        # any op between W2 and RS (timing).  Diagnostic.
+        if (mode == Mode.DECODE
+                and _u19f_os.environ.get("SGLANG_TT_U19_COPY_W2", "0") == "1"):
+            try:
+                ttnn.copy(w2_out, w2_out)
+            except Exception as _u19cp_e:
+                print(f"[U19_COPY_W2] ERROR: {type(_u19cp_e).__name__}: {_u19cp_e}",
+                      flush=True)
+
         w2_out_reduced = tt_all_reduce(
             w2_out,
             self.mesh_device,

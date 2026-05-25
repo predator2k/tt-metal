@@ -19,6 +19,16 @@
 #include <cstdint>
 #include <utility>
 
+#ifdef SGLANG_TT_U19_WRITER_PROBE
+// U19 — RS writer probe.  Dumps intermediate_address and output_address
+// at kernel entry.  If either ever equals the W2 mm_out_cb base 0xa6700,
+// the RS writer is a candidate stomper (it does noc_async_write to those
+// L1 regions across cores).  Also reads the bytes currently at the
+// receiver-core's L1 0xa6700 to compare with U17 PRE_RS at the same
+// dispatch step.
+#include "api/debug/dprint.h"
+#endif
+
 using address_t = uint32_t;
 using ttnn::ccl::Topology;
 using namespace tt::tt_fabric::linear::experimental;
@@ -117,6 +127,31 @@ void kernel_main() {
     uint32_t local_buffer_index_address = get_semaphore(get_arg_val<uint32_t>(arg_idx++));
     uint32_t termination_master_noc_x = get_arg_val<uint32_t>(arg_idx++);
     uint32_t termination_master_noc_y = get_arg_val<uint32_t>(arg_idx++);
+
+#ifdef SGLANG_TT_U19_WRITER_PROBE
+    // U19 — RS writer kernel-entry probe.  Two-part:
+    //   (1) Always dump intermediate_address and output_address at entry.
+    //       If either is 0xa6700, the writer scatter-writes there — possible
+    //       stomper of the W2 output L1 region.
+    //   (2) Budgeted: read receiver-core's L1 0xa6700 via a NoC self-read.
+    //       Compare to U17_PRE_RS (reader) at the same dispatch step.  If
+    //       the writer enters BEFORE the reader and sees ZERO, the stomp
+    //       happens between writer entry and reader entry.  If writer
+    //       enters with NONZERO (same as reader), the stomp is BEFORE the
+    //       whole RS program dispatches.
+    {
+        static uint32_t u19_writer_budget = 2048;
+        static uint32_t u19_writer_total = 0;
+        u19_writer_total++;
+        if (u19_writer_budget > 0) {
+            u19_writer_budget--;
+            // Always log addresses at every entry.
+            DPRINT << "[U19_WRITER_ADDR inter=0x" << HEX() << intermediate_address
+                   << " out=0x" << output_address
+                   << DEC() << " tot=" << u19_writer_total << "]" << ENDL();
+        }
+    }
+#endif
 
     const auto& unicast_route_info = (is_forward) ? forward_unicast_route_info : backward_unicast_route_info;
     const auto& multicast_route_info = (is_forward) ? forward_multicast_route_info : backward_multicast_route_info;

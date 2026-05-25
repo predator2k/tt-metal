@@ -1227,6 +1227,42 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
         reader_compute_defines["SGLANG_TT_U17_PROBE_RS_PRE"] = "1";
     }
 
+    // U19 — workaround / probe set.
+    // FORCE_ZERO: reader zeros the local L1 right after each noc_async_read
+    //   barrier, short-circuiting the stomped-L1 reads.  If the resulting
+    //   server output becomes deterministic under zero weights, this proves
+    //   the bug is the L1-0xa6700 stomp.
+    // ADDR_DUMP: reader logs intermediate/output addresses at entry.
+    // WRITER_PROBE: writer logs intermediate/output addresses at entry.
+    const char* u19_fz_env = std::getenv("SGLANG_TT_U19_FORCE_ZERO");
+    if (u19_fz_env != nullptr && std::string(u19_fz_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U19_FORCE_ZERO"] = "1";
+    }
+    const char* u19_ad_env = std::getenv("SGLANG_TT_U19_ADDR_DUMP");
+    if (u19_ad_env != nullptr && std::string(u19_ad_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U19_ADDR_DUMP"] = "1";
+    }
+    const char* u19_wp_env = std::getenv("SGLANG_TT_U19_WRITER_PROBE");
+    if (u19_wp_env != nullptr && std::string(u19_wp_env) == "1") {
+        writer_compute_defines["SGLANG_TT_U19_WRITER_PROBE"] = "1";
+    }
+    // U19 — L1-cache invalidate fence in RS reader (workaround / fix).
+    // When SGLANG_TT_U19_INVALIDATE_CACHE=1, RS reader fences before every
+    // noc_async_read of producer L1.  If the 46% NONZERO race disappears,
+    // it confirms a stale-cache / write-buffer race is the bug.
+    const char* u19_ic_env = std::getenv("SGLANG_TT_U19_INVALIDATE_CACHE");
+    if (u19_ic_env != nullptr && std::string(u19_ic_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U19_INVALIDATE_CACHE"] = "1";
+    }
+    // U19 — FORCE_PRODUCER_ZERO: NoC-write zeros to producer L1 0xa6700
+    // before the first RS read.  Diagnostic-only: breaks real-weight
+    // output (destroys W2's contribution).  Used to confirm racy NONZERO
+    // is the bug.
+    const char* u19_fpz_env = std::getenv("SGLANG_TT_U19_FORCE_PRODUCER_ZERO");
+    if (u19_fpz_env != nullptr && std::string(u19_fpz_env) == "1") {
+        reader_compute_defines["SGLANG_TT_U19_FORCE_PRODUCER_ZERO"] = "1";
+    }
+
     // KERNEL CREATION
     if (fuse_op) {
         fused_op_signaler->init_reduce_scatter(program, mesh_device, sender_worker_core_range_set);
@@ -1252,6 +1288,15 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
         buffer_size_bytes_full_size_channel,
         mux_base_l1_address);
 
+    // U19 — env-gated mux probe.  Logs (x,y) and every (address, size)
+    // pair the mux zeros at kernel entry.  Critical for confirming
+    // whether the fabric_mux clears L1 0xa6700 on receiver core (2,7).
+    std::map<std::string, std::string> mux_compute_defines;
+    const char* u19_mp_env = std::getenv("SGLANG_TT_U19_MUX_PROBE");
+    if (u19_mp_env != nullptr && std::string(u19_mp_env) == "1") {
+        mux_compute_defines["SGLANG_TT_U19_MUX_PROBE"] = "1";
+    }
+
     // mux kernel
     auto mux_kernel_id = tt::tt_metal::CreateKernel(
         program,
@@ -1261,6 +1306,7 @@ ReduceScatterProgramArtifacts build_line_reduce_scatter_minimal_async_program_ar
             .processor = tt::tt_metal::DataMovementProcessor::RISCV_0,
             .noc = tt::tt_metal::NOC::RISCV_0_default,
             .compile_args = mux_kernel_config.get_fabric_mux_compile_time_args(),
+            .defines = mux_compute_defines,
             .opt_level = tt::tt_metal::KernelBuildOptLevel::O3});
 
     // Reader

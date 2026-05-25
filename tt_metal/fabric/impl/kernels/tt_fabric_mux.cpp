@@ -14,6 +14,9 @@
 
 #include <cstddef>
 #include <array>
+#ifdef SGLANG_TT_U19_MUX_PROBE
+#include "api/debug/dprint.h"
+#endif
 // clang-format on
 
 constexpr size_t NUM_FULL_SIZE_CHANNELS = get_compile_time_arg_val(0);
@@ -142,9 +145,20 @@ void kernel_main() {
 
     // clear out memory regions
     auto num_regions_to_clear = get_arg_val<uint32_t>(rt_args_idx++);
+#ifdef SGLANG_TT_U19_MUX_PROBE
+    // U19 — dump (core x,y) and every (address, size) the mux zeros.
+    // If any address overlaps 0xa6700 on receiver core (2,7), the mux
+    // kernel is the stomper of W2 mm_out_cb.
+    DPRINT << "[U19_MUX_ENTRY num_regions=" << num_regions_to_clear << "]" << ENDL();
+#endif
     for (uint32_t i = 0; i < num_regions_to_clear; i++) {
         auto address = get_arg_val<uint32_t>(rt_args_idx++);
         auto size = get_arg_val<uint32_t>(rt_args_idx++);
+#ifdef SGLANG_TT_U19_MUX_PROBE
+        DPRINT << "[U19_MUX_ZERO addr=0x" << HEX() << address
+               << " size=0x" << size
+               << DEC() << " i=" << i << "]" << ENDL();
+#endif
         zero_l1_buf(reinterpret_cast<tt_l1_ptr uint32_t*>(address), size);
     }
 
