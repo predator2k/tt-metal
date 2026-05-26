@@ -1087,9 +1087,27 @@ class Prefetcher(LightweightModule):
         # incorrect".  Default 0 (real per-tensor offsets used).
         if os.environ.get("SGLANG_TT_U32_FORCE_ZERO", "0") == "1":
             return 0
-        try:
-            idx = self.prefetched_tensors.index(tensor)
-        except ValueError:
+        # U34 fix — lookup by Python identity + buffer_address fallback.
+        # ttnn.Tensor.__eq__ may return a tensor (not bool), making
+        # list.index() unreliable: it can return 0 (first match)
+        # spuriously.  Mirror the U33 set_tensor_consumer_bytes lookup
+        # explicitly here.
+        idx = None
+        for i, t in enumerate(self.prefetched_tensors):
+            if t is tensor:
+                idx = i
+                break
+        if idx is None:
+            try:
+                tgt_addr = tensor.buffer_address()
+            except Exception:
+                tgt_addr = None
+            if tgt_addr is not None:
+                for i, addr in enumerate(self.prefetched_tensor_addr):
+                    if addr == tgt_addr:
+                        idx = i
+                        break
+        if idx is None:
             return 0
         # Per-layer tensor list is the FIRST num_tensors entries; per-layer
         # offsets are the same across layers (producer's wr_ptr keeps the
@@ -1108,7 +1126,85 @@ class Prefetcher(LightweightModule):
             and getattr(self, "_tensor_consumer_bytes", None) is not None
             and len(self._tensor_consumer_bytes) > 0
         )
+        # U34 — producer-simulation align mode.  When SGLANG_TT_U34_LCM_ALIGN=1,
+        # mirror the writer_l1.cpp + resize_remote_sender_cb_interface logic
+        # exactly so each returned offset matches the producer's actual
+        # `fifo_wr_ptr` at the start of tensor t.  The producer's
+        # `resize_remote_sender_cb_interface` (remote_circular_buffer.h:110)
+        # at the start of each tensor sets page_size = block_size_per_receiver
+        # (= consumer's in1_block_size_bytes), ALIGN-UPs wr_ptr to that
+        # page_size, and wraps to fifo_start if past fifo_limit_page_aligned
+        # (= gcb_size - gcb_size%page_size).  Then writes num_blocks blocks
+        # of `page_size` each, with mid-tensor wrap when dest_addr ==
+        # fifo_limit_page_aligned (remote_circular_buffer.h:378).  Because the
+        # producer per-tensor re-aligns to the tensor's own page_size, every
+        # tensor's start address IS aligned to its own block_size_bytes — but
+        # the cumulative-sum U33 computation did NOT mirror this and gave
+        # un-aligned offsets (e.g. W1@696320 not multiple of 13824).  U34
+        # replays the producer logic in Python to get correct, aligned
+        # offsets.
+        use_u34 = (
+            os.environ.get("SGLANG_TT_U34_LCM_ALIGN", "0") == "1"
+            and use_u33
+        )
         gcb_size = self.max_tensor_block_size if self.max_tensor_block_size > 0 else 1
+        if use_u34:
+            # Recover per-tensor page_size from the registered consumer bytes:
+            # consumer_bytes[t] = num_blocks * page_size[t]; page_size[t] =
+            # consumer_bytes[t] / num_blocks.  num_blocks = ring_size.
+            try:
+                num_blocks = int(self.ring_size)
+            except Exception:
+                num_blocks = 32
+            if num_blocks <= 0:
+                num_blocks = 32
+            _u34_trace = []
+            # Simulate producer offsets for tensors 0..per_layer_idx.
+            # Returns the wr_ptr at the START of tensor `per_layer_idx`.
+            wr_ptr = 0
+            for t in range(per_layer_idx + 1):
+                cb_t = (
+                    int(self._tensor_consumer_bytes[t])
+                    if t < len(self._tensor_consumer_bytes)
+                    else 0
+                )
+                ps = cb_t // num_blocks if cb_t > 0 else 0
+                if ps <= 0:
+                    # Tensor t hasn't been registered yet — fall back to U33
+                    # cumulative (best-effort during iter-1).
+                    continue
+                cb_size_pa = gcb_size - (gcb_size % ps)
+                fifo_limit_pa = cb_size_pa if cb_size_pa > 0 else gcb_size
+                # resize: align wr_ptr up to ps; wrap if past fifo_limit_pa
+                if (wr_ptr % ps) != 0:
+                    wr_ptr = ((wr_ptr + ps - 1) // ps) * ps
+                if wr_ptr >= fifo_limit_pa:
+                    wr_ptr = 0
+                if t == per_layer_idx:
+                    # This is the tensor we're returning the offset for.
+                    # Log only once per (per_layer_idx, offset) tuple to avoid spam.
+                    if not hasattr(self, "_u34_logged"):
+                        self._u34_logged = {}
+                    _key = (per_layer_idx, wr_ptr)
+                    if _key not in self._u34_logged:
+                        self._u34_logged[_key] = True
+                        logger.info(
+                            f"[U34_RETURN] per_layer_idx={per_layer_idx} offset={wr_ptr} ps={ps} aligned={(wr_ptr%ps==0)}"
+                        )
+                    return wr_ptr
+                # Otherwise, simulate writing num_blocks blocks of ps each.
+                # Each block-write increments dest_addr by ps; if dest_addr ==
+                # fifo_limit_pa, wrap to 0 (remote_circular_buffer.h:378).
+                # If dest_addr overruns fifo_limit_pa mid-block (can happen
+                # when ps doesn't divide fifo_limit_pa evenly — but resize
+                # re-aligns so this rarely occurs), we wrap modulo gcb_size.
+                for _ in range(num_blocks):
+                    wr_ptr += ps
+                    if wr_ptr == fifo_limit_pa:
+                        wr_ptr = 0
+                    elif wr_ptr > fifo_limit_pa:
+                        wr_ptr = wr_ptr - fifo_limit_pa
+            return wr_ptr
         if use_u33:
             # Sum consumer bytes for all tensors BEFORE this one in the
             # per-layer order.  Each tensor's matmul reads num_blocks *
@@ -1180,11 +1276,41 @@ class Prefetcher(LightweightModule):
             for i in range(n_slots):
                 offs.append(cum % gcb_size)
                 cum += int(self._tensor_consumer_bytes[i])
+            # U34 — also log the producer-simulated (resize-aligned) offsets
+            # so we can verify each tensor's offset is a multiple of its own
+            # in1_block_size_bytes (page_size).
+            try:
+                num_blocks = int(self.ring_size)
+            except Exception:
+                num_blocks = 32
+            if num_blocks <= 0:
+                num_blocks = 32
+            u34_offs = []
+            wr_ptr = 0
+            for i in range(n_slots):
+                cb_i = int(self._tensor_consumer_bytes[i])
+                ps = cb_i // num_blocks if cb_i > 0 else 0
+                if ps <= 0:
+                    u34_offs.append(None)
+                    continue
+                cb_size_pa = gcb_size - (gcb_size % ps)
+                fifo_limit_pa = cb_size_pa if cb_size_pa > 0 else gcb_size
+                if (wr_ptr % ps) != 0:
+                    wr_ptr = ((wr_ptr + ps - 1) // ps) * ps
+                if wr_ptr >= fifo_limit_pa:
+                    wr_ptr = 0
+                u34_offs.append((wr_ptr, ps, wr_ptr % ps))
+                for _ in range(num_blocks):
+                    wr_ptr += ps
+                    if wr_ptr == fifo_limit_pa:
+                        wr_ptr = 0
+                    elif wr_ptr > fifo_limit_pa:
+                        wr_ptr = wr_ptr - fifo_limit_pa
             logger.info(
                 f"[U33] set_tensor_consumer_bytes per_layer_idx={per_layer_idx} "
                 f"bytes={consumer_bytes_per_dispatch} (was={was}) "
                 f"gcb_size={gcb_size} per_tensor_bytes={self._tensor_consumer_bytes} "
-                f"cumulative_offsets={offs}"
+                f"cumulative_offsets={offs} u34_producer_sim_offsets={u34_offs}"
             )
 
     def prefetch(self):
