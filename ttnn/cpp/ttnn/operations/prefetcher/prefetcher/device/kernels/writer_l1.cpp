@@ -158,6 +158,46 @@ void kernel_main() {
                                    << " 0x" << _u37_w3 << "]"
                                    << DEC() << " bsz=" << curr_block_size_per_receiver
                                    << "]" << ENDL();
+#ifdef SGLANG_TT_U39_EXT_BYTES
+                            // U39 (Suspect 5) — extended dump.  In addition
+                            // to bytes 0-15 (face-0 exponent area), dump:
+                            //   bytes 64-79   (face-0 mantissa start; the
+                            //                  shared exponents occupy the
+                            //                  first 64 bytes of a BFP8 tile)
+                            //   bytes 320-335 (face-1 mantissa start; each
+                            //                  face = 256 bytes of mantissa)
+                            //   bytes 576-591 (face-2 mantissa start)
+                            // Cross-correlate with the kernel-side U37 read
+                            // at the same wr_ptr/rd_l1.  If any offset
+                            // diverges between producer and consumer, the
+                            // bug is producer's per-face write ordering for
+                            // BFP8 (Suspect 5 CONFIRMED).
+                            uint32_t _u39_f0m_w0 = _u37_src[16];   // byte 64
+                            uint32_t _u39_f0m_w1 = _u37_src[17];
+                            uint32_t _u39_f0m_w2 = _u37_src[18];
+                            uint32_t _u39_f0m_w3 = _u37_src[19];
+                            uint32_t _u39_f1m_w0 = _u37_src[80];   // byte 320
+                            uint32_t _u39_f1m_w1 = _u37_src[81];
+                            uint32_t _u39_f1m_w2 = _u37_src[82];
+                            uint32_t _u39_f1m_w3 = _u37_src[83];
+                            uint32_t _u39_f2m_w0 = _u37_src[144];  // byte 576
+                            uint32_t _u39_f2m_w1 = _u37_src[145];
+                            uint32_t _u39_f2m_w2 = _u37_src[146];
+                            uint32_t _u39_f2m_w3 = _u37_src[147];
+                            DPRINT << "[U39_PROD_EXT layer=" << layer
+                                   << " t=" << t
+                                   << " blk=" << block
+                                   << " f0m@64=[0x" << HEX()
+                                   << _u39_f0m_w0 << " 0x" << _u39_f0m_w1
+                                   << " 0x" << _u39_f0m_w2 << " 0x" << _u39_f0m_w3
+                                   << "] f1m@320=[0x"
+                                   << _u39_f1m_w0 << " 0x" << _u39_f1m_w1
+                                   << " 0x" << _u39_f1m_w2 << " 0x" << _u39_f1m_w3
+                                   << "] f2m@576=[0x"
+                                   << _u39_f2m_w0 << " 0x" << _u39_f2m_w1
+                                   << " 0x" << _u39_f2m_w2 << " 0x" << _u39_f2m_w3
+                                   << "]" << DEC() << ENDL();
+#endif
                         }
                     }
 #endif

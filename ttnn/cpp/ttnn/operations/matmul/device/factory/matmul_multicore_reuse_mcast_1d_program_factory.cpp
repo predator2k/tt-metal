@@ -2540,6 +2540,21 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u37_read_env != nullptr && std::string(u37_read_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U37_READ_BYTES"] = "1";
         }
+        // U39 (Suspect 5) — extend U37 consumer-byte dump to cover face-0
+        // mantissa (byte 64), face-1 mantissa (byte 320), face-2 mantissa
+        // (byte 576).  Requires SGLANG_TT_U37_READ_BYTES=1 to actually fire.
+        // Default-off.
+        const char* u39_ext_env = std::getenv("SGLANG_TT_U39_EXT_BYTES");
+        if (u39_ext_env != nullptr && std::string(u39_ext_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U39_EXT_BYTES"] = "1";
+        }
+        // U39 — dump the LocalCBInterface metadata that the LLK matmul
+        // actually uses (fifo_page_size, fifo_size, fifo_rd_ptr).  Requires
+        // SGLANG_TT_U37_READ_BYTES=1 to fire.  Default-off.
+        const char* u39_meta_env = std::getenv("SGLANG_TT_U39_CB_META");
+        if (u39_meta_env != nullptr && std::string(u39_meta_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U39_CB_META"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).
@@ -2612,7 +2627,25 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
     if (packer_l1_acc_en) {
         mm_kernel_defines["PACKER_L1_ACC"] = "1";
     }
-    if (fp32_dest_acc_en) {
+    // U39 (Suspect 4) — env-gated forced override of fp32_dest_acc_en to
+    // false for ALL gathered (prefetcher) matmuls.  Per the U31 per-ELF
+    // CT-args table, the 3 BFP8 garbage ELFs have MIXED fp32_dest_acc_en
+    // (WQKV=1, WO=1, W2=0) while the 1 BFP4 CLEAN ELF has fp32_dest_acc_en=0.
+    // If forcing dest=fp16 on the BFP8 ELFs eliminates the garbage,
+    // fp32_dest_acc_en × BFP8 interaction is the bug.  Default-off so
+    // canonical matmuls and non-gathered paths are untouched.  Note: this
+    // may regress numerical precision; if GSM8K is close (5-7/10) this
+    // confirms the discriminator but a more surgical fix would follow.
+    bool effective_fp32_dest_acc_en = fp32_dest_acc_en;
+    {
+        const char* u39_fp32_off_env =
+            std::getenv("SGLANG_TT_U39_FORCE_FP32_DEST_OFF");
+        if (u39_fp32_off_env != nullptr &&
+            std::string(u39_fp32_off_env) == "1") {
+            effective_fp32_dest_acc_en = false;
+        }
+    }
+    if (effective_fp32_dest_acc_en) {
         mm_kernel_defines["FP32_DEST_ACC_EN"] = "1";
     }
     ttnn::operations::compute_throttle_utils::add_stagger_defines_if_needed(
@@ -2704,7 +2737,7 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
                 (unsigned)batch, out_block_tiles, (unsigned)untilize_out,
                 (unsigned)in1_is_dram_interleaved, (unsigned)in1_is_dram_sharded,
                 per_core_M, per_core_N, K,
-                (unsigned)fp32_dest_acc_en, (unsigned)packer_l1_acc_en,
+                (unsigned)effective_fp32_dest_acc_en, (unsigned)packer_l1_acc_en,
                 (unsigned)dst_full_sync_en, num_cores, ring_size,
                 (unsigned)spill_flag, out_block_num_subblocks);
             fflush(stderr);
@@ -2717,7 +2750,9 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         all_cores,
         tt_metal::ComputeConfig{
             .math_fidelity = math_fidelity,
-            .fp32_dest_acc_en = fp32_dest_acc_en,
+            // U39 (Suspect 4) — honor SGLANG_TT_U39_FORCE_FP32_DEST_OFF
+            // override via effective_fp32_dest_acc_en (computed above).
+            .fp32_dest_acc_en = effective_fp32_dest_acc_en,
             .dst_full_sync_en = dst_full_sync_en,
             .math_approx_mode = math_approx_mode,
             .compile_args = compute_kernel_args,

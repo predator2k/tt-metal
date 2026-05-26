@@ -651,6 +651,80 @@ void kernel_main() {
                                                << " 0x" << u37_w2
                                                << " 0x" << u37_w3 << "]"
                                                << DEC() << "]" << ENDL();
+#ifdef SGLANG_TT_U39_CB_META
+                                        // U39 — dump the LocalCBInterface
+                                        // metadata that the LLK matmul uses.
+                                        // tile_size_b = fifo_page_size (in
+                                        // 16B units; multiply by 16 for
+                                        // bytes).  fifo_rd_ptr is also in
+                                        // 16B units; -1 offset is applied
+                                        // inside the LLK.  If fifo_page_size
+                                        // does not equal in1_single_tile_size/16,
+                                        // then the LLK reads at wrong tile
+                                        // strides, which would explain
+                                        // BFP8 garbage + correct bytes at
+                                        // tile 0.
+                                        LocalCBInterface& _u39_in1_cb =
+                                            get_local_cb_interface(in1_cb_id);
+                                        DPRINT << "[U39_CB_META elf=0x" << HEX()
+                                               << u37_elf_tag
+                                               << " rd_l1=0x" << u37_rd_l1
+                                               << " in1bs=" << DEC()
+                                               << in1_block_size_bytes
+                                               << " fifo_size=" << _u39_in1_cb.fifo_size
+                                               << " fifo_limit=" << _u39_in1_cb.fifo_limit
+                                               << " fifo_page_size=" << _u39_in1_cb.fifo_page_size
+                                               << " fifo_num_pages=" << _u39_in1_cb.fifo_num_pages
+                                               << " fifo_rd_ptr=" << _u39_in1_cb.fifo_rd_ptr
+                                               << "]" << ENDL();
+                                        // Also dump in0 cb for comparison.
+                                        LocalCBInterface& _u39_in0_cb =
+                                            get_local_cb_interface(in0_cb_id);
+                                        DPRINT << "[U39_CB_META_IN0 elf=0x" << HEX()
+                                               << u37_elf_tag << DEC()
+                                               << " fifo_page_size=" << _u39_in0_cb.fifo_page_size
+                                               << " fifo_size=" << _u39_in0_cb.fifo_size
+                                               << " fifo_rd_ptr=" << _u39_in0_cb.fifo_rd_ptr
+                                               << "]" << ENDL();
+#endif
+#ifdef SGLANG_TT_U39_EXT_BYTES
+                                        // U39 (Suspect 5) — extended dump.
+                                        // BFP8 tile = 64 B shared exponent
+                                        // prefix + 4×256 B face mantissa.
+                                        // Sample face-0 mantissa (byte 64),
+                                        // face-1 mantissa (byte 320), and
+                                        // face-2 mantissa (byte 576) from
+                                        // the SAME rd_l1.  If face-1 or
+                                        // face-2 bytes diverge from the
+                                        // producer at the matching wr_ptr,
+                                        // the producer's per-face write
+                                        // ordering is wrong for BFP8.
+                                        uint32_t u39_f0m_w0 = u37_p[16];
+                                        uint32_t u39_f0m_w1 = u37_p[17];
+                                        uint32_t u39_f0m_w2 = u37_p[18];
+                                        uint32_t u39_f0m_w3 = u37_p[19];
+                                        uint32_t u39_f1m_w0 = u37_p[80];
+                                        uint32_t u39_f1m_w1 = u37_p[81];
+                                        uint32_t u39_f1m_w2 = u37_p[82];
+                                        uint32_t u39_f1m_w3 = u37_p[83];
+                                        uint32_t u39_f2m_w0 = u37_p[144];
+                                        uint32_t u39_f2m_w1 = u37_p[145];
+                                        uint32_t u39_f2m_w2 = u37_p[146];
+                                        uint32_t u39_f2m_w3 = u37_p[147];
+                                        DPRINT << "[U39_READ_EXT elf=0x" << HEX()
+                                               << u37_elf_tag
+                                               << " rd_l1=0x" << u37_rd_l1
+                                               << " f0m@64=[0x"
+                                               << u39_f0m_w0 << " 0x" << u39_f0m_w1
+                                               << " 0x" << u39_f0m_w2 << " 0x" << u39_f0m_w3
+                                               << "] f1m@320=[0x"
+                                               << u39_f1m_w0 << " 0x" << u39_f1m_w1
+                                               << " 0x" << u39_f1m_w2 << " 0x" << u39_f1m_w3
+                                               << "] f2m@576=[0x"
+                                               << u39_f2m_w0 << " 0x" << u39_f2m_w1
+                                               << " 0x" << u39_f2m_w2 << " 0x" << u39_f2m_w3
+                                               << "]" << DEC() << ENDL();
+#endif
                                     }
                                 }
                             ));

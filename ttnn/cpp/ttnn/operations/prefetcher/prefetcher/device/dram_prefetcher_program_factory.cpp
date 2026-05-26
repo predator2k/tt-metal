@@ -252,6 +252,17 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
             writer_defines["SGLANG_TT_U37_PROD_BYTES"] = "1";
         }
     }
+    // U39 (Suspect 5) — extend U37 producer-byte dump to cover face-0
+    // mantissa (byte 64), face-1 mantissa (byte 320), and face-2 mantissa
+    // (byte 576) so we can verify byte-match BEYOND the shared-exponent
+    // prefix.  Requires SGLANG_TT_U37_PROD_BYTES=1 to actually fire.
+    // Default-off so non-debug builds are untouched.
+    {
+        const char* env = std::getenv("SGLANG_TT_U39_EXT_BYTES");
+        if (env != nullptr && std::string(env) == "1") {
+            writer_defines["SGLANG_TT_U39_EXT_BYTES"] = "1";
+        }
+    }
     auto writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/prefetcher/prefetcher/device/kernels/writer_l1.cpp",
