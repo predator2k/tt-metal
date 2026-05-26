@@ -1147,7 +1147,159 @@ class Prefetcher(LightweightModule):
             os.environ.get("SGLANG_TT_U34_LCM_ALIGN", "0") == "1"
             and use_u33
         )
+        # U35 — *per-layer* producer-trajectory simulation.  Discovered
+        # 2026-05-25: U34's simulation correctly matches the producer for
+        # LAYER 0 only.  Page-sizes for different tensors are incommensurate
+        # with the GCB (e.g. 13824 doesn't divide 835584 exactly: 835584 /
+        # 13824 = 60.45), so the producer's `fifo_wr_ptr` at the start of
+        # layer N+1 differs from its position at the start of layer N.  But
+        # U34 returns the SAME (layer-0) offset for every layer's
+        # ttnn.linear, so layers 1+ read from positions where the producer
+        # has NOT written this tensor's data.  Fix: simulate the FULL
+        # cumulative trajectory across all (layer, t) pairs preceding the
+        # current call.  Caller passes the layer-specific tensor; we
+        # recover layer_idx = idx // num_tensors and per_layer_idx = idx
+        # % num_tensors and simulate through layer_idx layers worth of
+        # tensors, then through per_layer_idx tensors of this layer.
+        use_u35 = (
+            os.environ.get("SGLANG_TT_U35_PER_LAYER_OFFSET", "0") == "1"
+            and use_u34
+        )
         gcb_size = self.max_tensor_block_size if self.max_tensor_block_size > 0 else 1
+        if use_u35:
+            try:
+                num_blocks = int(self.ring_size)
+            except Exception:
+                num_blocks = 32
+            if num_blocks <= 0:
+                num_blocks = 32
+
+            # Recover per-tensor page_size from registered consumer bytes.
+            # Same as U34, but we need ALL num_tensors page sizes to simulate
+            # full layer rotations + iteration continuity.
+            page_sizes = []
+            for i in range(self.num_tensors if self.num_tensors > 0 else 0):
+                cb_i = (
+                    int(self._tensor_consumer_bytes[i])
+                    if i < len(self._tensor_consumer_bytes)
+                    else 0
+                )
+                ps_i = cb_i // num_blocks if cb_i > 0 else 0
+                page_sizes.append(ps_i)
+            # If any page_size is still 0 (registrations not complete),
+            # fall through to U34 — preserves iter-1 best-effort behavior.
+            if any(ps <= 0 for ps in page_sizes):
+                pass
+            else:
+                layer_idx = idx // self.num_tensors if self.num_tensors > 0 else 0
+                # U35 v2 — STATEFUL simulation across iterations.
+                # The PRODUCER (writer_l1.cpp) calls
+                # `update_remote_cb_config_in_l1` at the end of EACH kernel
+                # call, persisting the current fifo_wr_ptr to L1 config.
+                # The NEXT prefetcher call (next decode token) starts from
+                # that saved wr_ptr — NOT from fifo_start.  So iter 2's
+                # "layer 0 tensor 0" offset is NOT zero; it's wherever iter
+                # 1 left off (e.g. 339456 in the producer trace).
+                #
+                # To get this right, we maintain a Python-side simulator
+                # state (`self._u35_state_wr_ptr`) that advances by exactly
+                # one tensor's worth of writes on EACH call.  Caller is
+                # expected to call get_tensor_gcb_offset_bytes 1:1 with
+                # ttnn.linear dispatches in (L=0..num_layers, t=0..num_tensors)
+                # order — which matches the producer's writer_l1 loop.
+                #
+                # Initialize state on first call.
+                if not hasattr(self, "_u35_state_wr_ptr"):
+                    self._u35_state_wr_ptr = 0
+                    self._u35_state_next_call_lt = (0, 0)
+                    self._u35_call_count = 0
+                # If the caller's (L, t) doesn't match our state's
+                # expected next position, we may have a per-call cache-hit
+                # double-fetch or a re-init.  Detect this by comparing the
+                # CURRENT call's (layer_idx, per_layer_idx) vs the
+                # advanced-state's expected next (L, t).  If mismatched,
+                # re-sync.
+                expected_L, expected_t = self._u35_state_next_call_lt
+                if (layer_idx, per_layer_idx) != (expected_L, expected_t):
+                    # Likely a same-call duplicate (mlp.py's set_offset_for
+                    # might be called once, ttnn.linear runs, and on cache
+                    # hit the override re-reads — but Python only calls
+                    # this once per ttnn.linear, so this branch is for
+                    # init/re-warmup).  Reset to layer 0, tensor 0 and
+                    # advance forward until we hit the asked (L, t).
+                    # NOTE: this also serves to (re-)synchronize after a
+                    # prefill, which has its own ordering pattern.
+                    self._u35_state_wr_ptr = 0
+                    sim_L, sim_t = 0, 0
+                    # Fast-forward by simulating writes until we reach the
+                    # asked (layer_idx, per_layer_idx).
+                    cur_L, cur_t = 0, 0
+                    while (cur_L, cur_t) != (layer_idx, per_layer_idx):
+                        ps_cur = page_sizes[cur_t]
+                        cb_size_pa_cur = gcb_size - (gcb_size % ps_cur)
+                        fifo_limit_pa_cur = cb_size_pa_cur if cb_size_pa_cur > 0 else gcb_size
+                        if (self._u35_state_wr_ptr % ps_cur) != 0:
+                            self._u35_state_wr_ptr = ((self._u35_state_wr_ptr + ps_cur - 1) // ps_cur) * ps_cur
+                        if self._u35_state_wr_ptr >= fifo_limit_pa_cur:
+                            self._u35_state_wr_ptr = 0
+                        for _ in range(num_blocks):
+                            self._u35_state_wr_ptr += ps_cur
+                            if self._u35_state_wr_ptr == fifo_limit_pa_cur:
+                                self._u35_state_wr_ptr = 0
+                            elif self._u35_state_wr_ptr > fifo_limit_pa_cur:
+                                self._u35_state_wr_ptr = self._u35_state_wr_ptr - fifo_limit_pa_cur
+                        cur_t += 1
+                        if cur_t >= self.num_tensors:
+                            cur_t = 0
+                            cur_L += 1
+                            if cur_L >= self.num_layers:
+                                cur_L = 0  # wrap on multi-iteration; shouldn't happen pre-call
+
+                # Now state_wr_ptr is the producer's fifo_wr_ptr just
+                # before writing the asked (layer_idx, per_layer_idx).
+                # Apply the resize-up alignment to get the actual start.
+                ps = page_sizes[per_layer_idx]
+                cb_size_pa = gcb_size - (gcb_size % ps)
+                fifo_limit_pa = cb_size_pa if cb_size_pa > 0 else gcb_size
+                wr_ptr = self._u35_state_wr_ptr
+                if (wr_ptr % ps) != 0:
+                    wr_ptr = ((wr_ptr + ps - 1) // ps) * ps
+                if wr_ptr >= fifo_limit_pa:
+                    wr_ptr = 0
+
+                # Log first few unique (call_count, wr_ptr) tuples.
+                if not hasattr(self, "_u35_logged"):
+                    self._u35_logged = 0
+                if self._u35_logged < 30:
+                    self._u35_logged += 1
+                    logger.info(
+                        f"[U35_RETURN_V2] call={self._u35_call_count} "
+                        f"L={layer_idx} t={per_layer_idx} offset={wr_ptr} "
+                        f"ps={ps} state_pre={self._u35_state_wr_ptr}"
+                    )
+                self._u35_call_count += 1
+
+                # Advance state for the NEXT call.
+                wr_after = wr_ptr
+                for _ in range(num_blocks):
+                    wr_after += ps
+                    if wr_after == fifo_limit_pa:
+                        wr_after = 0
+                    elif wr_after > fifo_limit_pa:
+                        wr_after = wr_after - fifo_limit_pa
+                self._u35_state_wr_ptr = wr_after
+                # Set up expected next (L, t) — advance per-layer.
+                next_t = per_layer_idx + 1
+                next_L = layer_idx
+                if next_t >= self.num_tensors:
+                    next_t = 0
+                    next_L = layer_idx + 1
+                    if next_L >= self.num_layers:
+                        next_L = 0  # wraps for next iteration
+                self._u35_state_next_call_lt = (next_L, next_t)
+
+                return wr_ptr
+
         if use_u34:
             # Recover per-tensor page_size from the registered consumer bytes:
             # consumer_bytes[t] = num_blocks * page_size[t]; page_size[t] =

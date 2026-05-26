@@ -2495,6 +2495,18 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u32_gcb_offset_env != nullptr && std::string(u32_gcb_offset_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U32_GCB_OFFSET"] = "1";
         }
+        // U35 — env-gated kernel-side DPRINT of the offset RT arg actually
+        // received by the compute kernel.  Off by default; canonical
+        // bytewise-equal under U35=0.  When U35=1 the gathered compute
+        // kernel prints one [U35_KERNEL_OFFSET ...] line per worker core
+        // per program-launch (b==0 only).
+        const char* u35_off_probe_env = std::getenv("SGLANG_TT_U35_KERNEL_OFFSET_PROBE");
+        if (u35_off_probe_env != nullptr && std::string(u35_off_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U35_KERNEL_OFFSET_PROBE"] = "1";
+        }
+        // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
+        // (forwarded via mm_in1_kernel_defines mechanism, plumbed
+        // separately into the prefetcher program factory below).
         const char* u29_sig_env = std::getenv("SGLANG_TT_U29_W2_RS_SIGNALER");
         // U29 Phase 2 v3 — additional env gate `SGLANG_TT_U29_W2_PRODUCER_NOW`
         // distinguishes W2 (which should increment the counter) from all

@@ -28,6 +28,18 @@
 #include "api/debug/dprint_tile.h"  // CB_WR_PTR / cb_addr_shift
 #endif
 
+#if defined(SGLANG_TT_U35_KERNEL_OFFSET_PROBE)
+// U35 — verify the offset RT arg actually reaches the kernel.  Prints
+// the value once per worker (first batch iter, UNPACK risc) so we can
+// correlate with the Python-set SGLANG_TT_U32_GCB_TENSOR_OFFSET_BYTES
+// for each tensor.  No-op unless the env-gated define is propagated
+// through the matmul factory (mm_kernel_defines).
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -331,6 +343,25 @@ void kernel_main() {
         // units (1 unit = L1_ALIGNMENT bytes); add the offset in the
         // same shifted units.  ring_idx advancement (below) then steps
         // by ring_idx * block_size_bytes / L1_ALIGNMENT from this base.
+        #ifdef SGLANG_TT_U35_KERNEL_OFFSET_PROBE
+        // U35 — print the offset RT arg ACTUALLY received by the kernel,
+        // along with the CB's fifo_start (in shifted units) and the
+        // computed new rd_ptr.  Once per batch iter (b==0); UNPACK side
+        // only (a single risc print per worker core per launch).  This
+        // proves whether the Python-side env var → factory RT arg →
+        // kernel reception path is intact, OR whether the kernel sees
+        // 0 / a stale value despite the Python side passing the right
+        // value.
+        if (b == 0) {
+            UNPACK((DPRINT << "[U35_KERNEL_OFFSET ring_idx=" << ring_idx
+                           << " offset_bytes=" << u32_tensor_offset_bytes
+                           << " in1_block_size_bytes=" << in1_block_size_bytes
+                           << " in1_cb_start_shifted=" << in1_cb_start_addr
+                           << " new_rd_ptr_shifted="
+                           << (in1_cb_start_addr + u32_tensor_offset_bytes / L1_ALIGNMENT)
+                           << "]" << ENDL()));
+        }
+        #endif
         UNPACK((update_local_cb_rd_ptr(
             in1_cb_id,
             in1_cb_start_addr + u32_tensor_offset_bytes / L1_ALIGNMENT)));
