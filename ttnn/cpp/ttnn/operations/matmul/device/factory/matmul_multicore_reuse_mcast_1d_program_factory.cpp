@@ -2520,6 +2520,16 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u36_trace_env != nullptr && std::string(u36_trace_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U36_RDPTR_TRACE"] = "1";
         }
+        // U37 — ground-truth byte-level diagnostic.  At the moment matmul_block
+        // fires, dump the first 16 bytes of L1 at the kernel's actual read
+        // address.  Cross-correlate with U37_PROD_BYTES from writer_l1.cpp
+        // (env-gated via SGLANG_TT_U37_PROD_BYTES at the prefetcher program
+        // factory) to discriminate producer-side write skew vs post-producer
+        // L1 stomp.  Default-off; canonical bytewise-equal when unset.
+        const char* u37_read_env = std::getenv("SGLANG_TT_U37_READ_BYTES");
+        if (u37_read_env != nullptr && std::string(u37_read_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U37_READ_BYTES"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).

@@ -56,6 +56,28 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U37_READ_BYTES)
+// U37 — ground-truth byte-level diagnostic.  At the moment matmul_block
+// fires, read the first 16 bytes of L1 at the kernel's actual read
+// address (= fifo_rd_ptr * L1_ALIGNMENT in real L1 bytes) and DPRINT
+// them as two 64-bit hex words.  These bytes are what the matmul SEES
+// and consumes as in1.  Cross-correlate against producer's intended
+// bytes (U37_PROD_BYTES from writer_l1.cpp) to discriminate:
+//   match     → bytes correctly delivered; bug lives in compute/PACK
+//   divergent → producer wrote different bytes OR L1 stomp between
+// Per-kernel-static budget keeps log bounded.  Gated to
+// (ring_idx, block) == (0, 0) so we focus on the first read after
+// per-tensor offset placement.
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#ifndef SGLANG_TT_TENSIX_INCLUDED
+#define SGLANG_TT_TENSIX_INCLUDED
+#include "tensix.h"
+#endif
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -577,6 +599,63 @@ void kernel_main() {
                     uint32_t in1_index = in1_index_subblock_offset;  // offset into in1 block
                     // inner dim that we accumulate is the inner dim of in0/in1, which is in0_block_w
                     for (uint32_t inner_dim_idx = 0; inner_dim_idx < unpadded_in0_block_w; ++inner_dim_idx) {
+#ifdef SGLANG_TT_U37_READ_BYTES
+                        // U37 — ground-truth byte-level probe.  Dump the first
+                        // 16 bytes of L1 at the kernel's actual read address
+                        // RIGHT BEFORE matmul_block consumes them.  Gated to
+                        // (ring_idx==0, b==0, block==0, in0_subblock==0,
+                        // in1_subblock==0, inner_dim_idx==0) so we get a single
+                        // dump per worker core per program-launch focused on
+                        // the very first read of the per-tensor-offset region.
+                        // The ELF tag identifies which matmul (FF1/FF2/WO/WQKV)
+                        // is running.  Bytes are printed as 4 hex32 words.
+                        // tensix_sync() drains pipelined writes per U13 lesson.
+                        if (ring_idx == 0 && b == 0 && block == 0 &&
+                            in0_subblock == 0 && in1_subblock == 0 &&
+                            inner_dim_idx == 0) {
+                            constexpr uint32_t u37_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u37_budget = 8;
+                            UNPACK((
+                                {
+                                    if (u37_budget > 0) {
+                                        u37_budget--;
+                                        ckernel::tensix_sync();
+                                        uint32_t u37_rd_shifted =
+                                            get_local_cb_rd_ptr(in1_cb_id);
+                                        // fifo_rd_ptr is in L1_ALIGNMENT units
+                                        // (1 unit = 16 bytes on Blackhole).
+                                        // Real L1 byte address = shifted * 16.
+                                        uint32_t u37_rd_l1 =
+                                            u37_rd_shifted * L1_ALIGNMENT;
+                                        volatile uint32_t* u37_p =
+                                            (volatile uint32_t*)u37_rd_l1;
+                                        uint32_t u37_w0 = u37_p[0];
+                                        uint32_t u37_w1 = u37_p[1];
+                                        uint32_t u37_w2 = u37_p[2];
+                                        uint32_t u37_w3 = u37_p[3];
+                                        DPRINT << "[U37_READ elf=0x" << HEX()
+                                               << u37_elf_tag
+                                               << DEC()
+                                               << " ring=" << ring_idx
+                                               << " in1bs=" << in1_block_size_bytes
+                                               << " rd_l1=0x" << HEX() << u37_rd_l1
+                                               << " w=[0x" << u37_w0
+                                               << " 0x" << u37_w1
+                                               << " 0x" << u37_w2
+                                               << " 0x" << u37_w3 << "]"
+                                               << DEC() << "]" << ENDL();
+                                    }
+                                }
+                            ));
+                        }
+#endif
                         // matmul outer product of (out_subblock_h x out_subblock_w) tiles that fill dst
                         // accumulation is done by iterating matmul_block across inner dim
                         // in0_block_w is passed as innder dim (kt) to matmul_block, internally used to stride in0

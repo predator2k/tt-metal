@@ -301,6 +301,65 @@ class MLP(LightweightModule):
                         self.w2_pdg if self._permuted_dram_grid and self.w2_pdg is not None else self.w2
                     )
 
+                # U37 — ground-truth byte dump.  When SGLANG_TT_U37_GT_BYTES=1
+                # is set, dump the FIRST 16 bytes of W1/W3/W2 weight tensor
+                # for layer 0 via ttnn.to_torch.  These are the bytes the
+                # producer SHOULD read from DRAM and write into each
+                # receiver's L1 GCB region.  Cross-correlate with
+                # SGLANG_TT_U37_PROD_BYTES (producer's pre-NoC source bytes)
+                # and SGLANG_TT_U37_READ_BYTES (matmul kernel's read bytes)
+                # to detect (a) producer-side write skew (b) post-producer
+                # L1 stomp.  Only fires on layer 0 (layer_num == 0).
+                # IMPORTANT: ttnn.to_torch on a DRAM-sharded BFP4/BFP8
+                # tensor un-tilizes and un-encodes back to BF16/float,
+                # so the BYTE comparison must compare encoded-form bytes.
+                # We dump the raw tile-0 bytes via .cpu().to_torch_with_padded_shape()
+                # if available, else via the device buffer read.
+                import os as _u37_os
+                if _u37_os.environ.get("SGLANG_TT_U37_GT_BYTES", "0") == "1" \
+                        and layer_num == 0:
+                    try:
+                        from loguru import logger as _u37_log
+                    except Exception:
+                        _u37_log = None
+                    for _u37_name, _u37_t in (
+                        ("W1", self.w1),
+                        ("W3", self.w3),
+                        ("W2", self.w2),
+                    ):
+                        try:
+                            _u37_dt = str(_u37_t.dtype)
+                            _u37_shape = list(_u37_t.shape)
+                            _u37_addr = _u37_t.buffer_address()
+                            # Read raw tile bytes from device buffer.
+                            # buffer.read_pages reads encoded bytes
+                            # exactly as the producer would see them.
+                            _u37_torch_pt = ttnn.to_torch(_u37_t).cpu().contiguous()
+                            _u37_flat = _u37_torch_pt.view(-1)
+                            _u37_first_vals = _u37_flat[:8].tolist()
+                            # Encoded raw bytes via numpy view of underlying tensor
+                            import numpy as _u37_np
+                            try:
+                                _u37_arr = _u37_torch_pt.view(torch.uint8) \
+                                    if _u37_torch_pt.dtype == torch.uint8 \
+                                    else _u37_torch_pt.flatten().contiguous().view(torch.uint8)
+                                _u37_first_bytes = _u37_arr[:16].tolist()
+                            except Exception as _u37_e:
+                                _u37_first_bytes = f"<err:{_u37_e}>"
+                            msg = (
+                                f"[U37_GT name={_u37_name} layer={layer_num} "
+                                f"dt={_u37_dt} shape={_u37_shape} "
+                                f"addr=0x{_u37_addr:x} "
+                                f"first_vals={_u37_first_vals} "
+                                f"first_raw_bytes={_u37_first_bytes}]"
+                            )
+                            if _u37_log is not None:
+                                _u37_log.info(msg)
+                            else:
+                                print(msg, flush=True)
+                        except Exception as _u37_e:
+                            print(f"[U37_GT name={_u37_name} ERROR: {_u37_e}]", flush=True)
+
             self.prefetcher.register_callback(register_weights)
         else:
             self._skip_w1 = False

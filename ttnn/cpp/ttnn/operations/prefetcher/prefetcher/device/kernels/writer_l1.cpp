@@ -120,6 +120,47 @@ void kernel_main() {
                         }
                     }
 #endif
+#ifdef SGLANG_TT_U37_PROD_BYTES
+                    // U37 — ground-truth byte-level probe at the PRODUCER.
+                    // Dump the first 16 bytes of local_cb_addr (= the SOURCE
+                    // bytes being NoC-written to each receiver's GCB region)
+                    // for each (layer, t, block) we care about.  Gated to
+                    // (layer==0, block==0) to cap the log to one dump per
+                    // tensor per receiver-write.  These bytes are what each
+                    // receiver's L1 SHOULD see at its rd_ptr for that
+                    // (tensor, ring slot) pair.  Cross-correlate with
+                    // U37_READ from the matmul compute kernel to find:
+                    //   match     → bytes correctly delivered
+                    //   divergent → producer's intended bytes != consumer's
+                    //                read bytes (post-producer L1 stomp OR
+                    //                NoC dst skew)
+                    {
+                        static uint32_t u37_pb_budget = 64;
+                        if (layer == 0 && block == 0 && u37_pb_budget > 0) {
+                            u37_pb_budget--;
+                            auto& _u37_remote_cb =
+                                get_remote_sender_cb_interface(remote_cb_id);
+                            uint32_t _u37_wr_ptr = _u37_remote_cb.fifo_wr_ptr;
+                            volatile uint32_t* _u37_src =
+                                (volatile uint32_t*)local_cb_addr;
+                            uint32_t _u37_w0 = _u37_src[0];
+                            uint32_t _u37_w1 = _u37_src[1];
+                            uint32_t _u37_w2 = _u37_src[2];
+                            uint32_t _u37_w3 = _u37_src[3];
+                            DPRINT << "[U37_PROD layer=" << layer
+                                   << " t=" << t
+                                   << " blk=" << block
+                                   << " local_cb=0x" << HEX() << local_cb_addr
+                                   << " wr_ptr=0x" << _u37_wr_ptr
+                                   << " w=[0x" << _u37_w0
+                                   << " 0x" << _u37_w1
+                                   << " 0x" << _u37_w2
+                                   << " 0x" << _u37_w3 << "]"
+                                   << DEC() << " bsz=" << curr_block_size_per_receiver
+                                   << "]" << ENDL();
+                        }
+                    }
+#endif
                     experimental::remote_cb_push_back_and_write_pages<skip_ptr_update>(
                         remote_cb_id,
                         local_cb_addr,

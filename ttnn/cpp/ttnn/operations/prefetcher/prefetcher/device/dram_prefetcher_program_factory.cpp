@@ -241,6 +241,17 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
             writer_defines["SGLANG_TT_U25_RCB_PROBE"] = "1";
         }
     }
+    // U37 — ground-truth byte-level diagnostic at the producer.  Dump
+    // first 16 bytes of local_cb_addr (= the SOURCE bytes NoC-written
+    // to each receiver) for (layer=0, block=0) per tensor.  Pair with
+    // SGLANG_TT_U37_READ_BYTES at the matmul factory to cross-correlate
+    // producer-intended bytes vs consumer-read bytes.  Default-off.
+    {
+        const char* env = std::getenv("SGLANG_TT_U37_PROD_BYTES");
+        if (env != nullptr && std::string(env) == "1") {
+            writer_defines["SGLANG_TT_U37_PROD_BYTES"] = "1";
+        }
+    }
     auto writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/prefetcher/prefetcher/device/kernels/writer_l1.cpp",
