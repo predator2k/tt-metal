@@ -78,6 +78,39 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U40_FORCE_UNPACK_RECONFIG) || \
+    defined(SGLANG_TT_U40_RECONFIG_BLOCK) || \
+    defined(SGLANG_TT_U40_PROBE_TILE_DIMS)
+// U40 (Suspect 2 — LLK BFP8 unpacker internal stride/state setup).
+// After U37+U38+U39 ruled out byte delivery, fp32_dest, face stride,
+// and CB-meta fifo_page_size as root causes, the only remaining
+// viable suspect is the LLK unpacker's per-CB internal state setup
+// on the gathered code path.  `reconfig_data_format_srca` calls
+// `llk_unpack_reconfig_data_format_srca_impl_` which:
+//   - cfg_reg_rmw_tensix<THCON_SEC0_REG0_TileDescriptor>(src_format)
+//   - cfg_reg_rmw_tensix<THCON_SEC0_REG2_Out_data_format>(dst_format)
+//   - TT_SETDMAREG TILE_SIZE_A = fifo_page_size
+// On the gathered path, `mm_block_init` runs ONCE at the top of the
+// kernel.  Subsequent kernel re-entries (when the JIT-compiled binary
+// is reused across multiple matmul programs with different in1 CB data
+// formats) may inherit STALE THCON_SEC0 state from whichever matmul
+// ran on the same compute tile last.  In the canonical (non-gathered)
+// path, this issue is masked because the in1 CB allocation pattern is
+// different.  Forcing an explicit reconfig at top of each batch
+// re-programs THCON_SEC0 from the current in1_cb_id metadata.
+//
+// SGLANG_TT_U40_FORCE_UNPACK_RECONFIG — once per batch (top of for-b).
+// SGLANG_TT_U40_RECONFIG_BLOCK     — once per block (more aggressive).
+// SGLANG_TT_U40_PROBE_TILE_DIMS    — DPRINT the per-CB unpack tile-dim
+//                                    metadata observed by the LLK at
+//                                    init time; once per worker core.
+#include "api/compute/reconfig_data_format.h"
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -380,6 +413,73 @@ void kernel_main() {
     mm_block_init(
         in0_cb_id, in1_cb_id, mm_partials_cb_ids[0], in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
 
+#ifdef SGLANG_TT_U40_PROBE_TILE_DIMS
+    // U40 — probe the per-CB unpack tile-dim metadata observed by the LLK
+    // at init time.  These are the values that `_llk_unpack_AB_matmul_init_`
+    // uses for the partial_face / face_r_dim / num_faces controls AND that
+    // `_llk_unpack_hw_configure_` uses for tile_size / face geometry.  If
+    // gathered path metadata differs from canonical path's for the SAME
+    // BFP8 operand (in1), this is the root cause of Suspect 2.  One DPRINT
+    // per worker core per program launch.
+    {
+        constexpr uint32_t u40_elf_tag =
+            (in0_block_w * 1u) ^
+            (in0_num_subblocks * 131u) ^
+            (in1_num_subblocks * 17u) ^
+            (num_blocks * 7919u) ^
+            (out_subblock_h * 31u) ^
+            (out_subblock_w * 257u) ^
+            (batch * 65537u);
+        static uint32_t u40_probe_budget = 8;
+        UNPACK((
+            {
+                if (u40_probe_budget > 0) {
+                    u40_probe_budget--;
+                    const uint32_t in0_id = get_operand_id(in0_cb_id);
+                    const uint32_t in1_id = get_operand_id(in1_cb_id);
+                    // unpA = in1 (srcA), unpB = in0 (srcB) per LLK comment.
+                    DPRINT << "[U40_TILEDIMS elf=0x" << HEX() << u40_elf_tag
+                           << DEC()
+                           << " in1_cb=" << in1_cb_id
+                           << " in1_face_r=" << get_operand_face_r_dim(in1_id)
+                           << " in1_num_faces=" << get_operand_num_faces(in1_id)
+                           << " in1_partial=" << get_operand_partial_face(in1_id)
+                           << " in1_narrow=" << get_operand_narrow_tile(in1_id)
+                           << " in1_src_fmt=0x" << HEX() << get_operand_src_format(in1_id)
+                           << " in1_dst_fmt=0x" << get_operand_dst_format(in1_id)
+                           << DEC()
+                           << " in0_cb=" << in0_cb_id
+                           << " in0_face_r=" << get_operand_face_r_dim(in0_id)
+                           << " in0_num_faces=" << get_operand_num_faces(in0_id)
+                           << " in0_partial=" << get_operand_partial_face(in0_id)
+                           << " in0_narrow=" << get_operand_narrow_tile(in0_id)
+                           << " in0_src_fmt=0x" << HEX() << get_operand_src_format(in0_id)
+                           << " in0_dst_fmt=0x" << get_operand_dst_format(in0_id)
+                           << DEC() << "]" << ENDL();
+                }
+            }
+        ));
+    }
+#endif
+
+#ifdef SGLANG_TT_U40_FORCE_UNPACK_RECONFIG
+    // U40 Path C — force an explicit UNPACK reconfig RIGHT AFTER mm_block_init.
+    // mm_block_init's `llk_unpack_hw_configure` programs THCON_SEC0/SEC1 from
+    // CB metadata, BUT under static JIT caching on the gathered code path,
+    // the per-CB tile_dims metadata may have been incorrectly inherited from
+    // a sibling kernel-binary's pre-existing state.  Calling
+    // reconfig_data_format_srca/srcb explicitly with (old=new) re-issues the
+    // tile_descriptor / out_data_format / TILE_SIZE_A/B writes from the
+    // CURRENT CB metadata.  This is what mm_block_init_short_with_dt already
+    // does inside reload_from_cb_to_dst — we bring that same reconfig to
+    // the START of the matmul, before any matmul_block can fire.
+    //
+    // reconfig_data_format_srca(srca_new=in1_cb_id) — in1 → srcA → THCON_SEC0
+    // reconfig_data_format_srcb(srcb_new=in0_cb_id) — in0 → srcB → THCON_SEC1
+    reconfig_data_format_srca(in1_cb_id);
+    reconfig_data_format_srcb(in0_cb_id);
+#endif
+
 #ifdef SGLANG_TT_PREFETCHER_DST_ZERO
     // U9: Explicit DST zero before any matmul accumulation. mm_block_init's
     // llk_math_pack_sync_init only resets the dest_offset_id / section base
@@ -591,6 +691,25 @@ void kernel_main() {
                             out_subblock_h,
                             in0_block_w);
                     }
+#ifdef SGLANG_TT_U40_RECONFIG_BLOCK
+                    // U40 — most aggressive: force a fresh srcA/srcB UNPACK
+                    // reconfig before EVERY subblock's matmul_block.  Useful
+                    // if the once-per-batch FORCE_UNPACK_RECONFIG variant is
+                    // not sufficient (e.g. if some other kernel between
+                    // matmul_block calls perturbs THCON_SEC0/SEC1 state).
+                    // Expensive (re-issues CFG writes per subblock) but
+                    // diagnostic-only — used to isolate whether reconfig
+                    // frequency matters.
+                    if (in0_subblock == 0 && in1_subblock == 0) {
+                        reconfig_data_format_srca(in1_cb_id);
+                        reconfig_data_format_srcb(in0_cb_id);
+                        // Re-establish matmul-mode MOP after reconfig (per
+                        // mm_block_init_short_with_dt pattern).
+                        mm_block_init_short(
+                            in0_cb_id, in1_cb_id, in1_transpose_tile,
+                            out_subblock_w, out_subblock_h, in0_block_w);
+                    }
+#endif
 
 #ifndef SKIP_COMPUTE
                     // Compute output sub-block

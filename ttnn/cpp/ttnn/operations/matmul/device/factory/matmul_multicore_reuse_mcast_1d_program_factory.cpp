@@ -2555,6 +2555,46 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u39_meta_env != nullptr && std::string(u39_meta_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U39_CB_META"] = "1";
         }
+        // U40 (Suspect 2 — LLK BFP8 unpacker internal stride/state setup) —
+        // U37+U38+U39 ruled out byte delivery, fp32_dest×BFP8 interaction,
+        // BFP8 face stride beyond byte 256, and LocalCBInterface fifo_page_size
+        // corruption.  Only Suspect 2 (LLK unpacker state on the gathered
+        // code path) remains viable.  3 env-gated knobs:
+        //
+        //  SGLANG_TT_U40_PROBE_TILE_DIMS       — DPRINT per-CB unpack tile
+        //                                         metadata observed by LLK
+        //                                         (face_r_dim / num_faces /
+        //                                          partial_face / src_fmt /
+        //                                          dst_fmt) at init time.
+        //                                         Used to verify U38 actually
+        //                                         propagated tile metadata.
+        //
+        //  SGLANG_TT_U40_FORCE_UNPACK_RECONFIG — Path C.  After mm_block_init,
+        //                                         force an explicit
+        //                                         reconfig_data_format_srca/
+        //                                         srcb call to re-issue the
+        //                                         CFG writes from CURRENT CB
+        //                                         metadata, bypassing any
+        //                                         stale per-CB tile_size /
+        //                                         tile_descriptor state.
+        //
+        //  SGLANG_TT_U40_RECONFIG_BLOCK        — most aggressive: reconfig
+        //                                         BEFORE every subblock's
+        //                                         matmul_block, plus
+        //                                         mm_block_init_short to
+        //                                         re-establish the MOP.
+        const char* u40_probe_env = std::getenv("SGLANG_TT_U40_PROBE_TILE_DIMS");
+        if (u40_probe_env != nullptr && std::string(u40_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U40_PROBE_TILE_DIMS"] = "1";
+        }
+        const char* u40_force_env = std::getenv("SGLANG_TT_U40_FORCE_UNPACK_RECONFIG");
+        if (u40_force_env != nullptr && std::string(u40_force_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U40_FORCE_UNPACK_RECONFIG"] = "1";
+        }
+        const char* u40_block_env = std::getenv("SGLANG_TT_U40_RECONFIG_BLOCK");
+        if (u40_block_env != nullptr && std::string(u40_block_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U40_RECONFIG_BLOCK"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).
