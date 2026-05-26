@@ -2624,6 +2624,20 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u41_arr_env != nullptr && std::string(u41_arr_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U41_UNPACK_ARR_PROBE"] = "1";
         }
+        // U43 — runtime DPRINT of unpacker cfg registers post-
+        // `_llk_unpack_hw_configure_`.  Empirically verifies U42's
+        // static-analysis claim that Unpack_limit_address /
+        // Unpack_fifo_size are zero, AND scans other suspect
+        // discriminators (Force_shared_exp, Ovrd_data_format,
+        // Unpack_data_format_cntx, TileDescriptor.NoBFPExpSection,
+        // TileDescriptor.DigestSize) per-ELF for any value that
+        // differentiates BFP4-clean (W1+W3 fused, elf 0x2db6e) from
+        // BFP8-garbage (WQKV/WO/W2, elfs 0x2d96e/0x2de6b/0x2df6a).
+        // Off by default — canonical bytewise-equal when unset.
+        const char* u43_cfg_env = std::getenv("SGLANG_TT_U43_CFG_DUMP");
+        if (u43_cfg_env != nullptr && std::string(u43_cfg_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U43_CFG_DUMP"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).

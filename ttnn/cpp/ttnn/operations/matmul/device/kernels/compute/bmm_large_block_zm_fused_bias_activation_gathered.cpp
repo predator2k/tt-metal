@@ -111,6 +111,49 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U43_CFG_DUMP)
+// U43 — runtime DPRINT of the unpacker config registers that determine
+// per-tile address arithmetic + format conversion.  Per the
+// tt-isa-docs/UNPACR_Regular.md functional model:
+//
+//   * THCON_SEC0 holds the WEIGHT side (matmul wires `address_a`→SEC0
+//     via `_llk_unpack_configure_addresses_(address_b, address_a, cfg)`
+//     in the active llk_unpack_AB_matmul.h — `address_a` is the in1
+//     tile addr / Unpacker 0 / SrcA / BFP8 path).
+//   * Words 120-123 = REG2_*: out_data_format / throttle / context /
+//     haloize / tileize / src_reg_set_upd / if_sel / upsample /
+//     Ovrd_data_format / upsample_and_interleave / shift_amount_cntx
+//     (word 120); disable_zero_compress_cntx + if_sel_cntx +
+//     Force_shared_exp + context_count_non_log2 (word 121);
+//     Unpack_limit_address (word 122); Unpack_fifo_size (word 123).
+//   * Word 124 = REG3_Base_address (current); 125 = REG3_Base_cntx1.
+//   * Word 140 = REG7_Offset_address AND REG7_Unpack_data_format_cntx0
+//     (overlapping fields in the same word).
+//   * Words 112-115 = REG0_TileDescriptor (in_data_format /
+//     IsUncompressed / NoBFPExpSection / XDim / YDim / ZDim / WDim /
+//     BlobsYStart / DigestSize).
+//
+// U42 refuted the `Unpack_limit_address` / `Unpack_fifo_size` WrapAddr
+// hypothesis by static analysis (cfg-reg writes never appear in
+// production code, only in a unit test).  U43 confirms / refutes
+// EMPIRICALLY and at the same time scans the OTHER suspect fields
+// (Force_shared_exp, Ovrd_data_format, Unpack_data_format_cntx,
+// TileDescriptor.NoBFPExpSection, TileDescriptor.DigestSize) for any
+// value that discriminates BFP4-clean (0x2db6e) from BFP8-garbage
+// (0x2d96e / 0x2de6b / 0x2df6a) ELFs.
+//
+// Per-ELF tag uses the same CT-arg-hash idiom as U37/U40/U41 so the
+// 4 distinct ELFs are easy to distinguish in the log.  Probe fires
+// once per worker core per program-launch (budget=8), at the TOP of
+// the outer-batch loop AFTER the mm_block_init() call has run, so we
+// observe the values the LLK actually programmed for this ELF.
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#include "ckernel.h"  // ckernel::cfg_read
+#endif
+
 #if defined(SGLANG_TT_U41_FACE3_PROBE) || defined(SGLANG_TT_U41_UNPACK_ARR_PROBE)
 // U41 (Final two suspects).
 //
@@ -466,6 +509,88 @@ void kernel_main() {
 
     mm_block_init(
         in0_cb_id, in1_cb_id, mm_partials_cb_ids[0], in1_transpose_tile, out_subblock_w, out_subblock_h, in0_block_w);
+
+#ifdef SGLANG_TT_U43_CFG_DUMP
+    // U43 — dump the unpacker config registers AS SEEN BY THE HW after
+    // `mm_block_init` ran its `_llk_unpack_hw_configure_` sequence.
+    // For each candidate suspect register (see header comment above),
+    // print the raw cfg-word value plus the per-ELF tag.  One DPRINT
+    // per worker core per program-launch (budget=8).  UNPACK side only
+    // because that's where the cfg state matters.
+    {
+        constexpr uint32_t u43_elf_tag =
+            (in0_block_w * 1u) ^
+            (in0_num_subblocks * 131u) ^
+            (in1_num_subblocks * 17u) ^
+            (num_blocks * 7919u) ^
+            (out_subblock_h * 31u) ^
+            (out_subblock_w * 257u) ^
+            (batch * 65537u);
+        static uint32_t u43_budget = 8;
+        UNPACK((
+            {
+                if (u43_budget > 0) {
+                    u43_budget--;
+                    // SEC0 = WEIGHT side (Unpacker 0 → SrcA).  This is
+                    // the BFP8/BFP4 path that diverges under
+                    // prefetcher.  Read raw cfg-words.
+                    const uint32_t s0_td0 = ckernel::cfg_read(
+                        THCON_SEC0_REG0_TileDescriptor_ADDR32 + 0);
+                    const uint32_t s0_td1 = ckernel::cfg_read(
+                        THCON_SEC0_REG0_TileDescriptor_ADDR32 + 1);
+                    const uint32_t s0_td2 = ckernel::cfg_read(
+                        THCON_SEC0_REG0_TileDescriptor_ADDR32 + 2);
+                    const uint32_t s0_td3 = ckernel::cfg_read(
+                        THCON_SEC0_REG0_TileDescriptor_ADDR32 + 3);
+                    const uint32_t s0_cfg0 = ckernel::cfg_read(
+                        THCON_SEC0_REG2_Out_data_format_ADDR32 + 0);  // word 120
+                    const uint32_t s0_cfg1 = ckernel::cfg_read(
+                        THCON_SEC0_REG2_Out_data_format_ADDR32 + 1);  // word 121
+                    const uint32_t s0_cfg2 = ckernel::cfg_read(
+                        THCON_SEC0_REG2_Out_data_format_ADDR32 + 2);  // word 122 = Unpack_limit_address
+                    const uint32_t s0_cfg3 = ckernel::cfg_read(
+                        THCON_SEC0_REG2_Out_data_format_ADDR32 + 3);  // word 123 = Unpack_fifo_size
+                    const uint32_t s0_base = ckernel::cfg_read(
+                        THCON_SEC0_REG3_Base_address_ADDR32);          // word 124
+                    const uint32_t s0_base_c1 = ckernel::cfg_read(
+                        THCON_SEC0_REG3_Base_cntx1_address_ADDR32);    // word 125
+                    const uint32_t s0_off_fmt = ckernel::cfg_read(
+                        THCON_SEC0_REG7_Offset_address_ADDR32);        // word 140 (overlap)
+                    // SEC1 = ACTIVATION side (Unpacker 1 → SrcB) for
+                    // comparison.
+                    const uint32_t s1_td0 = ckernel::cfg_read(
+                        THCON_SEC1_REG0_TileDescriptor_ADDR32 + 0);
+                    const uint32_t s1_cfg0 = ckernel::cfg_read(
+                        THCON_SEC1_REG2_Out_data_format_ADDR32 + 0);
+                    const uint32_t s1_cfg1 = ckernel::cfg_read(
+                        THCON_SEC1_REG2_Out_data_format_ADDR32 + 1);
+                    const uint32_t s1_cfg2 = ckernel::cfg_read(
+                        THCON_SEC1_REG2_Out_data_format_ADDR32 + 2);
+                    const uint32_t s1_cfg3 = ckernel::cfg_read(
+                        THCON_SEC1_REG2_Out_data_format_ADDR32 + 3);
+                    const uint32_t s1_base = ckernel::cfg_read(
+                        THCON_SEC1_REG3_Base_address_ADDR32);
+                    const uint32_t s1_off_fmt = ckernel::cfg_read(
+                        THCON_SEC1_REG7_Offset_address_ADDR32);
+                    DPRINT << "[U43_CFG_S0 elf=0x" << HEX() << u43_elf_tag
+                           << " td=[0x" << s0_td0 << " 0x" << s0_td1
+                           << " 0x" << s0_td2 << " 0x" << s0_td3
+                           << "] cfg=[0x" << s0_cfg0 << " 0x" << s0_cfg1
+                           << " 0x" << s0_cfg2 << " 0x" << s0_cfg3
+                           << "] base=0x" << s0_base << " base_c1=0x"
+                           << s0_base_c1 << " off_fmt=0x" << s0_off_fmt
+                           << "]" << DEC() << ENDL();
+                    DPRINT << "[U43_CFG_S1 elf=0x" << HEX() << u43_elf_tag
+                           << " td0=0x" << s1_td0
+                           << " cfg=[0x" << s1_cfg0 << " 0x" << s1_cfg1
+                           << " 0x" << s1_cfg2 << " 0x" << s1_cfg3
+                           << "] base=0x" << s1_base << " off_fmt=0x"
+                           << s1_off_fmt << "]" << DEC() << ENDL();
+                }
+            }
+        ));
+    }
+#endif
 
 #ifdef SGLANG_TT_U40_PROBE_TILE_DIMS
     // U40 — probe the per-CB unpack tile-dim metadata observed by the LLK
