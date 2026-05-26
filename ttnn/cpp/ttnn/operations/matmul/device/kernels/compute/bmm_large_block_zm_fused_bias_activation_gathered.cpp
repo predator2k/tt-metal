@@ -40,6 +40,22 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U36_RDPTR_TRACE) || defined(SGLANG_TT_U36_WRAP_FIX)
+// U36 — per-(ring_idx, block) rd_ptr trajectory trace + wrap-arithmetic fix.
+// Trace prints the rd_ptr AT THE TOP OF EACH BLOCK ITER (= what matmul_block
+// actually reads from), along with curr_block_index, fifo_limit, and the
+// in1_block_size.  This lets us correlate the kernel's actual reads against
+// the producer's known write positions.  Fix replaces the equality-based
+// `reach_limit` check with a pre-emptive `>= fifo_limit` wrap inside
+// `calculate_next_block_index_and_update_rd_ptr` — so non-zero per-tensor
+// start offsets that cause the per-block advance to land at or past
+// `fifo_limit` get wrapped to `cb_start_addr` BEFORE the read.
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -108,6 +124,45 @@ FORCE_INLINE void calculate_next_block_index_and_update_rd_ptr(
     uint32_t block_size_bytes_aligned = block_size_bytes / L1_ALIGNMENT;
     bool reach_limit = local_cb.fifo_rd_ptr == local_cb.fifo_limit;
     bool last_block = curr_block_index == (num_blocks - 1);
+#ifdef SGLANG_TT_U36_WRAP_FIX
+    // U36 — pre-emptive wrap that handles non-zero per-tensor start offsets
+    // correctly.  Without U36, the existing logic only wraps when rd_ptr
+    // lands EXACTLY at fifo_limit (`reach_limit = (==)`).  For zero start
+    // offset, this works because the per-block advance always lands exactly
+    // at fifo_limit (cb_size is page-aligned to block_size).  For a non-zero
+    // start offset, the per-block advance can ALSO land exactly at
+    // fifo_limit, BUT only after first going through positions strictly less
+    // than fifo_limit — and the SUBSEQUENT iter's read happens AT rd_ptr =
+    // fifo_limit (= cb_start when wrapped by the existing reach_limit branch
+    // mutation) — which works because cb_start_addr is mutated and the read
+    // hits cb_start_addr.  So the existing logic IS correct for the simple
+    // case.  However, when the start offset is NEAR the limit, the advance
+    // from one block to the next might skip OVER fifo_limit entirely (e.g.
+    // rd_ptr = fifo_limit - block_size/2 + block_size = fifo_limit +
+    // block_size/2 > fifo_limit, not ==).  Then `reach_limit` is FALSE,
+    // wrap never fires, and the next iter reads PAST fifo_limit (OOB or
+    // into the next tensor's region).  This U36 branch checks `>=` against
+    // fifo_limit and wraps by (next - fifo_limit) so the next iter reads
+    // from `cb_start_addr + (overshoot)` instead of OOB.
+    if (tensor_split) {
+        if (last_block) {
+            next_block_index = 0;
+            next_fifo_rd_ptr = rd_ptr_start_addr;
+        } else {
+            next_fifo_rd_ptr += block_size_bytes_aligned;
+            if (next_fifo_rd_ptr >= local_cb.fifo_limit) {
+                next_fifo_rd_ptr = cb_start_addr + (next_fifo_rd_ptr - local_cb.fifo_limit);
+            }
+        }
+    } else {
+        if (last_block) {
+            next_block_index = 0;
+            next_fifo_rd_ptr = rd_ptr_start_addr;
+        } else {
+            next_fifo_rd_ptr += block_size_bytes_aligned;
+        }
+    }
+#else
     if (tensor_split) {
         if (reach_limit) {
             local_cb.fifo_rd_ptr = cb_start_addr;
@@ -133,6 +188,7 @@ FORCE_INLINE void calculate_next_block_index_and_update_rd_ptr(
             next_fifo_rd_ptr += block_size_bytes_aligned;
         }
     }
+#endif
     *updated_block_index = next_block_index;
     *updated_rd_ptr = next_fifo_rd_ptr;
 }
@@ -433,6 +489,38 @@ void kernel_main() {
             input0_cb.wait_front(in0_block_num_tiles);
 
 #ifdef ENABLE_GLOBAL_CB
+    #ifdef SGLANG_TT_U36_RDPTR_TRACE
+            // U36 — per-(ring_idx, block) rd_ptr trajectory probe.  Prints the
+            // rd_ptr AT THE TOP OF EACH BLOCK ITER (= the address matmul_block
+            // is about to read from).  Per-kernel-static budget keeps log size
+            // bounded.  Filter post-hoc by ring_idx + offset_bytes to focus on
+            // a specific tensor's read trajectory.
+            {
+                static uint32_t u36_trace_budget = 256;
+                UNPACK((
+                    {
+                        if (u36_trace_budget > 0) {
+                            u36_trace_budget--;
+                            uint32_t u36_rdptr_pre = get_local_cb_rd_ptr(in1_cb_id);
+                            LocalCBInterface& u36_cb = get_local_cb_interface(in1_cb_id);
+                            DPRINT << "[U36_TRACE ring_idx=" << ring_idx
+                                   << " b=" << b
+                                   << " block=" << block
+                                   << " curr=" << curr_in1_block_index
+                                   << " rd_ptr=" << u36_rdptr_pre
+                                   << " start=" << in1_rd_ptr_start_addr
+                                   << " cb_start=" << in1_cb_start_addr
+                                   << " fifo_limit=" << u36_cb.fifo_limit
+                                   << " fifo_size=" << u36_cb.fifo_size
+                                   << " bs=" << in1_block_size_bytes
+                                   << " split=" << (uint32_t)in1_tensor_split
+                                   << "]" << ENDL();
+                        }
+                    }
+                ));
+            }
+    #endif
+
     #ifndef SGLANG_TT_PREFETCHER_BYPASS_GCB_BLOCK
             // U10 Block B: per-block-start — computes next_in1_block_index and
             // next_in1_rd_ptr_addr that Block C consumes at end of this block.

@@ -2504,6 +2504,22 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u35_off_probe_env != nullptr && std::string(u35_off_probe_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U35_KERNEL_OFFSET_PROBE"] = "1";
         }
+        // U36 — pre-emptive wrap fix for non-zero per-tensor start offsets.
+        // Replaces the equality-based reach_limit check in
+        // calculate_next_block_index_and_update_rd_ptr with a >=-based check
+        // so the per-block advance wraps when it would land at or past
+        // fifo_limit.  Default-off — canonical bytewise-equal under U36=0.
+        const char* u36_wrap_fix_env = std::getenv("SGLANG_TT_U36_WRAP_FIX");
+        if (u36_wrap_fix_env != nullptr && std::string(u36_wrap_fix_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U36_WRAP_FIX"] = "1";
+        }
+        // U36 — per-(ring_idx, block) rd_ptr trajectory DPRINT.  Off by
+        // default; canonical bytewise-equal under U36_TRACE=0.  When enabled,
+        // emits ~256 lines per worker core per program-launch.
+        const char* u36_trace_env = std::getenv("SGLANG_TT_U36_RDPTR_TRACE");
+        if (u36_trace_env != nullptr && std::string(u36_trace_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U36_RDPTR_TRACE"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).
