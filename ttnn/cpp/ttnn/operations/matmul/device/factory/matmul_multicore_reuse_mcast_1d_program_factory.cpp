@@ -2157,6 +2157,16 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
             .set_page_size(in1_block_size_bytes)
             .set_data_format(in1_data_format);
         remote_cb_config.index(src1_cb_index).set_page_size(in1_single_tile_size).set_data_format(in1_data_format);
+        // U38 (SGLANG): the non-gathered process_in0 path sets `.set_tile_dims(src1_cb_index,
+        // in1_tile)` on its src1 CB (see line ~1705).  The gathered (use_global_cb) path was
+        // missing this call.  Without tile_dims metadata the local CB carries an undefined tile
+        // layout, which the BFP8 unpacker mis-interprets (shared-exponent prefix vs mantissa
+        // bytes).  BFP4 happens to land on safe bytes given the default; BFP8 produces ~2^60
+        // magnitudes.  Env-gated default-off so canonical matmuls are untouched until validated.
+        if (const char* env = std::getenv("SGLANG_TT_U38_SET_TILE_DIMS");
+            env != nullptr && std::string(env) == "1") {
+            remote_cb_config.index(src1_cb_index).set_tile_dims(in1_tile);
+        }
         cb_src1 = tt_metal::experimental::CreateCircularBuffer(program, all_cores, remote_cb_config, *global_cb);
     } else {
         tt_metal::CircularBufferConfig src1_cb_config =
