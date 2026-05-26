@@ -2595,6 +2595,35 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u40_block_env != nullptr && std::string(u40_block_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U40_RECONFIG_BLOCK"] = "1";
         }
+        // U41 (FINAL TWO SUSPECTS).
+        //
+        //  SGLANG_TT_U41_FACE3_PROBE       — kernel-side BFP8 face-3 mantissa
+        //                                     dump (bytes 832, 1024, 1080).
+        //                                     Cross-correlate with producer-
+        //                                     side U41 probe (same name in
+        //                                     writer_l1.cpp).  Same env both
+        //                                     sides → producer + consumer
+        //                                     get the JIT define.
+        //
+        //  SGLANG_TT_U41_UNPACK_ARR_PROBE  — kernel-side; DPRINT the FULL
+        //                                     unpack_*[] arrays for in0/in1
+        //                                     (extends U40_PROBE_TILE_DIMS
+        //                                     with tile_r_dim / tile_c_dim /
+        //                                     num_faces_r_dim / num_faces_c_dim).
+        //                                     Cross-correlate gathered vs
+        //                                     canonical to confirm whether
+        //                                     U38's set_tile_dims actually
+        //                                     propagates through the dual-
+        //                                     index (local+remote) CB
+        //                                     allocation pattern.
+        const char* u41_f3_env = std::getenv("SGLANG_TT_U41_FACE3_PROBE");
+        if (u41_f3_env != nullptr && std::string(u41_f3_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U41_FACE3_PROBE"] = "1";
+        }
+        const char* u41_arr_env = std::getenv("SGLANG_TT_U41_UNPACK_ARR_PROBE");
+        if (u41_arr_env != nullptr && std::string(u41_arr_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U41_UNPACK_ARR_PROBE"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).

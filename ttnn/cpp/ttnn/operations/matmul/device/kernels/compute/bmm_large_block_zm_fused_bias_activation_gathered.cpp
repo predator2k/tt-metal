@@ -111,6 +111,60 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U41_FACE3_PROBE) || defined(SGLANG_TT_U41_UNPACK_ARR_PROBE)
+// U41 (Final two suspects).
+//
+//   Sub-7 (face-3 mantissa byte misordering) — BFP8 32x32 tile is laid
+//   out as 64-byte shared-exponent prefix + 4 faces of 16x16, each face
+//   = 256 bytes of mantissa.  U37/U39 verified byte-equality producer
+//   vs consumer at byte 0-15 (face-0 prefix), 64-79 (face-0 mantissa
+//   start), 320-335 (face-1 mantissa start), 576-591 (face-2 mantissa
+//   start).  Face-3 mantissa lives at bytes 832-1087.  BFP4 tile is
+//   only 576 bytes (64 exp + 4×128 mantissa), so a BFP4 face-3 access
+//   at byte 832+ aliases harmlessly into the NEXT tile's exponent
+//   prefix — which is exactly the BFP4-clean-ELF insensitivity pattern
+//   observed throughout U17-U40.  Sub-7 = the producer (or NoC path)
+//   delivers BFP8 face-3 bytes in a DIFFERENT order than the LLK
+//   unpacker expects, while face-0/1/2 are fine.
+//
+//   Sub-8 (global unpack_*[] array staleness) — on the gathered path
+//   the local CB is created via
+//     tt_metal::experimental::CreateCircularBuffer(prog, cores, remote_cfg, *global_cb)
+//   whereas the canonical path uses the plain
+//     tt_metal::CreateCircularBuffer(prog, cores, src1_cfg)
+//   U38's `.set_tile_dims(src1_cb_index, in1_tile)` on the gathered
+//   `remote_cb_config` populates the parent CircularBufferConfig
+//   tile_dims field, but the propagation through
+//   `program_impl.cpp::set_cb_data_fmt_and_tile → JitBuildOptions →
+//   set_cb_tile_dims_all_cores` may not engage for the dual-index
+//   (local+remote) CB allocation pattern.  The result would be stale
+//   per-CB `unpack_tile_face_r_dim[]`, `unpack_partial_face[]`,
+//   `unpack_tile_num_faces[]`, `unpack_narrow_tile[]` etc. populating
+//   the JIT-emitted kernel binary's static data, which the LLK
+//   matmul-init then reads.
+//
+// SGLANG_TT_U41_FACE3_PROBE       — kernel-side; dumps bytes at
+//   offsets 832 (face-3 mantissa start), 1024 (face-3 last 64 B),
+//   1080 (last 8 B of tile).  Cross-correlate with the producer-side
+//   face-3 probe in writer_l1.cpp.
+//
+// SGLANG_TT_U41_UNPACK_ARR_PROBE  — kernel-side; in addition to the
+//   U40 probe (face_r_dim, num_faces, partial_face, narrow, src_fmt,
+//   dst_fmt) dumps the remaining unpack_*[] arrays
+//   (tile_r_dim, tile_c_dim, num_faces_r_dim, num_faces_c_dim) for
+//   both in0 and in1.  Per-ELF de-duplicated DPRINT.  Cross-correlate
+//   gathered vs canonical to confirm whether `set_tile_dims` actually
+//   propagated through the gathered (dual-index) CB allocation.
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#ifndef SGLANG_TT_TENSIX_INCLUDED
+#define SGLANG_TT_TENSIX_INCLUDED
+#include "tensix.h"
+#endif
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -449,6 +503,59 @@ void kernel_main() {
                            << " in1_dst_fmt=0x" << get_operand_dst_format(in1_id)
                            << DEC()
                            << " in0_cb=" << in0_cb_id
+                           << " in0_face_r=" << get_operand_face_r_dim(in0_id)
+                           << " in0_num_faces=" << get_operand_num_faces(in0_id)
+                           << " in0_partial=" << get_operand_partial_face(in0_id)
+                           << " in0_narrow=" << get_operand_narrow_tile(in0_id)
+                           << " in0_src_fmt=0x" << HEX() << get_operand_src_format(in0_id)
+                           << " in0_dst_fmt=0x" << get_operand_dst_format(in0_id)
+                           << DEC() << "]" << ENDL();
+                }
+            }
+        ));
+    }
+#endif
+
+#ifdef SGLANG_TT_U41_UNPACK_ARR_PROBE
+    // U41 Sub-8 — dump the FULL set of global unpack_*[] arrays for in0
+    // AND in1, including the four NOT covered by U40 (tile_r_dim,
+    // tile_c_dim, num_faces_r_dim, num_faces_c_dim).  These map 1:1 to
+    // the `set_tile_dims()` setter on CircularBufferConfig.  If gathered
+    // path values DIFFER from canonical path values for the SAME BFP8
+    // operand, the `set_tile_dims` populated the parent
+    // CircularBufferConfig but FAILED to propagate through the dual-
+    // index (local+remote) JitBuildOptions code path → Sub-8 CONFIRMED.
+    {
+        constexpr uint32_t u41_arr_elf_tag =
+            (in0_block_w * 1u) ^
+            (in0_num_subblocks * 131u) ^
+            (in1_num_subblocks * 17u) ^
+            (num_blocks * 7919u) ^
+            (out_subblock_h * 31u) ^
+            (out_subblock_w * 257u) ^
+            (batch * 65537u);
+        static uint32_t u41_arr_budget = 8;
+        UNPACK((
+            {
+                if (u41_arr_budget > 0) {
+                    u41_arr_budget--;
+                    const uint32_t in0_id = get_operand_id(in0_cb_id);
+                    const uint32_t in1_id = get_operand_id(in1_cb_id);
+                    DPRINT << "[U41_UNPACK_ARR elf=0x" << HEX()
+                           << u41_arr_elf_tag << DEC()
+                           << " in1_cb=" << in1_cb_id
+                           << " in1_tile_r=" << get_operand_tile_r_dim(in1_id)
+                           << " in1_tile_c=" << get_operand_tile_c_dim(in1_id)
+                           << " in1_face_r=" << get_operand_face_r_dim(in1_id)
+                           << " in1_num_faces=" << get_operand_num_faces(in1_id)
+                           << " in1_partial=" << get_operand_partial_face(in1_id)
+                           << " in1_narrow=" << get_operand_narrow_tile(in1_id)
+                           << " in1_src_fmt=0x" << HEX() << get_operand_src_format(in1_id)
+                           << " in1_dst_fmt=0x" << get_operand_dst_format(in1_id)
+                           << DEC()
+                           << " in0_cb=" << in0_cb_id
+                           << " in0_tile_r=" << get_operand_tile_r_dim(in0_id)
+                           << " in0_tile_c=" << get_operand_tile_c_dim(in0_id)
                            << " in0_face_r=" << get_operand_face_r_dim(in0_id)
                            << " in0_num_faces=" << get_operand_num_faces(in0_id)
                            << " in0_partial=" << get_operand_partial_face(in0_id)
@@ -842,6 +949,39 @@ void kernel_main() {
                                                << "] f2m@576=[0x"
                                                << u39_f2m_w0 << " 0x" << u39_f2m_w1
                                                << " 0x" << u39_f2m_w2 << " 0x" << u39_f2m_w3
+                                               << "]" << DEC() << ENDL();
+#endif
+#ifdef SGLANG_TT_U41_FACE3_PROBE
+                                        // U41 Sub-7 — BFP8 face-3 mantissa.  Face-3 lives
+                                        // at bytes 832-1087 of a BFP8 1088-byte tile.
+                                        // Sample three windows: f3_start (byte 832),
+                                        // f3_mid (byte 1024 — last 64 B), f3_tail
+                                        // (byte 1080 — last 8 B of tile).
+                                        //   u32 index = byte_offset / 4
+                                        //   byte 832  → idx 208
+                                        //   byte 1024 → idx 256
+                                        //   byte 1080 → idx 270
+                                        uint32_t u41_f3s_w0 = u37_p[208];  // byte 832
+                                        uint32_t u41_f3s_w1 = u37_p[209];
+                                        uint32_t u41_f3s_w2 = u37_p[210];
+                                        uint32_t u41_f3s_w3 = u37_p[211];
+                                        uint32_t u41_f3m_w0 = u37_p[256];  // byte 1024
+                                        uint32_t u41_f3m_w1 = u37_p[257];
+                                        uint32_t u41_f3m_w2 = u37_p[258];
+                                        uint32_t u41_f3m_w3 = u37_p[259];
+                                        uint32_t u41_f3t_w0 = u37_p[270];  // byte 1080
+                                        uint32_t u41_f3t_w1 = u37_p[271];
+                                        DPRINT << "[U41_READ_F3 elf=0x" << HEX()
+                                               << u37_elf_tag
+                                               << " rd_l1=0x" << u37_rd_l1
+                                               << " f3s@832=[0x"
+                                               << u41_f3s_w0 << " 0x" << u41_f3s_w1
+                                               << " 0x" << u41_f3s_w2 << " 0x" << u41_f3s_w3
+                                               << "] f3m@1024=[0x"
+                                               << u41_f3m_w0 << " 0x" << u41_f3m_w1
+                                               << " 0x" << u41_f3m_w2 << " 0x" << u41_f3m_w3
+                                               << "] f3t@1080=[0x"
+                                               << u41_f3t_w0 << " 0x" << u41_f3t_w1
                                                << "]" << DEC() << ENDL();
 #endif
                                     }

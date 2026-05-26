@@ -198,6 +198,38 @@ void kernel_main() {
                                    << " 0x" << _u39_f2m_w2 << " 0x" << _u39_f2m_w3
                                    << "]" << DEC() << ENDL();
 #endif
+#ifdef SGLANG_TT_U41_FACE3_PROBE
+                            // U41 Sub-7 — producer side BFP8 face-3 mantissa
+                            // dump.  Same windows as the kernel-side U41
+                            // probe (bytes 832, 1024, 1080).  Cross-correlate
+                            // producer-write source bytes vs consumer-read
+                            // L1 bytes for face-3 — divergence here proves
+                            // the producer's BFP8 layout writes face-3 in
+                            // wrong order (or skips it entirely on the
+                            // gathered path).
+                            uint32_t _u41_f3s_w0 = _u37_src[208];  // byte 832
+                            uint32_t _u41_f3s_w1 = _u37_src[209];
+                            uint32_t _u41_f3s_w2 = _u37_src[210];
+                            uint32_t _u41_f3s_w3 = _u37_src[211];
+                            uint32_t _u41_f3m_w0 = _u37_src[256];  // byte 1024
+                            uint32_t _u41_f3m_w1 = _u37_src[257];
+                            uint32_t _u41_f3m_w2 = _u37_src[258];
+                            uint32_t _u41_f3m_w3 = _u37_src[259];
+                            uint32_t _u41_f3t_w0 = _u37_src[270];  // byte 1080
+                            uint32_t _u41_f3t_w1 = _u37_src[271];
+                            DPRINT << "[U41_PROD_F3 layer=" << layer
+                                   << " t=" << t
+                                   << " blk=" << block
+                                   << " f3s@832=[0x" << HEX()
+                                   << _u41_f3s_w0 << " 0x" << _u41_f3s_w1
+                                   << " 0x" << _u41_f3s_w2 << " 0x" << _u41_f3s_w3
+                                   << "] f3m@1024=[0x"
+                                   << _u41_f3m_w0 << " 0x" << _u41_f3m_w1
+                                   << " 0x" << _u41_f3m_w2 << " 0x" << _u41_f3m_w3
+                                   << "] f3t@1080=[0x"
+                                   << _u41_f3t_w0 << " 0x" << _u41_f3t_w1
+                                   << "]" << DEC() << ENDL();
+#endif
                         }
                     }
 #endif

@@ -263,6 +263,17 @@ DramPrefetcherProgramFactory::cached_program_t DramPrefetcherProgramFactory::cre
             writer_defines["SGLANG_TT_U39_EXT_BYTES"] = "1";
         }
     }
+    // U41 Sub-7 — producer-side BFP8 face-3 mantissa probe (bytes 832,
+    // 1024, 1080).  Requires SGLANG_TT_U37_PROD_BYTES=1 to actually
+    // fire (the U41 dump is inside the U37 dump block to share gating).
+    // Cross-correlate with the kernel-side U41_FACE3_PROBE in the
+    // gathered compute kernel.  Default-off.
+    {
+        const char* env = std::getenv("SGLANG_TT_U41_FACE3_PROBE");
+        if (env != nullptr && std::string(env) == "1") {
+            writer_defines["SGLANG_TT_U41_FACE3_PROBE"] = "1";
+        }
+    }
     auto writer_kernel_id = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/prefetcher/prefetcher/device/kernels/writer_l1.cpp",
