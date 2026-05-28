@@ -2671,6 +2671,21 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         if (u48_layout_env != nullptr && std::string(u48_layout_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U48_LAYOUT_PROBE"] = "1";
         }
+        // U49b — Engineer's remaining lanes after U48 ruled out
+        // Force_shared_exp.  Lane 2 dumps the TILE_SIZE_A GPR value at the
+        // EXACT instant matmul_block fires (= MOP-replay-buffer fire time),
+        // covering the engineer's most-direct ask.  Lane 1 dumps the CFG
+        // state pre/post matmul_block to detect mid-update intermediates.
+        // Both env vars are off by default; canonical bytewise-equal when
+        // unset.
+        const char* u49_mop_env = std::getenv("SGLANG_TT_U49_MOP_PROBE");
+        if (u49_mop_env != nullptr && std::string(u49_mop_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U49_MOP_PROBE"] = "1";
+        }
+        const char* u49_cfg_env = std::getenv("SGLANG_TT_U49_CFG_ORDER_PROBE");
+        if (u49_cfg_env != nullptr && std::string(u49_cfg_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U49_CFG_ORDER_PROBE"] = "1";
+        }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed
         // separately into the prefetcher program factory below).

@@ -208,6 +208,58 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U49_MOP_PROBE) || defined(SGLANG_TT_U49_CFG_ORDER_PROBE)
+// U49b — Engineer's remaining lanes after U48 ruled out Force_shared_exp.
+//
+// Lane 2 (MOP / TILE_SIZE_A GPR capture at fire time, per engineer's analysis
+// doc): "Disassemble the MOP replay buffer at runtime — capture TILE_SIZE_A
+// GPR value at the instant the failing matmul runs, not from a separate probe."
+//
+// The MOP replay buffer programmed by `_llk_unpack_AB_matmul_mop_config_`
+// uses `TTI_ADDDMAREG(TMP0, TMP0, TILE_SIZE_A)` to compute the next-tile
+// THCON_SEC0_REG3 base address (in0_block_w >= 2 — multi-tile inner-K).
+// If the GPR holds the wrong value (e.g. 36 = BFP4 stride / 16, when the
+// kernel context is BFP8 expecting 68 = 1088 / 16), the unpacker will read
+// from the wrong byte offset on tile 2/3/…, producing 4-face SrcA garbage.
+//
+// Per LLK `tt_metal/tt-llk/tt_llk_blackhole/llk_lib/llk_unpack_common.h`:
+//   TT_SETDMAREG(0, LOWER_HALFWORD(unpA_tile_size), 0, LO_16(p_gpr_unpack::TILE_SIZE_A));
+// The GPR is set with `tile_size = (face_r_dim * num_faces * src_format_bytes)`
+// in bytes, then later inside the matmul mop it's used as a stride.  In
+// `_llk_unpack_AB_matmul_init_` the kt_dim is stored in KT_DIM gpr; in the
+// `!reuse_a` MOP path it computes `TMP_LO = TILE_SIZE_B * KT_DIM` and uses
+// TMP_LO for the stride; in the `reuse_a` MOP path it uses TILE_SIZE_A
+// directly.  We dump BOTH gprs (TILE_SIZE_A=36, TILE_SIZE_B=37, KT_DIM=39,
+// TMP_LO=38, TMP0=32) so all reuse paths are covered.
+//
+// On the gathered/prefetcher path, mm_block_init runs ONCE at top of the
+// kernel.  Subsequent re-entries on the same compute tile inherit stale
+// GPR state from whichever matmul ran on the same compute tile last.  If
+// the last matmul was BFP4 (tile_size 576 → unpA_tile_size 36 / 16) and the
+// current one is BFP8 (tile_size 1088 → unpA_tile_size 68 / 16), the GPR
+// is stale = 36 when MOP fires with BFP8 context.  This is the smoking-gun
+// hypothesis.
+//
+// Lane 1 (CFG programming-order probe): The BH MOP body uses
+//   TTI_STALLWAIT(STALL_CFG, THCON) + TTI_WRCFG
+// to update cfg.  Probe the cfg state at three sample points:
+//   (a) RIGHT BEFORE matmul_block (immediately after mm_block_init's MOP-
+//       programming returned), to see what the unpacker has just been told.
+//   (b) RIGHT AFTER matmul_block returns.
+// Compare these between BFP4 and BFP8 ELFs.  If they diverge in a way that
+// is consistent with mid-update intermediate reads, Lane 1 has a hit.
+//
+// Both lanes share the same per-ELF tag idiom + budgeted DPRINT scheme so
+// they only fire once per worker core per program-launch.
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#include "ckernel.h"
+// p_gpr_unpack live in ckernel_gpr_map.h via cunpack_common.h
+// regfile[] live in ckernel.h
+#endif
+
 #if defined(SGLANG_TT_U48_FORCED_EXP_PROBE) || defined(SGLANG_TT_U48_FORCE_EXP_CLEAR)
 // U48 — `REG2_Force_shared_exp` + `UNP[…].FORCED_SHARED_EXP_shared_exp`
 // per-unpacker register probe (and optional clear) per tt-metal Staff LLK
@@ -1272,6 +1324,128 @@ void kernel_main() {
                             ));
                         }
 #endif
+
+#if defined(SGLANG_TT_U49_MOP_PROBE) || defined(SGLANG_TT_U49_CFG_ORDER_PROBE)
+                        // U49b — Lane 2 (MOP / TILE_SIZE_A GPR capture at fire
+                        // time) + Lane 1 (CFG state at MOP-fire time).
+                        // Engineer requested the GPR value at the EXACT
+                        // instant the MOP runs, not from a separate probe.
+                        // We dump it from the UNPACK risc on the (b==0,
+                        // block==0, in0_subblock==0, in1_subblock==0,
+                        // inner_dim_idx==0) iteration so it's the first
+                        // matmul fire after mm_block_init.  Per-ELF
+                        // de-duplicated (same hash idiom as U37/U43/U48).
+                        if (b == 0 && block == 0 && in0_subblock == 0 &&
+                            in1_subblock == 0 && inner_dim_idx == 0) {
+                            constexpr uint32_t u49_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u49_budget = 8;
+                            UNPACK((
+                                {
+                                    if (u49_budget > 0) {
+                                        u49_budget--;
+#ifdef SGLANG_TT_U49_MOP_PROBE
+                                        // Lane 2 — TILE_SIZE_A GPR at fire
+                                        // time.  The GPR is set in `_llk_
+                                        // unpack_hw_configure_` /
+                                        // `_llk_unpack_reconfig_data_format_
+                                        // srca_impl_` via:
+                                        //   TT_SETDMAREG(0, LOWER_HALFWORD
+                                        //     (unpA_tile_size), 0,
+                                        //     LO_16(p_gpr_unpack::
+                                        //            TILE_SIZE_A));
+                                        // and consumed inside the MOP body by:
+                                        //   TTI_ADDDMAREG(0, TMP0, TMP0,
+                                        //                 TILE_SIZE_A)
+                                        // BFP8 32x32 4-face tile = 1088 B
+                                        //   → unpA_tile_size = 1088/16 = 68
+                                        // BFP4 32x32 4-face tile = 576 B
+                                        //   → unpA_tile_size = 576/16  = 36
+                                        // BF16 32x32 4-face tile = 2080 B
+                                        //   → unpA_tile_size = 2080/16 = 130
+                                        // Only the LOWER 16 bits are
+                                        // significant (SETDMAREG writes the
+                                        // low halfword).
+                                        const uint32_t tile_size_a =
+                                            ckernel::regfile[
+                                                ckernel::p_gpr_unpack::
+                                                    TILE_SIZE_A] & 0xffff;
+                                        const uint32_t tile_size_b =
+                                            ckernel::regfile[
+                                                ckernel::p_gpr_unpack::
+                                                    TILE_SIZE_B] & 0xffff;
+                                        const uint32_t kt_dim_gpr =
+                                            ckernel::regfile[
+                                                ckernel::p_gpr_unpack::KT_DIM]
+                                            & 0xffff;
+                                        const uint32_t tmp_lo_gpr =
+                                            ckernel::regfile[
+                                                ckernel::p_gpr_unpack::TMP_LO];
+                                        const uint32_t tmp0_gpr =
+                                            ckernel::regfile[
+                                                ckernel::p_gpr_unpack::TMP0];
+                                        // Expected: tile_size_a = 68 for
+                                        // BFP8, 36 for BFP4, 130 for BF16.
+                                        // If we see 36 on a BFP8 ELF → Case
+                                        // A (stale GPR root cause).
+                                        DPRINT << "[U49_MOP elf=0x"
+                                               << HEX() << u49_elf_tag
+                                               << " tsA=" << DEC() << tile_size_a
+                                               << " tsB=" << tile_size_b
+                                               << " kt=" << kt_dim_gpr
+                                               << " tmp_lo=0x" << HEX() << tmp_lo_gpr
+                                               << " tmp0=0x" << tmp0_gpr
+                                               << " in0bw=" << DEC() << in0_block_w
+                                               << " ct=" << out_subblock_w
+                                               << " rt=" << out_subblock_h
+                                               << "]" << ENDL();
+#endif
+#ifdef SGLANG_TT_U49_CFG_ORDER_PROBE
+                                        // Lane 1 — CFG state RIGHT BEFORE
+                                        // matmul_block.  This is identical
+                                        // location to U43 in steady state
+                                        // (U43 fires once after mm_block_init
+                                        // at top of kernel; this fires once
+                                        // per matmul fire) — used to detect
+                                        // mid-update intermediates.
+                                        // THCON_SEC0_REG3_Base_address is the
+                                        // load-bearing reg that the MOP
+                                        // ADDDMAREG/WRCFG sequence touches.
+                                        const uint32_t s0_base =
+                                            ckernel::cfg_read(
+                                                THCON_SEC0_REG3_Base_address_ADDR32);
+                                        const uint32_t s0_base_c1 =
+                                            ckernel::cfg_read(
+                                                THCON_SEC0_REG3_Base_cntx1_address_ADDR32);
+                                        const uint32_t s1_base =
+                                            ckernel::cfg_read(
+                                                THCON_SEC1_REG3_Base_address_ADDR32);
+                                        const uint32_t s0_td0 =
+                                            ckernel::cfg_read(
+                                                THCON_SEC0_REG0_TileDescriptor_ADDR32 + 0);
+                                        const uint32_t s0_cfg0 =
+                                            ckernel::cfg_read(
+                                                THCON_SEC0_REG2_Out_data_format_ADDR32 + 0);
+                                        DPRINT << "[U49_CFGORD_PRE elf=0x"
+                                               << HEX() << u49_elf_tag
+                                               << " s0_base=0x" << s0_base
+                                               << " s0_base_c1=0x" << s0_base_c1
+                                               << " s1_base=0x" << s1_base
+                                               << " s0_td0=0x" << s0_td0
+                                               << " s0_cfg0=0x" << s0_cfg0
+                                               << "]" << DEC() << ENDL();
+#endif
+                                    }
+                                }
+                            ));
+                        }
+#endif
                         // matmul outer product of (out_subblock_h x out_subblock_w) tiles that fill dst
                         // accumulation is done by iterating matmul_block across inner dim
                         // in0_block_w is passed as innder dim (kt) to matmul_block, internally used to stride in0
@@ -1285,6 +1459,49 @@ void kernel_main() {
                             out_subblock_w,
                             out_subblock_h,
                             in0_block_w);
+#ifdef SGLANG_TT_U49_CFG_ORDER_PROBE
+                        // Lane 1 — CFG state RIGHT AFTER matmul_block returns.
+                        // The MOP has run; if it advanced THCON_SEC0_REG3
+                        // base_address, this reflects it.  Compare PRE vs
+                        // POST to see the address-stride delta — that delta
+                        // is precisely `TILE_SIZE_A * 16` (or for !reuse_a
+                        // path: TMP_LO * 16).  If the delta == 576 (BFP4
+                        // stride) on a BFP8 ELF, Case A confirmed.
+                        if (b == 0 && block == 0 && in0_subblock == 0 &&
+                            in1_subblock == 0 && inner_dim_idx == 0) {
+                            constexpr uint32_t u49_elf_tag =
+                                (in0_block_w * 1u) ^
+                                (in0_num_subblocks * 131u) ^
+                                (in1_num_subblocks * 17u) ^
+                                (num_blocks * 7919u) ^
+                                (out_subblock_h * 31u) ^
+                                (out_subblock_w * 257u) ^
+                                (batch * 65537u);
+                            static uint32_t u49_post_budget = 8;
+                            UNPACK((
+                                {
+                                    if (u49_post_budget > 0) {
+                                        u49_post_budget--;
+                                        const uint32_t s0_base =
+                                            ckernel::cfg_read(
+                                                THCON_SEC0_REG3_Base_address_ADDR32);
+                                        const uint32_t s0_base_c1 =
+                                            ckernel::cfg_read(
+                                                THCON_SEC0_REG3_Base_cntx1_address_ADDR32);
+                                        const uint32_t s1_base =
+                                            ckernel::cfg_read(
+                                                THCON_SEC1_REG3_Base_address_ADDR32);
+                                        DPRINT << "[U49_CFGORD_POST elf=0x"
+                                               << HEX() << u49_elf_tag
+                                               << " s0_base=0x" << s0_base
+                                               << " s0_base_c1=0x" << s0_base_c1
+                                               << " s1_base=0x" << s1_base
+                                               << "]" << DEC() << ENDL();
+                                    }
+                                }
+                            ));
+                        }
+#endif
 #ifdef SGLANG_TT_PREFETCHER_LLK_PROBE
                         // U13 Part 2 (widened) — verify U12's probe fired on EVERY
                         // gathered ELF.  U12 v2's gate
