@@ -2156,17 +2156,21 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         remote_cb_config.remote_index(remote_cb_index)
             .set_page_size(in1_block_size_bytes)
             .set_data_format(in1_data_format);
-        remote_cb_config.index(src1_cb_index).set_page_size(in1_single_tile_size).set_data_format(in1_data_format);
-        // U38 (SGLANG): the non-gathered process_in0 path sets `.set_tile_dims(src1_cb_index,
-        // in1_tile)` on its src1 CB (see line ~1705).  The gathered (use_global_cb) path was
-        // missing this call.  Without tile_dims metadata the local CB carries an undefined tile
-        // layout, which the BFP8 unpacker mis-interprets (shared-exponent prefix vs mantissa
-        // bytes).  BFP4 happens to land on safe bytes given the default; BFP8 produces ~2^60
-        // magnitudes.  Env-gated default-off so canonical matmuls are untouched until validated.
-        if (const char* env = std::getenv("SGLANG_TT_U38_SET_TILE_DIMS");
-            env != nullptr && std::string(env) == "1") {
-            remote_cb_config.index(src1_cb_index).set_tile_dims(in1_tile);
-        }
+        // U48 / tt-metal PR #45402 (ncvetkovic/qwen3_bfp8_global_cb_tile_dims_fix)
+        // — propagate in1_tile to the local CB index of the dual-index
+        // (local+remote) global-CB pair so set_cb_tile_dims emits per-CB
+        // unpack_tile_*_dim / unpack_num_faces / unpack_partial_face arrays
+        // from the user-provided Tile rather than the tt_hlk_desc defaults
+        // (32x32, 4 faces, face_r_dim=16, partial_face=0, narrow_tile=0).
+        // Symmetric with the non-global path below.  Previously gated by
+        // SGLANG_TT_U38_SET_TILE_DIMS (U38) — now unconditional per the
+        // upstream LLK engineer's recommendation (defaults match the BFP8
+        // 32x32 4-face tile so this is a latent rather than immediate bug
+        // for our specific case, but it's a free correctness win).
+        remote_cb_config.index(src1_cb_index)
+            .set_page_size(in1_single_tile_size)
+            .set_data_format(in1_data_format)
+            .set_tile_dims(in1_tile);
         cb_src1 = tt_metal::experimental::CreateCircularBuffer(program, all_cores, remote_cb_config, *global_cb);
     } else {
         tt_metal::CircularBufferConfig src1_cb_config =
@@ -2637,6 +2641,35 @@ MatmulMultiCoreReuseMcast1DProgramFactory::shared_variables_t process_gather_in0
         const char* u43_cfg_env = std::getenv("SGLANG_TT_U43_CFG_DUMP");
         if (u43_cfg_env != nullptr && std::string(u43_cfg_env) == "1") {
             mm_kernel_defines["SGLANG_TT_U43_CFG_DUMP"] = "1";
+        }
+        // U48 — runtime DPRINT of Force_shared_exp + FORCED_SHARED_EXP
+        // per-unpacker registers (the cfg-words U43 did NOT cover).
+        // Per Tenstorrent Staff LLK engineer ncvetkovicTT in PR #45402,
+        // this is the single most plausible silicon-side cause of the
+        // BFP8 prefetcher corruption.  Off by default — canonical
+        // bytewise-equal when unset.
+        const char* u48_probe_env = std::getenv("SGLANG_TT_U48_FORCED_EXP_PROBE");
+        if (u48_probe_env != nullptr && std::string(u48_probe_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U48_FORCED_EXP_PROBE"] = "1";
+        }
+        // U48 fix — env-gated TTI_WRCFG-based clear of Force_shared_exp
+        // on BOTH THCON_SEC + zero of the per-unpacker FORCED_SHARED_EXP
+        // register at the start of every gathered matmul kernel launch.
+        // Only ship if U48 probe confirms Case A.
+        const char* u48_clear_env = std::getenv("SGLANG_TT_U48_FORCE_EXP_CLEAR");
+        if (u48_clear_env != nullptr && std::string(u48_clear_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U48_FORCE_EXP_CLEAR"] = "1";
+        }
+        // U48 layout probe — per LLK engineer's recommendation in
+        // PR #45402 step 2, dump first 64 bytes (full exp block) and
+        // first 16 bytes of mantissa block (bytes 64-79) SEPARATELY
+        // so the engineer can rule in/out byte-perfect layout (not
+        // just byte-equality of arbitrary samples).  Requires
+        // SGLANG_TT_U37_READ_BYTES=1 to fire (lives inside the U37
+        // gated block).
+        const char* u48_layout_env = std::getenv("SGLANG_TT_U48_LAYOUT_PROBE");
+        if (u48_layout_env != nullptr && std::string(u48_layout_env) == "1") {
+            mm_kernel_defines["SGLANG_TT_U48_LAYOUT_PROBE"] = "1";
         }
         // U35 Path B — env-gated DPRINT in prefetcher's writer_l1.cpp
         // (forwarded via mm_in1_kernel_defines mechanism, plumbed

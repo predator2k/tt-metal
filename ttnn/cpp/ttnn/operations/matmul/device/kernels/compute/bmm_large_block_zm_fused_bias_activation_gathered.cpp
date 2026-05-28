@@ -208,6 +208,43 @@
 #endif
 #endif
 
+#if defined(SGLANG_TT_U48_FORCED_EXP_PROBE) || defined(SGLANG_TT_U48_FORCE_EXP_CLEAR)
+// U48 — `REG2_Force_shared_exp` + `UNP[…].FORCED_SHARED_EXP_shared_exp`
+// per-unpacker register probe (and optional clear) per tt-metal Staff LLK
+// engineer ncvetkovicTT's recommendation in PR #45402's
+// qwen3_8b_bfp8_prefetcher_llk_analysis.md, Addendum §1:
+//
+//   "When set, the unpacker substitutes a single hardcoded exponent for
+//   every datum, ignoring the per-face exponent block in L1.  If this
+//   register is true on the BFP8 path but false on BFP4 (or holds a
+//   stale value from an earlier kernel), the symptom is precisely
+//   'magnitudes 2^60-2^109' — random scale applied to correct
+//   mantissas."
+//
+// U43 probed THCON_SEC0/SEC1 only.  U48 covers UNP0/UNP1 top-level regs
+// (NOT THCON_SEC) that hold the *forced shared exponent value*, plus
+// the per-section Force_shared_exp gating bit.
+//
+//   THCON_SEC0_REG2_Force_shared_exp = bit 8 of cfg word 73 (mask 0x100)
+//   THCON_SEC1_REG2_Force_shared_exp = bit 8 of cfg word 121 (mask 0x100)
+//   UNP0_FORCED_SHARED_EXP_shared_exp = byte 0 of cfg word 50 (mask 0xff)
+//   UNP1_FORCED_SHARED_EXP_shared_exp = byte 0 of cfg word 62 (mask 0xff)
+//
+// SGLANG_TT_U48_FORCED_EXP_PROBE — env-gated DPRINT of all 4 fields per
+//   ELF (one-shot per worker core per program-launch, budget=8).
+//
+// SGLANG_TT_U48_FORCE_EXP_CLEAR  — env-gated TT_SETDMAREG + TTI_WRCFG
+//   that clears Force_shared_exp on both THCON_SEC + zeroes the per-
+//   unpacker FORCED_SHARED_EXP register at the start of every gathered
+//   matmul kernel launch (before mm_block_init).  Only fires if
+//   FORCED_EXP_PROBE confirms Case A (Force=1 on BFP8 but =0 on BFP4).
+#ifndef SGLANG_TT_DPRINT_INCLUDED
+#define SGLANG_TT_DPRINT_INCLUDED
+#include "api/debug/dprint.h"
+#endif
+#include "ckernel.h"
+#endif
+
 enum class CORE_TYPE : uint8_t { IDLE_CORE = 0, WORKER_CORE = 1, HOP_CORE = 2 };
 
 FORCE_INLINE void reload_from_cb_to_dst(
@@ -586,6 +623,72 @@ void kernel_main() {
                            << " 0x" << s1_cfg2 << " 0x" << s1_cfg3
                            << "] base=0x" << s1_base << " off_fmt=0x"
                            << s1_off_fmt << "]" << DEC() << ENDL();
+                }
+            }
+        ));
+    }
+#endif
+
+#ifdef SGLANG_TT_U48_FORCED_EXP_PROBE
+    // U48 — `Force_shared_exp` + `FORCED_SHARED_EXP_shared_exp` probe.
+    // Per ncvetkovicTT (Tenstorrent Staff LLK engineer) tt-metal PR #45402
+    // analysis doc Addendum §1, this is "the single most plausible
+    // silicon-side cause that's consistent with every diagnostic the
+    // customer ran" — the U43 probe missed UNP[…] top-level regs.  Dump
+    // both the per-section gating bit and the per-unpacker forced value
+    // for each ELF AFTER mm_block_init's `_llk_unpack_hw_configure_`
+    // sequence has run.
+    //
+    //   THCON_SEC0_REG2_Force_shared_exp (word 73, bit 8, mask 0x100)
+    //   THCON_SEC1_REG2_Force_shared_exp (word 121, bit 8, mask 0x100)
+    //   UNP0_FORCED_SHARED_EXP_shared_exp (word 50, byte 0, mask 0xff)
+    //   UNP1_FORCED_SHARED_EXP_shared_exp (word 62, byte 0, mask 0xff)
+    {
+        constexpr uint32_t u48_elf_tag =
+            (in0_block_w * 1u) ^
+            (in0_num_subblocks * 131u) ^
+            (in1_num_subblocks * 17u) ^
+            (num_blocks * 7919u) ^
+            (out_subblock_h * 31u) ^
+            (out_subblock_w * 257u) ^
+            (batch * 65537u);
+        static uint32_t u48_budget = 8;
+        UNPACK((
+            {
+                if (u48_budget > 0) {
+                    u48_budget--;
+                    // Per-section gating bits (THCON_SEC0/SEC1, REG2)
+                    const uint32_t w73 = ckernel::cfg_read(
+                        THCON_SEC0_REG2_Force_shared_exp_ADDR32);
+                    const uint32_t w121 = ckernel::cfg_read(
+                        THCON_SEC1_REG2_Force_shared_exp_ADDR32);
+                    const uint32_t s0_force_bit =
+                        (w73 & THCON_SEC0_REG2_Force_shared_exp_MASK)
+                        >> THCON_SEC0_REG2_Force_shared_exp_SHAMT;
+                    const uint32_t s1_force_bit =
+                        (w121 & THCON_SEC1_REG2_Force_shared_exp_MASK)
+                        >> THCON_SEC1_REG2_Force_shared_exp_SHAMT;
+                    // Per-unpacker forced-exponent values (top-level UNP[…])
+                    const uint32_t w50 = ckernel::cfg_read(
+                        UNP0_FORCED_SHARED_EXP_shared_exp_ADDR32);
+                    const uint32_t w62 = ckernel::cfg_read(
+                        UNP1_FORCED_SHARED_EXP_shared_exp_ADDR32);
+                    const uint32_t unp0_forced_exp =
+                        (w50 & UNP0_FORCED_SHARED_EXP_shared_exp_MASK)
+                        >> UNP0_FORCED_SHARED_EXP_shared_exp_SHAMT;
+                    const uint32_t unp1_forced_exp =
+                        (w62 & UNP1_FORCED_SHARED_EXP_shared_exp_MASK)
+                        >> UNP1_FORCED_SHARED_EXP_shared_exp_SHAMT;
+                    DPRINT << "[U48_FORCED_EXP elf=0x" << HEX() << u48_elf_tag
+                           << " s0_force=" << DEC() << s0_force_bit
+                           << " s1_force=" << s1_force_bit
+                           << " unp0_exp=0x" << HEX() << unp0_forced_exp
+                           << " unp1_exp=0x" << unp1_forced_exp
+                           << " raw_w73=0x" << w73
+                           << " raw_w121=0x" << w121
+                           << " raw_w50=0x" << w50
+                           << " raw_w62=0x" << w62
+                           << "]" << DEC() << ENDL();
                 }
             }
         ));
@@ -1107,6 +1210,61 @@ void kernel_main() {
                                                << " 0x" << u41_f3m_w2 << " 0x" << u41_f3m_w3
                                                << "] f3t@1080=[0x"
                                                << u41_f3t_w0 << " 0x" << u41_f3t_w1
+                                               << "]" << DEC() << ENDL();
+#endif
+#ifdef SGLANG_TT_U48_LAYOUT_PROBE
+                                        // U48 — layout probe per LLK engineer
+                                        // ncvetkovicTT recommendation in PR
+                                        // #45402 analysis doc step 2:
+                                        //
+                                        //   "dump 1 BFP8 weight tile from L1
+                                        //    as raw 1088 bytes, compare the
+                                        //    *first* 64 bytes against the
+                                        //    host-side reference's exp block,
+                                        //    compare bytes 64-1087 against
+                                        //    the host-side mantissa block —
+                                        //    separately."
+                                        //
+                                        // U37 only dumped first 16 bytes;
+                                        // U48 dumps the full 64-byte exp
+                                        // block separately so we can verify
+                                        // the exponents block is byte-exact
+                                        // at the correct offset (vs the
+                                        // mantissa starting at byte 64).
+                                        DPRINT << "[U48_LAYOUT_EXP elf=0x"
+                                               << HEX() << u37_elf_tag
+                                               << " rd_l1=0x" << u37_rd_l1
+                                               << " e0_0=0x" << u37_p[0]
+                                               << " e0_1=0x" << u37_p[1]
+                                               << " e0_2=0x" << u37_p[2]
+                                               << " e0_3=0x" << u37_p[3]
+                                               << " e1_0=0x" << u37_p[4]
+                                               << " e1_1=0x" << u37_p[5]
+                                               << " e1_2=0x" << u37_p[6]
+                                               << " e1_3=0x" << u37_p[7]
+                                               << " e2_0=0x" << u37_p[8]
+                                               << " e2_1=0x" << u37_p[9]
+                                               << " e2_2=0x" << u37_p[10]
+                                               << " e2_3=0x" << u37_p[11]
+                                               << " e3_0=0x" << u37_p[12]
+                                               << " e3_1=0x" << u37_p[13]
+                                               << " e3_2=0x" << u37_p[14]
+                                               << " e3_3=0x" << u37_p[15]
+                                               << "]" << DEC() << ENDL();
+                                        // First 16 bytes of mantissa block
+                                        // (face-0 mantissa start at byte 64,
+                                        // = u32 idx 16) — independently of
+                                        // the U37/U39 dumps so engineer can
+                                        // compare exp block bytes 0-63 vs
+                                        // mantissa block bytes 64-79 in
+                                        // strict isolation.
+                                        DPRINT << "[U48_LAYOUT_MANT elf=0x"
+                                               << HEX() << u37_elf_tag
+                                               << " rd_l1=0x" << u37_rd_l1
+                                               << " m_64=0x" << u37_p[16]
+                                               << " m_68=0x" << u37_p[17]
+                                               << " m_72=0x" << u37_p[18]
+                                               << " m_76=0x" << u37_p[19]
                                                << "]" << DEC() << ENDL();
 #endif
                                     }

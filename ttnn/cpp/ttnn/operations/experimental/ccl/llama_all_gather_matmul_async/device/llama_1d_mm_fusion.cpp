@@ -212,7 +212,17 @@ process_agmm_fusion_program_and_create_override_variables(
         remote_cb_config.remote_index(remote_cb_index)
             .set_page_size(in1_block_size_bytes)
             .set_data_format(in1_data_format);
-        remote_cb_config.index(src1_cb_index).set_page_size(in1_single_tile_size).set_data_format(in1_data_format);
+        // U48 / tt-metal PR #45402 (ncvetkovic/qwen3_bfp8_global_cb_tile_dims_fix)
+        // Propagate in1_tile to the local CB index of the dual-index (local+remote)
+        // global-CB pair so set_cb_tile_dims emits per-CB unpack_tile_*_dim /
+        // unpack_num_faces / unpack_partial_face arrays from the user-provided
+        // Tile rather than the tt_hlk_desc defaults (32x32, 4 faces, face_r_dim=16,
+        // partial_face=0, narrow_tile=0).  Symmetric with the non-global path
+        // below at L221.
+        remote_cb_config.index(src1_cb_index)
+            .set_page_size(in1_single_tile_size)
+            .set_data_format(in1_data_format)
+            .set_tile_dims(in1_tile);
         cb_src1 = tt_metal::experimental::CreateCircularBuffer(program, all_cores, remote_cb_config, *global_cb);
     } else {
         tt_metal::CircularBufferConfig src1_cb_config =
