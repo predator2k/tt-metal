@@ -3902,6 +3902,12 @@ class ModelArgs:
             out_subblock_w -= 1
 
         hop_grid = []  # FIXME: Make not hard coded
+        # U50 D2: env-gated `hop_cores=[(3,6)]` override. U49b found Galaxy
+        # WH BFP8 prefetcher matmuls use a non-empty hop_cores set; the
+        # Qwen3-8B BH path uses []. Default-off; canonical untouched.
+        import os as _u50d2_os
+        if _u50d2_os.environ.get("SGLANG_TT_U50_HOP_CORES", "0") == "1":
+            hop_grid = [(3, 6)]
         hop_core_range_set = ttnn.CoreRangeSet(
             {
                 ttnn.CoreRange(
@@ -4965,7 +4971,32 @@ class DecodersPrecision:
             MathFidelitySetting.HIFI4: configuration.compute_kernel_config_hifi4,
             MathFidelitySetting.HIFI4_FP32: configuration.compute_kernel_config_hifi4_fp32,
         }
-        return math_fidelity_setting_lookup[self.decoder_optimizations[decoder_id].op_fidelity_settings[op]]
+        _cfg = math_fidelity_setting_lookup[self.decoder_optimizations[decoder_id].op_fidelity_settings[op]]
+
+        # U50 D1: force `dst_full_sync_en=True` for prefetcher-fed matmul ops
+        # (WQKV/WO/W1/W3/W2). U49b found Galaxy WH BFP8 prefetcher matmuls
+        # use this flag, but our Qwen3-8B BH path uses False. The engineer
+        # called out `dst_full_sync_en + packer_l1_acc + LoFi` as the prime
+        # BH dest-accumulator quirk interaction. Default-off; canonical
+        # untouched. Env-gated via SGLANG_TT_U50_DST_FULL_SYNC=1.
+        import os as _u50_os
+        if (_u50_os.environ.get("SGLANG_TT_U50_DST_FULL_SYNC", "0") == "1"
+                and op in (OpGroup.LI_FF1_FF3, OpGroup.LI_FF2,
+                           OpGroup.LI_QKV_DECODE, OpGroup.LI_O_DECODE)):
+            try:
+                import ttnn as _u50_ttnn
+                _cfg = _u50_ttnn.WormholeComputeKernelConfig(
+                    math_fidelity=_cfg.math_fidelity,
+                    math_approx_mode=_cfg.math_approx_mode,
+                    fp32_dest_acc_en=_cfg.fp32_dest_acc_en,
+                    packer_l1_acc=_cfg.packer_l1_acc,
+                    dst_full_sync_en=True,
+                )
+            except Exception as _u50_e:
+                print(f"[U50] dst_full_sync_en override failed: {_u50_e}",
+                      flush=True)
+
+        return _cfg
 
     def _update_full_name(self):
         self._full_name = " | ".join(
